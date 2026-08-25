@@ -315,6 +315,37 @@ class TestQCOMDriver(unittest.TestCase):
     self.device._gpu_free(malformed_buffer)
     self.device._gpu_free(buffer)
 
+  def test_ir3_decoder_rejects_invalid_and_private_encodings(self):
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+
+    end = 6 << 55
+    decoded = decode_a630_ir3(end.to_bytes(8, "little"))
+    self.assertEqual(len(decoded), 1)
+    self.assertEqual((decoded[0].index, decoded[0].category, decoded[0].raw, decoded[0].name), (0, 0, end, "end"))
+    self.assertEqual(decoded[0].fields,
+                     (("SY", 0), ("SS", 0), ("EQ", 0), ("JP", 0), ("REPEAT", 0), ("NAME", "end")))
+
+    for image,message in (
+      (b"", "empty IR3 image"),
+      (bytes(7), "multiple of 8"),
+      (bytes(8), "missing end instruction"),
+      ((end.to_bytes(8, "little") + (1 << 40).to_bytes(8, "little")), "nonzero instruction after end"),
+      ((end | 1 << 32).to_bytes(8, "little"), "invalid or reserved IR3 encoding"),
+      ((0xb87f84e841a312a8).to_bytes(8, "little"), "invalid or reserved IR3 encoding"),
+      ((0xecb0ba8427a4164a).to_bytes(8, "little"), "unmatched IR3 encoding"),
+    ):
+      with self.subTest(message=message), self.assertRaisesRegex(ValueError, message): decode_a630_ir3(image)
+
+    private_or_stack = {
+      "ret":4 << 55,
+      "call":3 << 55,
+      "ldp":(6 << 61) | (2 << 54) | (1 << 23) | 1,
+      "stp":(6 << 61) | (5 << 54) | (1 << 40) | (1 << 23),
+    }
+    for name,word in private_or_stack.items():
+      with self.subTest(name=name), self.assertRaisesRegex(ValueError, f"unsupported IR3 instruction {name}"):
+        decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))
+
   def test_production_add_queue_decodes_without_retirement(self):
     from tinygrad import Device, Tensor
     from tinygrad.codegen import to_program
@@ -353,6 +384,14 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((dispatch.constants_address, dispatch.constants_size), (int(args.buf.va_addr), 4096))
     self.assertEqual((dispatch.local_size, dispatch.groups), (tuple(program_spec.arg.local_size), tuple(program_spec.arg.global_size)))
     self.assertEqual(dispatch.global_size, tuple(g*l for g,l in zip(dispatch.groups, dispatch.local_size)))
+    self.assertEqual(len(dispatch.instructions), runtime.image_size // 8)
+    self.assertEqual((dispatch.instructions[0].raw, dispatch.instructions[0].category, dispatch.instructions[0].name),
+                     (0x47180803201f0000, 2, "ashr.b"))
+    self.assertEqual((dispatch.instructions[10].category, dispatch.instructions[10].name), (1, None))
+    self.assertIn(("SRC_TYPE", 2), dispatch.instructions[10].fields)
+    self.assertIn(("DST_TYPE", 5), dispatch.instructions[10].fields)
+    self.assertEqual((dispatch.instructions[20].raw, dispatch.instructions[20].name), (6 << 55, "end"))
+    self.assertTrue(all(instruction.raw == 0 and instruction.name == "nop" for instruction in dispatch.instructions[21:]))
     range_sizes = {(memory_range.purpose, memory_range.size) for memory_range in submission.memory_ranges}
     self.assertTrue({("wait value", 4), ("event value", 4), ("counter value", 8), ("constants", 4096),
                      ("shader", runtime.image_size)} <= range_sizes)
@@ -368,6 +407,13 @@ class TestQCOMDriver(unittest.TestCase):
       shader_view[0] ^= 1
       self.assertEqual(dispatch.shader_image[0], first_byte)
     finally: shader_view[0] = first_byte
+
+    end_reserved_byte = 20 * 8 + 4
+    try:
+      shader_view[end_reserved_byte] ^= 1
+      with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 20"):
+        stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally: shader_view[end_reserved_byte] ^= 1
 
     def mutate(packet, payload_index, value):
       mutated = list(words)
@@ -503,6 +549,10 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((len(words), len(submission.dispatches)), (100, 1))
     self.assertIsNone(queue.binded_device)
     self.assertEqual(self.device.last_cmd, last_command)
+    image_instructions = submission.dispatches[0].instructions
+    self.assertEqual(tuple(instruction.name for instruction in image_instructions[:10]),
+                     ("shl.b", None, "nop", "add.u", "nop", "isam", "add.f", "nop", "stib.b", "end"))
+    self.assertTrue(all(instruction.raw == 0 for instruction in image_instructions[10:]))
 
     texture_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.tex_off)
     uav_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.ibo_off)
@@ -608,6 +658,8 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual([(resource.kind, resource.size, resource.pitch, resource.itemsize)
                       for resource in half_submission.dispatches[0].resources],
                      [("texture", 512, 512, 2), ("uav", 512, 512, 2)])
+    self.assertEqual(tuple(instruction.raw for instruction in half_submission.dispatches[0].instructions),
+                     tuple(instruction.raw for instruction in image_instructions))
     self.assertIsNone(half_queue.binded_device)
     self.assertEqual(self.device.last_cmd, last_command)
 
@@ -634,6 +686,12 @@ class TestQCOMDriver(unittest.TestCase):
                        [("texture", args_address + multi_runtime.tex_off, int(buffers[1]._buf.va_addr)),
                         ("texture", args_address + multi_runtime.tex_off + 64, int(buffers[2]._buf.va_addr)),
                         ("uav", args_address + multi_runtime.ibo_off, int(buffers[0]._buf.va_addr))])
+      self.assertEqual(tuple(instruction.name for instruction in dispatch.instructions[:11]),
+                       ("shl.b", None, "nop", "add.u", "nop", "isam", "isam", "add.f", "nop", "stib.b", "end"))
+      image_samples = [instruction for instruction in dispatch.instructions if instruction.name == "isam"]
+      self.assertEqual([[field for field in instruction.fields if field[0] in ("SAMP", "TEX")] for instruction in image_samples],
+                       [[("SAMP", 0), ("SAMP", 0), ("TEX", 0), ("TEX", 0)],
+                        [("SAMP", 1), ("SAMP", 1), ("TEX", 1), ("TEX", 1)]])
     self.assertIsNone(multi_queue.binded_device)
     self.assertEqual(self.device.last_cmd, last_command)
 

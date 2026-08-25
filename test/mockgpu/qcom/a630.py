@@ -1,12 +1,13 @@
 from __future__ import annotations
-import struct
+import ctypes, os, struct
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
-from tinygrad.runtime.autogen import mesa
+from tinygrad.runtime.autogen import libc, mesa
 from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
-# adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, and ir3_shader.h.
+# adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, ir3_shader.h,
+# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, isaspec.h, and isaspec_decode_impl.c.
 
 @dataclass(frozen=True)
 class A630MemoryRange:
@@ -55,6 +56,14 @@ class A630Resource:
   image:bytes|None = None
 
 @dataclass(frozen=True)
+class A630IR3Instruction:
+  index:int
+  category:int
+  raw:int
+  name:str|None
+  fields:tuple[tuple[str, int|str], ...]
+
+@dataclass(frozen=True)
 class A630Dispatch:
   word_offset:int
   registers:tuple[tuple[int, int], ...]
@@ -71,6 +80,7 @@ class A630Dispatch:
   global_size:tuple[int, int, int]
   groups:tuple[int, int, int]
   resources:tuple[A630Resource, ...] = ()
+  instructions:tuple[A630IR3Instruction, ...] = ()
 
 @dataclass(frozen=True)
 class A630Submission:
@@ -83,6 +93,94 @@ Resolver = Callable[[int, int], memoryview]
 
 def _require(condition:bool, message:str):
   if not condition: raise ValueError(message)
+
+def decode_a630_ir3(image:bytes) -> tuple[A630IR3Instruction, ...]:
+  _require(bool(image), "empty IR3 image")
+  _require(len(image) % 8 == 0, "IR3 image size must be a multiple of 8")
+  _require(len(image) <= 0x7fffffff, "IR3 image exceeds Mesa decoder size")
+  instructions:list[A630IR3Instruction] = []
+  current = [-1]
+  callback_errors:list[str] = []
+  pre_indices:list[int] = []
+  post_indices:list[int] = []
+  pre_images:list[bytes] = []
+  callback_fields:list[list[tuple[str, int|str]]] = [[], [], []]
+
+  @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.POINTER(ctypes.c_char), ctypes.POINTER(mesa.struct_isa_decode_value))
+  def field_cb(_data, name, value):
+    try:
+      if not name or not value: raise ValueError("null field callback value")
+      field_name = ctypes.string_at(name).decode("ascii")
+      if field_name.partition(":align=")[0] == "NAME":
+        if not value.contents.str: raise ValueError("null NAME callback value")
+        field_value:int|str = ctypes.string_at(value.contents.str).decode("ascii")
+      else: field_value = int(value.contents.num)
+      if not 0 <= current[0] < len(callback_fields): raise ValueError("field outside instruction callbacks")
+      callback_fields[current[0]].append((field_name, field_value))
+    except Exception as error: callback_errors.append(str(error))
+
+  @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+  def pre_cb(_data, index, instruction):
+    try:
+      current[0] = int(index)
+      if not instruction or not 0 <= current[0] < len(callback_fields): raise ValueError("invalid pre-instruction callback")
+      pre_indices.append(current[0])
+      pre_images.append(ctypes.string_at(instruction, 8))
+    except Exception as error: callback_errors.append(str(error))
+
+  @ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p)
+  def post_cb(_data, index, _instruction):
+    try:
+      if current[0] != int(index): raise ValueError("mismatched post-instruction callback")
+      post_indices.append(int(index))
+      current[0] = -1
+    except Exception as error: callback_errors.append(str(error))
+
+  sink = libc.fopen(os.devnull.encode(), b"w")
+  _require(bool(sink), "failed to open IR3 decoder output sink")
+  mesa_sink = ctypes.cast(sink, ctypes.POINTER(mesa.struct__IO_FILE))
+  try:
+    for index in range(len(image) // 8):
+      instruction = image[index*8:(index+1)*8]
+      # IR3 has no generated <decode> map in this Mesa revision, so this call supplies only the leaf-match result.
+      matched = mesa.ir3_isa_decode(None, instruction, mesa.struct_isa_decode_options(gpu_id=630, show_errors=False))
+      _require(matched, f"unmatched IR3 encoding at instruction {index}")
+
+      current[0] = -1
+      callback_errors.clear()
+      pre_indices.clear()
+      post_indices.clear()
+      pre_images.clear()
+      callback_fields[:] = [[], [], []]
+      # Mesa exposes reserved/assert failures only through its disassembler. In the pin, errors > max_errors is tested before
+      # the next word; two copies with max_errors=1 therefore expose an error by stopping before this zero callback sentinel.
+      probe = instruction * 2 + bytes(8)
+      mesa.ir3_isa_disasm(probe, len(probe), mesa_sink, mesa.struct_isa_decode_options(
+        gpu_id=630, show_errors=True, max_errors=1, branch_labels=False,
+        field_cb=field_cb, pre_instr_cb=pre_cb, post_instr_cb=post_cb))
+      _require(not callback_errors, f"IR3 callback failure at instruction {index}: {callback_errors[0] if callback_errors else ''}")
+      _require(pre_indices == [0, 1, 2] and post_indices == [0, 1, 2] and
+               pre_images == [instruction, instruction, bytes(8)], f"invalid or reserved IR3 encoding at instruction {index}")
+      _require(callback_fields[0] == callback_fields[1], f"inconsistent IR3 fields at instruction {index}")
+
+      fields = tuple(callback_fields[0])
+      names = [value for field,value in fields if field.partition(":align=")[0] == "NAME"]
+      name = names[0] if names else None
+      _require(len(names) <= 1 and (name is None or isinstance(name, str)), f"ambiguous IR3 name at instruction {index}")
+      assert name is None or isinstance(name, str)
+      _require(name not in {"ldp", "stp", "call", "ret"}, f"unsupported IR3 instruction {name}")
+      raw = int.from_bytes(instruction, "little")
+      instructions.append(A630IR3Instruction(index, raw >> 61, raw, name, fields))
+  finally:
+    libc.fclose(sink)
+
+  # Accept only the observed pinned-compiler image boundary: one canonical end followed by zero-filled allocation padding.
+  ends = [instruction.index for instruction in instructions if instruction.name == "end"]
+  _require(len(ends) == 1, "missing end instruction" if not ends else "multiple end instructions")
+  end = ends[0]
+  _require(instructions[end].raw == 6 << 55, "unsupported end instruction encoding")
+  _require(all(instruction.raw == 0 for instruction in instructions[end+1:]), "nonzero instruction after end")
+  return tuple(instructions)
 
 def _address(lo:int, hi:int, alignment:int, purpose:str) -> int:
   address = lo | hi << 32
@@ -330,6 +428,8 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
     resolved_range = replace(memory_range, image=image)
     resolved.append(resolved_range)
     if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
+  dispatch_instructions = tuple(decode_a630_ir3(read_images[(dispatch.shader_address, dispatch.shader_size, "shader")])
+                                for dispatch in dispatches)
   dispatch_resources = tuple(_resources(dispatch, read_images) for dispatch in dispatches)
   nested_ranges = tuple(A630MemoryRange(resource.address, resource.size, read=resource.read, write=resource.write,
                                         purpose=f"{resource.kind} {resource.index} target")
@@ -345,6 +445,7 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
     shader_image=read_images[(dispatch.shader_address, dispatch.shader_size, "shader")],
     constants_image=read_images[(dispatch.constants_address, dispatch.constants_size, "constants")],
     resources=tuple(replace(resource,
-      image=read_images[(resource.address, resource.size, f"{resource.kind} {resource.index} target")]) for resource in resources))
-    for dispatch,resources in zip(dispatches, dispatch_resources))
+      image=read_images[(resource.address, resource.size, f"{resource.kind} {resource.index} target")]) for resource in resources),
+    instructions=instructions)
+    for dispatch,resources,instructions in zip(dispatches, dispatch_resources, dispatch_instructions))
   return A630Submission(frozen_dispatches, tuple(resolved), tuple(waits), tuple(writes))
