@@ -321,7 +321,8 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad.engine.realize import get_runtime
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMProgram
     from tinygrad.runtime.autogen import kgsl, mesa
-    from test.mockgpu.qcom.pm4 import PM4Type7Packet, parse_pm4
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import PM4Type4Packet, PM4Type7Packet, parse_pm4
     last_command = self.device.last_cmd
     source = Tensor([0., 1.], device=Device.DEFAULT).realize()
     result = source + 1
@@ -335,20 +336,109 @@ class TestQCOMDriver(unittest.TestCase):
     queue.wait(self.device.timeline_signal, self.device.timeline_value - 1)
     queue.memory_barrier()
     queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    queue.timestamp(self.device.timeline_signal)
     queue.signal(self.device.timeline_signal, self.device.timeline_value)
-    packets = parse_pm4(tuple(queue._q))
+    words = tuple(queue._q)
+    packets = parse_pm4(words)
+    submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
     self.assertIs(type(runtime), QCOMProgram)
     self.assertIs(type(queue), QCOMComputeQueue)
     self.assertGreater(runtime.image_size, 0)
     self.assertEqual(runtime.image_size % 128, 0)
     self.assertTrue(any(isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS for packet in packets))
-    command_buffer, _, request = self.gpu_command(tuple(queue._q))
+    self.assertEqual(len(submission.dispatches), 1)
+    dispatch = submission.dispatches[0]
+    self.assertEqual((dispatch.shader_address, dispatch.shader_size), (int(runtime.lib_gpu.va_addr), runtime.image_size))
+    self.assertEqual(dispatch.shader_image, bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)))
+    self.assertEqual((dispatch.constants_address, dispatch.constants_size), (int(args.buf.va_addr), 4096))
+    self.assertEqual((dispatch.local_size, dispatch.groups), (tuple(program_spec.arg.local_size), tuple(program_spec.arg.global_size)))
+    self.assertEqual(dispatch.global_size, tuple(g*l for g,l in zip(dispatch.groups, dispatch.local_size)))
+    range_sizes = {(memory_range.purpose, memory_range.size) for memory_range in submission.memory_ranges}
+    self.assertTrue({("wait value", 4), ("event value", 4), ("counter value", 8), ("constants", 4096),
+                     ("shader", runtime.image_size)} <= range_sizes)
+    self.assertEqual((submission.waits[0].address, submission.waits[0].mask),
+                     (self.device.timeline_signal.value_addr, 0xffffffff))
+    self.assertTrue(any(write.size == 8 and write.value is None for write in submission.writes))
+    self.assertTrue(any(write.size == 4 and write.value == self.device.timeline_value for write in submission.writes))
+    self.assertFalse(any(name in dispatch.__dataclass_fields__ for name in ("program", "uops", "python_program")))
+
+    shader_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    first_byte = shader_view[0]
+    try:
+      shader_view[0] ^= 1
+      self.assertEqual(dispatch.shader_image[0], first_byte)
+    finally: shader_view[0] = first_byte
+
+    def mutate(packet, payload_index, value):
+      mutated = list(words)
+      mutated[packet.word_offset + 1 + payload_index] = value
+      return mutated
+
+    def remove(packet): return words[:packet.word_offset] + words[packet.word_offset+len(packet.values)+1:]
+
+    wait_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_WAIT_REG_MEM)
+    marker_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_SET_MARKER)
+    load_packets = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_LOAD_STATE6_FRAG]
+    constants_packet = next(packet for packet in load_packets if packet.values[0] >> 14 & 0x3 == mesa.ST_CONSTANTS)
+    shader_packet = next(packet for packet in load_packets if packet.values[0] >> 14 & 0x3 == mesa.ST_SHADER)
+    exec_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS)
+    ndrange_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_NDRANGE_0)
+    cntl_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CNTL_0)
+    instr_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_INSTR_SIZE)
+    config_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CONFIG)
+    mode_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_MODE_CNTL)
+    update_clear = [packet for packet in packets if isinstance(packet, PM4Type4Packet) and
+                    packet.register == mesa.REG_A6XX_SP_UPDATE_CNTL][1]
+    semantic_cases = (
+      mutate(wait_packet, 0, wait_packet.values[0] | 1 << 31),
+      mutate(marker_packet, 0, marker_packet.values[0] | 1 << 8),
+      mutate(constants_packet, 0, constants_packet.values[0] + (1 << 22)),
+      mutate(shader_packet, 1, shader_packet.values[1] | 1),
+      mutate(exec_packet, 1, 0),
+      mutate(ndrange_packet, 9, ndrange_packet.values[9] + 1),
+      mutate(cntl_packet, 4, cntl_packet.values[4] + 128),
+      mutate(instr_packet, 0, instr_packet.values[0] + 1),
+      mutate(config_packet, 0, config_packet.values[0] | 1 << 17),
+      mutate(update_clear, 0, 1),
+      remove(mode_packet),
+      remove(exec_packet),
+    )
+    for mutated in semantic_cases:
+      resolver = mock.Mock(side_effect=AssertionError("semantic failure reached resolver"))
+      with self.subTest(word=next(i for i,(left,right) in enumerate(zip(words, mutated)) if left != right)), self.assertRaises(ValueError):
+        stage_a630(parse_pm4(mutated), resolver)
+      resolver.assert_not_called()
+
+    command_buffer, _, request = self.gpu_command(words)
     request.timestamp = 0x87654321
     with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
     self.assertEqual(request.timestamp, 0x87654321)
     self.device._gpu_free(command_buffer)
     self.assertEqual(self.device.last_cmd, last_command)
+
+    invalid_tail = list(words)
+    final_event = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and
+                   packet.opcode == mesa.CP_EVENT_WRITE and len(packet.values) == 4][-1]
+    dummy_allocation = self.allocation_for(self.device.dummy_addr, 1)
+    self.assertIsNotNone(dummy_allocation)
+    invalid_address = dummy_allocation.addr + dummy_allocation.size
+    invalid_tail[final_event.word_offset+2:final_event.word_offset+4] = (invalid_address & 0xffffffff, invalid_address >> 32)
+    invalid_buffer, _, invalid_request = self.gpu_command(invalid_tail)
+    invalid_request.timestamp = 0x13572468
+    before = (dict(self.driver.contexts), dict(self.driver.user_mappings), dict(self.driver.power_levels),
+              bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
+              bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
+              bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)))
+    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=invalid_request)
+    self.assertEqual(invalid_request.timestamp, 0x13572468)
+    self.assertEqual((self.driver.contexts, self.driver.user_mappings, self.driver.power_levels,
+                      bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
+                      bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
+                      bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size))), before)
+    self.assertEqual(self.device.last_cmd, last_command)
+    self.device._gpu_free(invalid_buffer)
 
   def test_ioctl_and_mmap_fail_closed(self):
     from tinygrad.runtime.autogen import kgsl

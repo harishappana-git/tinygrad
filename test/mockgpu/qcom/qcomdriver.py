@@ -5,6 +5,7 @@ from typing import Any, Callable, Iterator, cast
 from tinygrad.runtime.autogen import kgsl, libc
 from tinygrad.helpers import DEV, Target, to_mv
 from test.mockgpu.driver import VirtDriver, VirtFile, VirtFileDesc
+from test.mockgpu.qcom.a630 import stage_a630
 from test.mockgpu.qcom.pm4 import parse_pm4
 
 PAGE_SIZE = 0x1000
@@ -250,6 +251,8 @@ class QCOMDriver(VirtDriver):
     self._require(command.gpuaddr != 0 and command.gpuaddr % 4 == 0, f"unaligned command address {command.gpuaddr:#x}")
     self._require(command.size > 0 and command.size % 4 == 0, f"invalid command size {command.size:#x}")
     command_bytes = bytes(self.resolve_owned(fd, command.gpuaddr, command.size, internal_only=True))
-    try: parse_pm4(struct.unpack(f"<{command.size // 4}I", command_bytes))
+    try:
+      packets = parse_pm4(struct.unpack(f"<{command.size // 4}I", command_bytes))
+      stage_a630(packets, lambda address,size: self.resolve_owned(fd, address, size))
     except ValueError as error: raise RuntimeError(f"invalid KGSL request: {error}") from error
     raise RuntimeError("A630 PM4 execution and retirement are not implemented")
