@@ -1,16 +1,18 @@
 from __future__ import annotations
+import struct
 from dataclasses import dataclass, replace
 from typing import Callable, Sequence
 from tinygrad.runtime.autogen import mesa
 from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
-# adreno_pm4.xml, a6xx.xml, tu_shader.cc, tu_cmd_buffer.cc, and ir3_shader.h.
+# adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, and ir3_shader.h.
 
 @dataclass(frozen=True)
 class A630MemoryRange:
   address:int
   size:int
+  read:bool
   write:bool
   purpose:str
   image:bytes|None = None
@@ -38,6 +40,21 @@ class A630Write:
   purpose:str
 
 @dataclass(frozen=True)
+class A630Resource:
+  kind:str
+  index:int
+  descriptor_address:int
+  address:int
+  size:int
+  read:bool
+  write:bool
+  width:int
+  height:int
+  pitch:int
+  itemsize:int
+  image:bytes|None = None
+
+@dataclass(frozen=True)
 class A630Dispatch:
   word_offset:int
   registers:tuple[tuple[int, int], ...]
@@ -53,6 +70,7 @@ class A630Dispatch:
   local_size:tuple[int, int, int]
   global_size:tuple[int, int, int]
   groups:tuple[int, int, int]
+  resources:tuple[A630Resource, ...] = ()
 
 @dataclass(frozen=True)
 class A630Submission:
@@ -142,6 +160,52 @@ def _load_state(values:tuple[int, ...]) -> A630LoadState:
   address = _address(values[1], values[2], alignment, kind)
   return A630LoadState(kind, address, units * unit_size, units)
 
+def _resource_descriptor(kind:str, index:int, descriptor_address:int, image:bytes) -> A630Resource:
+  words = struct.unpack("<16I", image)
+  fmt = words[0] >> 22 & 0xff
+  formats = {mesa.FMT6_16_16_16_16_FLOAT:2, mesa.FMT6_32_32_32_32_FLOAT:4}
+  _require(fmt in formats, f"unsupported {kind} descriptor format {fmt}")
+  # Bit 3 and words 6/7 are opaque unchanged-runtime literals: the pinned descriptor XML does not assign them these meanings.
+  expected_word0 = fmt << 22 | (0x6888 if kind == "texture" else 0)
+  _require(words[0] == expected_word0, f"unsupported {kind} descriptor word 0")
+  _require(words[1] & 0xc0000000 == 0, f"unsupported {kind} descriptor word 1")
+  width, height = words[1] & 0x7fff, words[1] >> 15 & 0x7fff
+  _require(0 < width <= 16384 and 0 < height <= 16384, f"unsupported {kind} descriptor dimensions")
+  _require(words[2] & 0x70 == 0 and words[2] >> 29 == mesa.A6XX_TEX_2D, f"unsupported {kind} descriptor word 2")
+  pitch, pitch_alignment = words[2] >> 7 & 0x3fffff, words[2] & 0xf
+  itemsize = formats[fmt]
+  _require(pitch >= 64 and pitch % 64 == 0 and pitch == width * 4 * itemsize, f"unsupported {kind} descriptor pitch")
+  _require(pitch_alignment == (pitch & -pitch).bit_length() - 7, f"invalid {kind} descriptor pitch alignment")
+  _require(words[3] == 0, f"unsupported {kind} descriptor word 3")
+  _require(words[5] & ~0x1ffff == 0, f"unsupported {kind} descriptor depth or address")
+  address = _address(words[4], words[5], 32, f"{kind} target")
+  _require(words[6:] == (0x40000000, 13) + (0,) * 8, f"unsupported {kind} descriptor tail")
+  size = pitch * height
+  _require(address + size <= 1 << 49, f"overflowing {kind} target range")
+  return A630Resource(kind, index, descriptor_address, address, size, True, kind == "uav", width, height, pitch, itemsize)
+
+def _resources(dispatch:A630Dispatch, read_images:dict[tuple[int, int, str], bytes]) -> tuple[A630Resource, ...]:
+  registers = dict(dispatch.registers)
+  config = registers[mesa.REG_A6XX_SP_CS_CONFIG]
+  counts = {"samplers":config >> 17 & 0x1f, "textures":config >> 9 & 0xff, "uavs":config >> 22 & 0x7f}
+  loads = {load.kind:load for load in dispatch.loads}
+  if (count:=counts["samplers"]):
+    table = read_images[(loads["samplers"].address, count * 16, "samplers descriptors")]
+    for index in range(count):
+      _require(struct.unpack_from("<4I", table, index * 16) == (0x1b60, 0x30, 0, 0), f"unsupported sampler descriptor {index}")
+    border_words = _registers(registers, mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE, 2, "border-color base")
+    border_address = _address(border_words[0], border_words[1], 128, "border-color")
+    _require(read_images[(border_address, 128, "border color")] == bytes(128), "unsupported border color")
+
+  resources:list[A630Resource] = []
+  for plural,kind in (("textures", "texture"), ("uavs", "uav")):
+    if not (count:=counts[plural]): continue
+    load = loads[plural]
+    table = read_images[(load.address, count * 64, f"{plural} descriptors")]
+    resources.extend(_resource_descriptor(kind, index, load.address + index * 64, table[index*64:(index+1)*64])
+                     for index in range(count))
+  return tuple(resources)
+
 def _dispatch(regs:dict[int, int], loads:dict[str, A630LoadState], packet:PM4Type7Packet,
               ranges:list[A630MemoryRange]) -> A630Dispatch:
   values = packet.values
@@ -170,8 +234,11 @@ def _dispatch(regs:dict[int, int], loads:dict[str, A630LoadState], packet:PM4Typ
   shader_base = _address(cntl[4], cntl[5], 128, "shader")
   stack_base = _address(cntl[7], cntl[8], 32, "private-memory base")
   _require(shader.address == shader_base and shader.units == instr_size, "shader base or instruction size differs from state load")
+  # The unchanged runtime emits this inert raw value even with zero private memory; no stack range is implied or accepted.
+  _require(stack_offset == 0x1000, "unsupported private-stack offset")
 
   nsamp, ntex, nuav = config >> 17 & 0x1f, config >> 9 & 0xff, config >> 22 & 0x7f
+  _require(nsamp == ntex and ntex + nuav <= mesa.IR3_MAX_SHADER_IMAGES, "unsupported IR3 resource counts")
   resources = (("samplers", nsamp, mesa.REG_A6XX_SP_CS_SAMPLER_BASE, 16, nsamp),
                ("textures", ntex, mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, 64, min(16, ntex)),
                ("uavs", nuav, mesa.REG_A6XX_SP_CS_UAV_BASE, 64, nuav))
@@ -181,10 +248,15 @@ def _dispatch(regs:dict[int, int], loads:dict[str, A630LoadState], packet:PM4Typ
     base_words = _registers(regs, base_register, 2, f"{kind} base")
     base = _address(base_words[0], base_words[1], unit_size if kind != "uavs" else 16, kind)
     _require(base == loads[kind].address, f"{kind} base differs from state load")
-    ranges.append(A630MemoryRange(base, count * unit_size, False, f"{kind} descriptors"))
+    expected_base = constants.address + {"textures":2048, "uavs":2048 + 64*ntex,
+                                         "samplers":2048 + 64*(ntex+nuav)}[kind]
+    _require(base == expected_base, f"unsupported {kind} descriptor-table placement")
+    _require(base % 64 == 0, f"unsupported {kind} descriptor-table alignment")
+    ranges.append(A630MemoryRange(base, count * unit_size, read=True, write=False, purpose=f"{kind} descriptors"))
   if nsamp:
     border = _registers(regs, mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE, 2, "border-color base")
-    ranges.append(A630MemoryRange(_address(border[0], border[1], 128, "border-color"), 128, False, "border color"))
+    ranges.append(A630MemoryRange(_address(border[0], border[1], 128, "border-color"), 128,
+                                  read=True, write=False, purpose="border color"))
 
   active_loads = tuple(loads[kind] for kind in ("constants", "shader", "samplers", "textures", "uavs") if kind in loads)
   return A630Dispatch(packet.word_offset, tuple(sorted(regs.items())), active_loads, shader.address, shader.size, b"", constants.address,
@@ -219,20 +291,20 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
       _require(values[0] == (mesa.WRITE_GE | mesa.POLL_MEMORY << 4) and values[4] == 0xffffffff and values[5] == 32,
                "invalid memory-wait control")
       address = _address(values[1], values[2], 4, "wait")
-      ranges.append(A630MemoryRange(address, 4, False, "wait value"))
+      ranges.append(A630MemoryRange(address, 4, read=True, write=False, purpose="wait value"))
       waits.append(A630Wait(packet.word_offset, address, values[3], values[4]))
     elif packet.opcode == mesa.CP_EVENT_WRITE:
       if len(values) == 1: _require(values[0] == mesa.CACHE_INVALIDATE, "invalid cache-invalidate event")
       else:
         _require(values[0] == mesa.CACHE_FLUSH_TS, "invalid cache-flush event")
         address = _address(values[1], values[2], 4, "event-write")
-        ranges.append(A630MemoryRange(address, 4, True, "event value"))
+        ranges.append(A630MemoryRange(address, 4, read=False, write=True, purpose="event value"))
         writes.append(A630Write(packet.word_offset, address, 4, values[3], "event value"))
     elif packet.opcode == mesa.CP_REG_TO_MEM:
       expected = mesa.REG_A6XX_CP_ALWAYS_ON_COUNTER | 2 << 18 | 1 << 30
       _require(values[0] == expected, "invalid counter-to-memory control")
       address = _address(values[1], values[2], 8, "counter")
-      ranges.append(A630MemoryRange(address, 8, True, "counter value"))
+      ranges.append(A630MemoryRange(address, 8, read=False, write=True, purpose="counter value"))
       writes.append(A630Write(packet.word_offset, address, 8, None, "counter value"))
     elif packet.opcode in (mesa.CP_WAIT_MEM_WRITES, mesa.CP_WAIT_FOR_IDLE): pass
     elif packet.opcode == mesa.CP_SET_MARKER:
@@ -241,7 +313,7 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
     elif packet.opcode == mesa.CP_LOAD_STATE6_FRAG:
       load = _load_state(values)
       loads[load.kind] = load
-      ranges.append(A630MemoryRange(load.address, load.size, False, load.kind))
+      ranges.append(A630MemoryRange(load.address, load.size, read=True, write=False, purpose=load.kind))
     elif packet.opcode == mesa.CP_EXEC_CS:
       _require(marker_pending, "compute dispatch without marker")
       dispatches.append(_dispatch(regs, loads, packet, ranges))
@@ -254,11 +326,25 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
   for memory_range in ranges:
     view = resolver(memory_range.address, memory_range.size)
     _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
-    image = None if memory_range.write else bytes(view)
+    image = bytes(view) if memory_range.read else None
     resolved_range = replace(memory_range, image=image)
     resolved.append(resolved_range)
     if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
+  dispatch_resources = tuple(_resources(dispatch, read_images) for dispatch in dispatches)
+  nested_ranges = tuple(A630MemoryRange(resource.address, resource.size, read=resource.read, write=resource.write,
+                                        purpose=f"{resource.kind} {resource.index} target")
+                        for resources in dispatch_resources for resource in resources)
+  for memory_range in nested_ranges:
+    view = resolver(memory_range.address, memory_range.size)
+    _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
+    image = bytes(view) if memory_range.read else None
+    resolved.append(replace(memory_range, image=image))
+    if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
+
   frozen_dispatches = tuple(replace(dispatch,
     shader_image=read_images[(dispatch.shader_address, dispatch.shader_size, "shader")],
-    constants_image=read_images[(dispatch.constants_address, dispatch.constants_size, "constants")]) for dispatch in dispatches)
+    constants_image=read_images[(dispatch.constants_address, dispatch.constants_size, "constants")],
+    resources=tuple(replace(resource,
+      image=read_images[(resource.address, resource.size, f"{resource.kind} {resource.index} target")]) for resource in resources))
+    for dispatch,resources in zip(dispatches, dispatch_resources))
   return A630Submission(frozen_dispatches, tuple(resolved), tuple(waits), tuple(writes))

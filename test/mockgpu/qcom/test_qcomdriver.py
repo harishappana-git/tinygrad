@@ -385,6 +385,8 @@ class TestQCOMDriver(unittest.TestCase):
     ndrange_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_NDRANGE_0)
     cntl_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CNTL_0)
     instr_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_INSTR_SIZE)
+    stack_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and
+                        packet.register == mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET)
     config_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CONFIG)
     mode_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_MODE_CNTL)
     update_clear = [packet for packet in packets if isinstance(packet, PM4Type4Packet) and
@@ -398,6 +400,7 @@ class TestQCOMDriver(unittest.TestCase):
       mutate(ndrange_packet, 9, ndrange_packet.values[9] + 1),
       mutate(cntl_packet, 4, cntl_packet.values[4] + 128),
       mutate(instr_packet, 0, instr_packet.values[0] + 1),
+      mutate(stack_packet, 0, stack_packet.values[0] + 1),
       mutate(config_packet, 0, config_packet.values[0] | 1 << 17),
       mutate(update_clear, 0, 1),
       remove(mode_packet),
@@ -408,6 +411,21 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(word=next(i for i,(left,right) in enumerate(zip(words, mutated)) if left != right)), self.assertRaises(ValueError):
         stage_a630(parse_pm4(mutated), resolver)
       resolver.assert_not_called()
+
+    repeated_queue = self.device.hw_compute_queue_t()
+    repeated_queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    repeated_queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    repeated_packets = parse_pm4(tuple(repeated_queue._q))
+    repeated = stage_a630(repeated_packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    self.assertEqual(len(repeated.dispatches), 2)
+    self.assertLess(repeated.dispatches[0].word_offset, repeated.dispatches[1].word_offset)
+    self.assertEqual(tuple(item.shader_image for item in repeated.dispatches), (dispatch.shader_image, dispatch.shader_image))
+    second_exec = [packet for packet in repeated_packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS][1]
+    invalid_second = list(repeated_queue._q)
+    invalid_second[second_exec.word_offset+2] = 0
+    resolver = mock.Mock(side_effect=AssertionError("invalid second dispatch reached resolver"))
+    with self.assertRaises(ValueError): stage_a630(parse_pm4(invalid_second), resolver)
+    resolver.assert_not_called()
 
     command_buffer, _, request = self.gpu_command(words)
     request.timestamp = 0x87654321
@@ -439,6 +457,192 @@ class TestQCOMDriver(unittest.TestCase):
                       bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size))), before)
     self.assertEqual(self.device.last_cmd, last_command)
     self.device._gpu_free(invalid_buffer)
+
+  def test_production_image_descriptor_path_preflights_nested_ranges(self):
+    import struct
+    from tinygrad import Tensor, dtypes
+    from tinygrad.codegen import to_program
+    from tinygrad.device import Buffer, Device
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.helpers import Context, Target
+    from tinygrad.renderer.nir import IR3Renderer
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import parse_pm4
+    from test.mockgpu.qcom.qcomdriver import ioctl_code
+
+    last_command = self.device.last_cmd
+    # Exact DEV routing stays a630; image coalescing additionally requires the production renderer's pitch capability.
+    image_arch = self.device.arch if "IMAGE_PITCH_ALIGNMENT=" in self.device.arch else f"{self.device.arch},IMAGE_PITCH_ALIGNMENT=64"
+    renderer = IR3Renderer(Target.parse(f"MOCK+QCOM:IR3:{image_arch}"))
+    def compile_image(dtype):
+      with Context(IMAGE=2):
+        source = Tensor.empty(16, 4, 4, device="QCOM", dtype=dtype).contiguous()
+        result = (source + 1).contiguous()
+        schedule_item = result.schedule_linear().src[-1]
+        return to_program(schedule_item.src[0], renderer)
+    program_spec = compile_image(dtypes.float)
+    runtime = get_runtime(self.device.device, program_spec)
+    output_buffer = Buffer("QCOM", 256, dtypes.float).ensure_allocated()
+    input_buffer = Buffer("QCOM", 256, dtypes.float).ensure_allocated()
+    input_buffer._buf.cpu_view().mv[:8] = b"A630TEX!"
+    args = runtime.fill_kernargs((output_buffer._buf, input_buffer._buf))
+    queue = self.device.hw_compute_queue_t()
+    queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    words = tuple(queue._q)
+    submission = stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+
+    self.assertEqual(Device.DEFAULT, "QCOM")
+    self.assertEqual(self.device.renderer.target.arch, "a630")
+    self.assertEqual(renderer.target.arch, image_arch)
+    self.assertEqual(program_spec.to_elf().signature,
+                     ((None, 0, dtypes.float, (1, 64, 4)), (None, 1, dtypes.float, (1, 64, 4))))
+    self.assertEqual((runtime.image_size, runtime.pvtmem, runtime.samp_cnt, runtime.tex_cnt, runtime.ibo_cnt), (128, 0, 1, 1, 1))
+    self.assertEqual((runtime.tex_off, runtime.ibo_off, runtime.samp_off, runtime.kernargs_alloc_size), (2048, 2112, 2176, 2304))
+    self.assertEqual((program_spec.arg.global_size, program_spec.arg.local_size), ((2, 1, 1), (32, 1, 1)))
+    self.assertEqual((len(words), len(submission.dispatches)), (100, 1))
+    self.assertIsNone(queue.binded_device)
+    self.assertEqual(self.device.last_cmd, last_command)
+
+    texture_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.tex_off)
+    uav_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.ibo_off)
+    sampler_words = struct.unpack_from("<4I", bytes(args.buf.cpu_view().mv), runtime.samp_off)
+    input_address, output_address = int(input_buffer._buf.va_addr), int(output_buffer._buf.va_addr)
+    self.assertEqual(texture_words[:4] + texture_words[6:], (0x20806888, 0x8040, 0x20020004, 0) +
+                     (0x40000000, 13) + (0,) * 8)
+    self.assertEqual(uav_words[:4] + uav_words[6:], (0x20800000, 0x8040, 0x20020004, 0) + (0x40000000, 13) + (0,) * 8)
+    self.assertEqual(sampler_words, (0x1b60, 0x30, 0, 0))
+    self.assertEqual(texture_words[4] | texture_words[5] << 32, input_address)
+    self.assertEqual(uav_words[4] | uav_words[5] << 32, output_address)
+
+    resources = submission.dispatches[0].resources
+    self.assertEqual([(resource.kind, resource.descriptor_address, resource.address, resource.size, resource.read, resource.write,
+                       resource.width, resource.height, resource.pitch, resource.itemsize) for resource in resources],
+                     [("texture", int(args.buf.va_addr) + runtime.tex_off, input_address, 1024, True, False, 64, 1, 1024, 4),
+                      ("uav", int(args.buf.va_addr) + runtime.ibo_off, output_address, 1024, True, True, 64, 1, 1024, 4)])
+    self.assertEqual(resources[0].image, bytes(input_buffer._buf.cpu_view().mv[:1024]))
+    self.assertEqual(resources[1].image, bytes(output_buffer._buf.cpu_view().mv[:1024]))
+    nested_ranges = {(memory_range.purpose, memory_range.address, memory_range.size, memory_range.read, memory_range.write)
+                     for memory_range in submission.memory_ranges if memory_range.purpose.endswith(" target")}
+    self.assertEqual(nested_ranges, {("texture 0 target", input_address, 1024, True, False),
+                                     ("uav 0 target", output_address, 1024, True, True)})
+
+    descriptor_view = args.buf.cpu_view().mv
+    descriptor_cases = ((runtime.samp_off, 0), (runtime.tex_off, 0), (runtime.tex_off+4, 0), (runtime.tex_off+8, 0),
+                        (runtime.tex_off+12, 1), (runtime.tex_off+16, texture_words[4] | 1),
+                        (runtime.tex_off+20, texture_words[5] | 1 << 17), (runtime.tex_off+24, 0),
+                        (runtime.tex_off+28, 0), (runtime.tex_off+32, 1), (runtime.ibo_off, 0))
+    for offset,value in descriptor_cases:
+      original_word = bytes(descriptor_view[offset:offset+4])
+      nested_calls:list[tuple[int, int]] = []
+      def tracking_resolver(address:int, size:int):
+        nested_calls.append((address, size))
+        return self.driver.resolve_owned(self.device.fd.fd, address, size)
+      try:
+        struct.pack_into("<I", descriptor_view, offset, value)
+        with self.subTest(descriptor_offset=offset), self.assertRaises(ValueError):
+          stage_a630(parse_pm4(words), tracking_resolver)
+        self.assertFalse(any(address in (input_address, output_address) for address,_ in nested_calls))
+      finally: descriptor_view[offset:offset+4] = original_word
+
+    border_view = self.device.border_color_buf.cpu_view().mv
+    original_border = border_view[0]
+    try:
+      border_view[0] = 1
+      with self.assertRaisesRegex(ValueError, "unsupported border color"):
+        stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally: border_view[0] = original_border
+
+    original_address = bytes(descriptor_view[runtime.ibo_off+16:runtime.ibo_off+24])
+    invalid_address = (1 << 48) - 0x1000
+    try:
+      struct.pack_into("<Q", descriptor_view, runtime.ibo_off+16, invalid_address)
+      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+        stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally: descriptor_view[runtime.ibo_off+16:runtime.ibo_off+24] = original_address
+
+    external_backing = bytearray(0x3000)
+    external_address = (mv_address(memoryview(external_backing)) + 0xfff) & ~0xfff
+    kgsl.IOCTL_KGSL_MAP_USER_MEM(self.device.fd, hostptr=external_address, len=0x1000, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
+    try:
+      struct.pack_into("<Q", descriptor_view, runtime.ibo_off+16, external_address)
+      external_submission = stage_a630(parse_pm4(words),
+                                        lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      self.assertEqual(external_submission.dispatches[0].resources[1].address, external_address)
+      struct.pack_into("<Q", descriptor_view, runtime.ibo_off+16, external_address + 0xe00)
+      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+        stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally:
+      descriptor_view[runtime.ibo_off+16:runtime.ibo_off+24] = original_address
+      kgsl.IOCTL_KGSL_SHAREDMEM_FREE(self.device.fd, gpuaddr=external_address)
+
+    other_fd = self.driver.open('/dev/kgsl-3d0', os.O_RDWR, 0, self.driver.tracked_files[0])
+    try:
+      foreign = kgsl.struct_kgsl_map_user_mem(hostptr=external_address, len=0x1000, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
+      other_fd.ioctl(other_fd.fd, ioctl_code(kgsl.IOCTL_KGSL_MAP_USER_MEM), ctypes.addressof(foreign))
+      struct.pack_into("<Q", descriptor_view, runtime.ibo_off+16, external_address)
+      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+        stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally:
+      descriptor_view[runtime.ibo_off+16:runtime.ibo_off+24] = original_address
+      other_fd.close(other_fd.fd)
+    try:
+      struct.pack_into("<Q", descriptor_view, runtime.ibo_off+16, external_address)
+      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+        stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally: descriptor_view[runtime.ibo_off+16:runtime.ibo_off+24] = original_address
+
+    half_program = compile_image(dtypes.half)
+    half_runtime = get_runtime(self.device.device, half_program)
+    half_output = Buffer("QCOM", 256, dtypes.half).ensure_allocated()
+    half_input = Buffer("QCOM", 256, dtypes.half).ensure_allocated()
+    half_args = half_runtime.fill_kernargs((half_output._buf, half_input._buf))
+    half_queue = self.device.hw_compute_queue_t()
+    half_queue.exec(half_runtime, half_args, half_program.arg.global_size, half_program.arg.local_size)
+    half_submission = stage_a630(parse_pm4(tuple(half_queue._q)),
+                                 lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    half_texture = struct.unpack_from("<16I", bytes(half_args.buf.cpu_view().mv), half_runtime.tex_off)
+    half_uav = struct.unpack_from("<16I", bytes(half_args.buf.cpu_view().mv), half_runtime.ibo_off)
+    self.assertEqual((half_texture[0], half_uav[0], half_texture[2], half_uav[2]),
+                     (0x18806888, 0x18800000, 0x20010003, 0x20010003))
+    self.assertEqual([(resource.kind, resource.size, resource.pitch, resource.itemsize)
+                      for resource in half_submission.dispatches[0].resources],
+                     [("texture", 512, 512, 2), ("uav", 512, 512, 2)])
+    self.assertIsNone(half_queue.binded_device)
+    self.assertEqual(self.device.last_cmd, last_command)
+
+    with Context(IMAGE=2):
+      left, right = Tensor.empty(16, 4, 4, device="QCOM"), Tensor.empty(16, 4, 4, device="QCOM")
+      multi_item = (left + right).contiguous().schedule_linear().src[-1]
+      multi_program = to_program(multi_item.src[0], renderer)
+    multi_runtime = get_runtime(self.device.device, multi_program)
+    multi_queue, multi_args, multi_buffers = self.device.hw_compute_queue_t(), [], []
+    for _ in range(2):
+      buffers = tuple(Buffer("QCOM", 256, dtypes.float).ensure_allocated() for _ in range(3))
+      args_state = multi_runtime.fill_kernargs(tuple(buffer._buf for buffer in buffers))
+      multi_buffers.append(buffers)
+      multi_args.append(args_state)
+      multi_queue.exec(multi_runtime, args_state, multi_program.arg.global_size, multi_program.arg.local_size)
+    multi_submission = stage_a630(parse_pm4(tuple(multi_queue._q)),
+                                  lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    self.assertEqual((multi_runtime.samp_cnt, multi_runtime.tex_cnt, multi_runtime.ibo_cnt), (2, 2, 1))
+    self.assertEqual(len(multi_submission.dispatches), 2)
+    self.assertNotEqual(int(multi_args[0].buf.va_addr), int(multi_args[1].buf.va_addr))
+    for dispatch,args_state,buffers in zip(multi_submission.dispatches, multi_args, multi_buffers):
+      args_address = int(args_state.buf.va_addr)
+      self.assertEqual([(resource.kind, resource.descriptor_address, resource.address) for resource in dispatch.resources],
+                       [("texture", args_address + multi_runtime.tex_off, int(buffers[1]._buf.va_addr)),
+                        ("texture", args_address + multi_runtime.tex_off + 64, int(buffers[2]._buf.va_addr)),
+                        ("uav", args_address + multi_runtime.ibo_off, int(buffers[0]._buf.va_addr))])
+    self.assertIsNone(multi_queue.binded_device)
+    self.assertEqual(self.device.last_cmd, last_command)
+
+    command_buffer, _, request = self.gpu_command(words)
+    request.timestamp = 0x24681357
+    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    self.assertEqual((request.timestamp, self.device.last_cmd), (0x24681357, last_command))
+    self.device._gpu_free(command_buffer)
 
   def test_ioctl_and_mmap_fail_closed(self):
     from tinygrad.runtime.autogen import kgsl
