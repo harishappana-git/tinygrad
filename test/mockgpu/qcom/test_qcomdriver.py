@@ -1,5 +1,5 @@
 import ctypes, functools, mmap, os, unittest
-from typing import Any
+from typing import Any, cast
 from unittest import mock
 from tinygrad.helpers import DEV, mv_address
 
@@ -21,6 +21,15 @@ class TestQCOMDriver(unittest.TestCase):
   def allocation_for(self, addr:int, size:int):
     return next((allocation for allocation in self.driver.allocations.values()
                  if allocation.addr is not None and allocation.addr <= addr and addr + size <= allocation.addr + allocation.size), None)
+
+  def gpu_command(self, words):
+    from tinygrad.runtime.autogen import kgsl
+    buffer = self.device._gpu_alloc(len(words) * 4, fill_zeroes=True)
+    (ctypes.c_uint32 * len(words)).from_address(int(buffer.va_addr))[:] = words
+    command = kgsl.struct_kgsl_command_object(gpuaddr=int(buffer.va_addr), size=len(words) * 4, flags=kgsl.KGSL_CMDLIST_IB)
+    request = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(command), cmdsize=ctypes.sizeof(command), numcmds=1,
+                                           context_id=self.device.ctx)
+    return buffer, command, request
 
   def test_production_backend_identity_and_initialization(self):
     from tinygrad.device import Device
@@ -195,6 +204,152 @@ class TestQCOMDriver(unittest.TestCase):
                                   value=ctypes.addressof(constraint), sizebytes=ctypes.sizeof(constraint))
     self.assertEqual(self.driver.power_levels[self.device.ctx], kgsl.KGSL_CONSTRAINT_PWR_MAX)
 
+  def test_gpu_command_validation_does_not_retire(self):
+    from tinygrad.runtime.autogen import kgsl, mesa
+    from tinygrad.runtime.ops_qcom import pkt7_hdr
+    from test.mockgpu.qcom.qcomdriver import ioctl_code
+    words = [pkt7_hdr(mesa.CP_WAIT_FOR_IDLE, 0)]
+    buffer, command, request = self.gpu_command(words)
+    request.timestamp = 0x12345678
+    before_bytes = bytes(buffer.cpu_view().mv[:4])
+    before_state = (dict(self.driver.contexts), dict(self.driver.allocations), dict(self.driver.user_mappings))
+    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    self.assertEqual(request.timestamp, 0x12345678)
+    self.assertEqual(bytes(buffer.cpu_view().mv[:4]), before_bytes)
+    self.assertEqual((self.driver.contexts, self.driver.allocations, self.driver.user_mappings), before_state)
+    self.assertEqual(bytes(self.driver.resolve_owned(self.device.fd.fd, int(buffer.va_addr), 4, internal_only=True)), before_bytes)
+
+    outer_cases = (
+      ("flags", 1, "unsupported GPU command flags"),
+      ("cmdlist", 0, "invalid command-list pointer"),
+      ("cmdlist", ctypes.addressof(command) + 1, "invalid command-list pointer"),
+      ("cmdsize", ctypes.sizeof(command) - 1, "invalid command-list shape"),
+      ("cmdsize", ctypes.sizeof(command) + 1, "invalid command-list shape"),
+      ("numcmds", 0, "invalid command-list shape"),
+      ("numcmds", 2, "invalid command-list shape"),
+      ("objlist", 1, "unsupported GPU object list"),
+      ("objsize", 1, "unsupported GPU object list"),
+      ("numobjs", 1, "unsupported GPU object list"),
+      ("synclist", 1, "unsupported GPU sync list"),
+      ("syncsize", 1, "unsupported GPU sync list"),
+      ("numsyncs", 1, "unsupported GPU sync list"),
+      ("context_id", 0xffffffff, "unknown context"),
+    )
+    for field,value,message in outer_cases:
+      original = getattr(request, field)
+      setattr(request, field, value)
+      with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, message):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      setattr(request, field, original)
+      self.assertEqual(request.timestamp, 0x12345678)
+
+    request_code = ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND)
+    for malformed in (request_code ^ (1 << 30), request_code ^ (1 << 16), request_code ^ (1 << 8), request_code ^ 1):
+      with self.assertRaisesRegex(RuntimeError, "unsupported KGSL ioctl"):
+        self.device.fd.ioctl(malformed, request)
+
+    object_cases = (
+      ("offset", 4, "unsupported command-object offset or id"),
+      ("id", 1, "unsupported command-object offset or id"),
+      ("flags", 0, "unsupported command-object flags"),
+      ("flags", kgsl.KGSL_CMDLIST_IB | 2, "unsupported command-object flags"),
+      ("gpuaddr", int(buffer.va_addr) + 1, "unaligned command address"),
+      ("size", 0, "invalid command size"),
+      ("size", 2, "invalid command size"),
+      ("gpuaddr", (1 << 64) - 4, "invalid GPU range"),
+    )
+    for field,value,message in object_cases:
+      original = getattr(command, field)
+      if field == "gpuaddr" and value == (1 << 64) - 4:
+        original_size, command.size = command.size, 8
+      setattr(command, field, value)
+      with self.subTest(field=field, value=value), self.assertRaisesRegex(RuntimeError, message):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      setattr(command, field, original)
+      if field == "gpuaddr" and value == (1 << 64) - 4: command.size = original_size
+      self.assertEqual(request.timestamp, 0x12345678)
+
+    command.gpuaddr = int(buffer.va_addr) + buffer.meta[0].mmapsize
+    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    command.gpuaddr = int(buffer.va_addr)
+
+    other_fd = self.driver.open('/dev/kgsl-3d0', os.O_RDWR, 0, self.driver.tracked_files[0])
+    with self.assertRaisesRegex(RuntimeError, "belongs to another descriptor"):
+      other_fd.ioctl(other_fd.fd, request_code, ctypes.addressof(request))
+    flags = kgsl.KGSL_MEMFLAGS_USE_CPU_MAP | (12 << kgsl.KGSL_MEMALIGN_SHIFT)
+    foreign = kgsl.struct_kgsl_gpuobj_alloc(size=0x1000, mmapsize=0x1000, flags=flags)
+    other_fd.ioctl(other_fd.fd, ioctl_code(kgsl.IOCTL_KGSL_GPUOBJ_ALLOC), ctypes.addressof(foreign))
+    foreign_address = other_fd.mmap(0, 0x1000, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, other_fd.fd, foreign.id * 0x1000)
+    command.gpuaddr = foreign_address
+    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    command.gpuaddr = int(buffer.va_addr)
+    other_fd.close(other_fd.fd)
+
+    backing = bytearray(0x3000)
+    external_address = (mv_address(memoryview(backing)) + 0xfff) & ~0xfff
+    kgsl.IOCTL_KGSL_MAP_USER_MEM(self.device.fd, hostptr=external_address, len=0x1000, memtype=kgsl.KGSL_USER_MEM_TYPE_ADDR)
+    command.gpuaddr = external_address
+    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    kgsl.IOCTL_KGSL_SHAREDMEM_FREE(self.device.fd, gpuaddr=external_address)
+    command.gpuaddr = int(buffer.va_addr)
+
+    freed_buffer = self.device._gpu_alloc(4, fill_zeroes=True)
+    freed_address = int(freed_buffer.va_addr)
+    self.device._gpu_free(freed_buffer)
+    command.gpuaddr = freed_address
+    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    command.gpuaddr = int(buffer.va_addr)
+
+    malformed_words = [pkt7_hdr(mesa.CP_WAIT_FOR_IDLE, 0), 0]
+    malformed_buffer, malformed_command, malformed_request = self.gpu_command(malformed_words)
+    malformed_request.timestamp = 77
+    malformed_before = bytes(malformed_buffer.cpu_view().mv[:8])
+    with self.assertRaisesRegex(RuntimeError, "invalid KGSL request: unsupported packet header"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=malformed_request)
+    self.assertEqual((malformed_request.timestamp, bytes(malformed_buffer.cpu_view().mv[:8])), (77, malformed_before))
+    self.device._gpu_free(malformed_buffer)
+    self.device._gpu_free(buffer)
+
+  def test_production_add_queue_decodes_without_retirement(self):
+    from tinygrad import Device, Tensor
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMProgram
+    from tinygrad.runtime.autogen import kgsl, mesa
+    from test.mockgpu.qcom.pm4 import PM4Type7Packet, parse_pm4
+    last_command = self.device.last_cmd
+    source = Tensor([0., 1.], device=Device.DEFAULT).realize()
+    result = source + 1
+    schedule_item = result.schedule_linear().src[-1]
+    program_spec = to_program(schedule_item.src[0], self.device.renderer)
+    runtime = get_runtime(self.device.device, program_spec)
+    result_buffer, source_buffer = cast(Any, result.uop.buffer), cast(Any, source.uop.buffer)
+    result_buffer.allocate()
+    args = runtime.fill_kernargs([result_buffer._buf, source_buffer._buf])
+    queue = self.device.hw_compute_queue_t()
+    queue.wait(self.device.timeline_signal, self.device.timeline_value - 1)
+    queue.memory_barrier()
+    queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    queue.signal(self.device.timeline_signal, self.device.timeline_value)
+    packets = parse_pm4(tuple(queue._q))
+    self.assertIs(type(runtime), QCOMProgram)
+    self.assertIs(type(queue), QCOMComputeQueue)
+    self.assertGreater(runtime.image_size, 0)
+    self.assertEqual(runtime.image_size % 128, 0)
+    self.assertTrue(any(isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS for packet in packets))
+    command_buffer, _, request = self.gpu_command(tuple(queue._q))
+    request.timestamp = 0x87654321
+    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    self.assertEqual(request.timestamp, 0x87654321)
+    self.device._gpu_free(command_buffer)
+    self.assertEqual(self.device.last_cmd, last_command)
+
   def test_ioctl_and_mmap_fail_closed(self):
     from tinygrad.runtime.autogen import kgsl
     from test.mockgpu.qcom import qcomdriver
@@ -263,7 +418,7 @@ class TestQCOMDriver(unittest.TestCase):
       self.driver.open('/dev/kgsl-3d0', os.O_RDONLY, 0, self.driver.tracked_files[0])
     with self.assertRaisesRegex(RuntimeError, "unsupported KGSL ioctl"):
       kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=self.device.ctx, timestamp=0, timeout=0)
-    with self.assertRaisesRegex(RuntimeError, "unsupported KGSL ioctl"):
+    with self.assertRaisesRegex(RuntimeError, "invalid command-list pointer"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, context_id=self.device.ctx)
 
 if __name__ == '__main__':

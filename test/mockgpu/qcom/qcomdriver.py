@@ -1,10 +1,11 @@
 from __future__ import annotations
-import ctypes, functools, mmap, os
+import ctypes, functools, mmap, os, struct
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, cast
 from tinygrad.runtime.autogen import kgsl, libc
 from tinygrad.helpers import DEV, Target, to_mv
 from test.mockgpu.driver import VirtDriver, VirtFile, VirtFileDesc
+from test.mockgpu.qcom.pm4 import parse_pm4
 
 PAGE_SIZE = 0x1000
 A630_CHIP_ID = 0x060300FF
@@ -59,6 +60,7 @@ class QCOMDriver(VirtDriver):
       ioctl_code(kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY): (kgsl.struct_kgsl_device_getproperty, self._getproperty),
       ioctl_code(kgsl.IOCTL_KGSL_MAP_USER_MEM): (kgsl.struct_kgsl_map_user_mem, self._map_user_mem),
       ioctl_code(kgsl.IOCTL_KGSL_SHAREDMEM_FREE): (kgsl.struct_kgsl_sharedmem_free, self._sharedmem_free),
+      ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND): (kgsl.struct_kgsl_gpu_command, self._gpu_command),
     }
 
   @staticmethod
@@ -129,6 +131,17 @@ class QCOMDriver(VirtDriver):
     ranges = [(start, mapped_size) for start,mapped_size in self._mapped_ranges()
               if start <= gpuaddr and gpuaddr + size <= start + mapped_size]
     self._require(len(ranges) == 1, f"unmapped or ambiguous GPU range {gpuaddr:#x}+{size:#x}")
+    return to_mv(gpuaddr, size)
+
+  def resolve_owned(self, fd:int, gpuaddr:int, size:int, *, internal_only:bool=False) -> memoryview:
+    self._require(fd in self.open_fds, f"closed descriptor {fd}")
+    self._require(gpuaddr > 0 and size > 0 and gpuaddr + size <= 1 << 64, f"invalid GPU range {gpuaddr:#x}+{size:#x}")
+    ranges = [(allocation.addr, allocation.size) for allocation in self.allocations.values()
+              if allocation.owner == fd and allocation.addr is not None]
+    if not internal_only: ranges += [(addr, mapping_size) for addr,(owner,mapping_size) in self.user_mappings.items() if owner == fd]
+    matches = [(start, mapped_size) for start,mapped_size in ranges
+               if start is not None and start <= gpuaddr and gpuaddr + size <= start + mapped_size]
+    self._require(len(matches) == 1, f"GPU range {gpuaddr:#x}+{size:#x} is not in one owned mapping")
     return to_mv(gpuaddr, size)
 
   def _gpuobj_alloc(self, fd:int, req:kgsl.struct_kgsl_gpuobj_alloc) -> int:
@@ -217,3 +230,26 @@ class QCOMDriver(VirtDriver):
     self._require(mapping[0] == fd, f"user mapping {req.gpuaddr:#x} belongs to another descriptor")
     self.user_mappings.pop(req.gpuaddr)
     return 0
+
+  def _gpu_command(self, fd:int, req:kgsl.struct_kgsl_gpu_command) -> int:
+    self._require(req.flags == 0, f"unsupported GPU command flags {req.flags:#x}")
+    self._require(req.cmdlist != 0 and req.cmdlist % ctypes.alignment(ctypes.c_uint64) == 0 and
+                  req.cmdlist + ctypes.sizeof(kgsl.struct_kgsl_command_object) <= 1 << 64, "invalid command-list pointer")
+    self._require(req.cmdsize == ctypes.sizeof(kgsl.struct_kgsl_command_object) and req.numcmds == 1,
+                  f"invalid command-list shape size={req.cmdsize} count={req.numcmds}")
+    self._require((req.objlist, req.objsize, req.numobjs) == (0, 0, 0), "unsupported GPU object list")
+    self._require((req.synclist, req.syncsize, req.numsyncs) == (0, 0, 0), "unsupported GPU sync list")
+    self._require((context:=self.contexts.get(req.context_id)) is not None, f"unknown context {req.context_id}")
+    assert context is not None
+    self._require(context[0] == fd, f"context {req.context_id} belongs to another descriptor")
+
+    # cmdlist is a trusted in-process UAPI pointer; validate its complete scalar shape before the unavoidable ctypes dereference.
+    command = kgsl.struct_kgsl_command_object.from_address(req.cmdlist)
+    self._require(command.offset == 0 and command.id == 0, "unsupported command-object offset or id")
+    self._require(command.flags == kgsl.KGSL_CMDLIST_IB, f"unsupported command-object flags {command.flags:#x}")
+    self._require(command.gpuaddr != 0 and command.gpuaddr % 4 == 0, f"unaligned command address {command.gpuaddr:#x}")
+    self._require(command.size > 0 and command.size % 4 == 0, f"invalid command size {command.size:#x}")
+    command_bytes = bytes(self.resolve_owned(fd, command.gpuaddr, command.size, internal_only=True))
+    try: parse_pm4(struct.unpack(f"<{command.size // 4}I", command_bytes))
+    except ValueError as error: raise RuntimeError(f"invalid KGSL request: {error}") from error
+    raise RuntimeError("A630 PM4 execution and retirement are not implemented")
