@@ -346,16 +346,18 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(name=name), self.assertRaisesRegex(ValueError, f"unsupported IR3 instruction {name}"):
         decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))
 
-  def test_production_add_queue_decodes_without_retirement(self):
+  def test_production_add_machine_execution_without_retirement(self):
+    import struct
     from tinygrad import Device, Tensor
     from tinygrad.codegen import to_program
     from tinygrad.engine.realize import get_runtime
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMProgram
     from tinygrad.runtime.autogen import kgsl, mesa
-    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.a630 import execute_a630, stage_a630
     from test.mockgpu.qcom.pm4 import PM4Type4Packet, PM4Type7Packet, parse_pm4
     last_command = self.device.last_cmd
-    source = Tensor([0., 1.], device=Device.DEFAULT).realize()
+    source_values = [-7.5, -0.0, 1024.5]
+    source = Tensor(source_values, device=Device.DEFAULT).realize()
     result = source + 1
     schedule_item = result.schedule_linear().src[-1]
     program_spec = to_program(schedule_item.src[0], self.device.renderer)
@@ -390,6 +392,12 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((dispatch.instructions[10].category, dispatch.instructions[10].name), (1, None))
     self.assertIn(("SRC_TYPE", 2), dispatch.instructions[10].fields)
     self.assertIn(("DST_TYPE", 5), dispatch.instructions[10].fields)
+    cov = dispatch.instructions[10]
+    assert cov.dst is not None
+    self.assertEqual((cov.opcode, cov.dst.kind, cov.srcs[0].kind), ("cov.u16s32", "gpr", "half"))
+    self.assertEqual((dispatch.instructions[16].opcode, dispatch.instructions[17].opcode, dispatch.instructions[19].opcode),
+                     ("ldg.u32", "add.f", "stg.u32"))
+    self.assertEqual((dispatch.instructions[17].srcs[1].kind, dispatch.instructions[17].srcs[1].value), ("flut", 2))
     self.assertEqual((dispatch.instructions[20].raw, dispatch.instructions[20].name), (6 << 55, "end"))
     self.assertTrue(all(instruction.raw == 0 and instruction.name == "nop" for instruction in dispatch.instructions[21:]))
     range_sizes = {(memory_range.purpose, memory_range.size) for memory_range in submission.memory_ranges}
@@ -401,7 +409,51 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertTrue(any(write.size == 4 and write.value == self.device.timeline_value for write in submission.writes))
     self.assertFalse(any(name in dispatch.__dataclass_fields__ for name in ("program", "uops", "python_program")))
 
+    self.assertEqual(Device.DEFAULT, "QCOM")
+    result_size, result_format = len(source_values) * 4, f"<{len(source_values)}f"
+    result_view = self.driver.resolve_owned(self.device.fd.fd, int(result_buffer._buf.va_addr), result_size)
+    result_view[:] = bytes(result_size)
+    journal = execute_a630(submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    self.assertEqual(bytes(result_view), bytes(result_size))
+    self.assertEqual(tuple((write.address, len(write.data)) for write in journal),
+                     tuple((int(result_buffer._buf.va_addr) + offset, 4) for offset in range(0, result_size, 4)))
+    for write in journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
+    reference = cast(list[float], (Tensor(source_values, device="PYTHON") + 1).tolist())
+    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+
+    # FLUT immediate 2 is 1.0 and immediate 3 is 2.0 in pinned Mesa ir3-common.xml.
     shader_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    add_immediate_byte = 17 * 8 + 2
+    self.assertEqual(shader_view[add_immediate_byte], 2)
+    try:
+      result_view[:] = bytes(result_size)
+      shader_view[add_immediate_byte] = 3
+      mutated_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      mutated_journal = execute_a630(mutated_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      self.assertEqual(bytes(result_view), bytes(result_size))
+      for write in mutated_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
+      mutated = list(struct.unpack(result_format, result_view))
+      self.assertEqual(mutated, [value + 1 for value in reference])
+      self.assertNotEqual(mutated, reference)
+    finally:
+      shader_view[add_immediate_byte] = 2
+      result_view[:] = bytes(result_size)
+
+    constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
+    original_output_pointer = bytes(constants_view[:8])
+    output_allocation = self.allocation_for(int(result_buffer._buf.va_addr), result_size)
+    self.assertIsNotNone(output_allocation)
+    final_word = output_allocation.addr + output_allocation.size - 4
+    final_view = self.driver.resolve_owned(self.device.fd.fd, final_word, 4)
+    final_before = bytes(final_view)
+    try:
+      constants_view[:8] = struct.pack("<Q", final_word)
+      late_failure = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      with self.assertRaisesRegex(ValueError, "instruction 19 lane 1"):
+        execute_a630(late_failure, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      self.assertEqual(bytes(final_view), final_before)
+    finally: constants_view[:8] = original_output_pointer
+
     first_byte = shader_view[0]
     try:
       shader_view[0] ^= 1
@@ -513,7 +565,7 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad.helpers import Context, Target
     from tinygrad.renderer.nir import IR3Renderer
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.a630 import execute_a630, stage_a630
     from test.mockgpu.qcom.pm4 import parse_pm4
     from test.mockgpu.qcom.qcomdriver import ioctl_code
 
@@ -553,6 +605,8 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(tuple(instruction.name for instruction in image_instructions[:10]),
                      ("shl.b", None, "nop", "add.u", "nop", "isam", "add.f", "nop", "stib.b", "end"))
     self.assertTrue(all(instruction.raw == 0 for instruction in image_instructions[10:]))
+    with self.assertRaisesRegex(ValueError, "image execution is not implemented"):
+      execute_a630(submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
 
     texture_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.tex_off)
     uav_words = struct.unpack_from("<16I", bytes(args.buf.cpu_view().mv), runtime.ibo_off)
