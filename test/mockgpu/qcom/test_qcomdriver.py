@@ -119,8 +119,10 @@ class TestQCOMDriver(unittest.TestCase):
     context = kgsl.IOCTL_KGSL_DRAWCTXT_CREATE(self.device.fd, flags=self.driver.contexts[self.device.ctx][1])
     self.assertNotEqual(context.drawctxt_id, self.device.ctx)
     self.assertIn(context.drawctxt_id, self.driver.contexts)
+    self.assertEqual(self.driver.context_timestamps[context.drawctxt_id], 0)
     kgsl.IOCTL_KGSL_DRAWCTXT_DESTROY(self.device.fd, drawctxt_id=context.drawctxt_id)
     self.assertNotIn(context.drawctxt_id, self.driver.contexts)
+    self.assertNotIn(context.drawctxt_id, self.driver.context_timestamps)
     with self.assertRaisesRegex(RuntimeError, "unknown context"):
       kgsl.IOCTL_KGSL_DRAWCTXT_DESTROY(self.device.fd, drawctxt_id=context.drawctxt_id)
 
@@ -160,6 +162,7 @@ class TestQCOMDriver(unittest.TestCase):
     descriptor.close(descriptor.fd)
     self.assertNotIn(allocation.id, self.driver.allocations)
     self.assertNotIn(context.drawctxt_id, self.driver.contexts)
+    self.assertNotIn(context.drawctxt_id, self.driver.context_timestamps)
     self.assertNotIn(context.drawctxt_id, self.driver.power_levels)
     self.assertNotIn(external_address, self.driver.user_mappings)
     for stale_address in (address, external_address):
@@ -204,21 +207,39 @@ class TestQCOMDriver(unittest.TestCase):
                                   value=ctypes.addressof(constraint), sizebytes=ctypes.sizeof(constraint))
     self.assertEqual(self.driver.power_levels[self.device.ctx], kgsl.KGSL_CONSTRAINT_PWR_MAX)
 
-  def test_gpu_command_validation_does_not_retire(self):
+  def test_gpu_command_validation_and_control_retirement(self):
     from tinygrad.runtime.autogen import kgsl, mesa
     from tinygrad.runtime.ops_qcom import pkt7_hdr
-    from test.mockgpu.qcom.qcomdriver import ioctl_code
+    from test.mockgpu.qcom.qcomdriver import KGSLJournalWrite, ioctl_code
     words = [pkt7_hdr(mesa.CP_WAIT_FOR_IDLE, 0)]
     buffer, command, request = self.gpu_command(words)
     request.timestamp = 0x12345678
     before_bytes = bytes(buffer.cpu_view().mv[:4])
     before_state = (dict(self.driver.contexts), dict(self.driver.allocations), dict(self.driver.user_mappings))
-    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-    self.assertEqual(request.timestamp, 0x12345678)
+    previous_timestamp = self.driver.context_timestamps[self.device.ctx]
+    kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]),
+                     (previous_timestamp + 1, previous_timestamp + 1))
     self.assertEqual(bytes(buffer.cpu_view().mv[:4]), before_bytes)
     self.assertEqual((self.driver.contexts, self.driver.allocations, self.driver.user_mappings), before_state)
     self.assertEqual(bytes(self.driver.resolve_owned(self.device.fd.fd, int(buffer.va_addr), 4, internal_only=True)), before_bytes)
+
+    signal = self.device.new_signal(value=5)
+    control_queue = self.device.hw_compute_queue_t().wait(signal, 5).signal(signal, 6).signal(signal, 7)
+    control_timestamp = self.driver.context_timestamps[self.device.ctx]
+    control_queue.submit(self.device)
+    self.assertEqual(signal.value, 7)
+    self.assertEqual((self.device.last_cmd, self.driver.context_timestamps[self.device.ctx]),
+                     (control_timestamp + 1, control_timestamp + 1))
+
+    writable, readonly = memoryview(bytearray(b"left")), memoryview(b"right")
+    preflight_journal = (KGSLJournalWrite(0, 0, 1, b"LEFT", "first test", False),
+                         KGSLJournalWrite(1, 0, 5, b"RIGHT", "second test", False))
+    with mock.patch.object(self.driver, "resolve_owned", side_effect=(writable, readonly)), \
+         self.assertRaisesRegex(RuntimeError, "read-only second test range"):
+      self.driver._commit_a630_journal(self.device.fd.fd, preflight_journal)
+    self.assertEqual(bytes(writable), b"left")
+    request.timestamp = 0x12345678
 
     outer_cases = (
       ("flags", 1, "unsupported GPU command flags"),
@@ -346,13 +367,14 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(name=name), self.assertRaisesRegex(ValueError, f"unsupported IR3 instruction {name}"):
         decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))
 
-  def test_production_add_machine_execution_without_retirement(self):
+  def test_production_add_machine_execution_and_retirement(self):
     import struct
     from tinygrad import Device, Tensor
     from tinygrad.codegen import to_program
     from tinygrad.engine.realize import get_runtime
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMProgram
     from tinygrad.runtime.autogen import kgsl, mesa
+    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import execute_a630, stage_a630
     from test.mockgpu.qcom.pm4 import PM4Type4Packet, PM4Type7Packet, parse_pm4
     last_command = self.device.last_cmd
@@ -452,6 +474,36 @@ class TestQCOMDriver(unittest.TestCase):
       with self.assertRaisesRegex(ValueError, "instruction 19 lane 1"):
         execute_a630(late_failure, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
       self.assertEqual(bytes(final_view), final_before)
+
+      late_buffer, _, late_request = self.gpu_command(words)
+      late_request.timestamp = 0x31415926
+      late_signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+      late_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
+      late_before = (bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
+                     self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
+      with self.assertRaisesRegex(RuntimeError, "instruction 19 lane 1"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
+      self.assertEqual(late_request.timestamp, 0x31415926)
+      self.assertEqual((bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
+                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), late_before)
+      self.device._gpu_free(late_buffer)
+    finally: constants_view[:8] = original_output_pointer
+
+    input_view = self.driver.resolve_owned(self.device.fd.fd, int(source_buffer._buf.va_addr), result_size)
+    try:
+      constants_view[:8] = constants_view[8:16]
+      alias_input_buffer, _, alias_input_request = self.gpu_command(words)
+      alias_input_request.timestamp = 0x42424242
+      alias_input_signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+      alias_input_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
+      alias_input_before = (bytes(result_view), bytes(input_view), bytes(alias_input_signal), bytes(alias_input_dummy),
+                            self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
+      with self.assertRaisesRegex(RuntimeError, "A630 global store aliases snapshotted A630 global input"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_input_request)
+      self.assertEqual(alias_input_request.timestamp, 0x42424242)
+      self.assertEqual((bytes(result_view), bytes(input_view), bytes(alias_input_signal), bytes(alias_input_dummy),
+                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), alias_input_before)
+      self.device._gpu_free(alias_input_buffer)
     finally: constants_view[:8] = original_output_pointer
 
     first_byte = shader_view[0]
@@ -475,6 +527,8 @@ class TestQCOMDriver(unittest.TestCase):
     def remove(packet): return words[:packet.word_offset] + words[packet.word_offset+len(packet.values)+1:]
 
     wait_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_WAIT_REG_MEM)
+    final_event = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and
+                   packet.opcode == mesa.CP_EVENT_WRITE and len(packet.values) == 4][-1]
     marker_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_SET_MARKER)
     load_packets = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_LOAD_STATE6_FRAG]
     constants_packet = next(packet for packet in load_packets if packet.values[0] >> 14 & 0x3 == mesa.ST_CONSTANTS)
@@ -525,35 +579,135 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaises(ValueError): stage_a630(parse_pm4(invalid_second), resolver)
     resolver.assert_not_called()
 
-    command_buffer, _, request = self.gpu_command(words)
-    request.timestamp = 0x87654321
-    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-    self.assertEqual(request.timestamp, 0x87654321)
-    self.device._gpu_free(command_buffer)
-    self.assertEqual(self.device.last_cmd, last_command)
+    repeated_buffer, _, repeated_request = self.gpu_command(tuple(repeated_queue._q))
+    repeated_request.timestamp = 0x27182818
+    repeated_signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+    repeated_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
+    repeated_before = (bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
+                       self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
+    with self.assertRaisesRegex(RuntimeError, "at most one dispatch"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=repeated_request)
+    self.assertEqual(repeated_request.timestamp, 0x27182818)
+    self.assertEqual((bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
+                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), repeated_before)
+    self.device._gpu_free(repeated_buffer)
+
+    alias_words = list(words)
+    output_address = int(result_buffer._buf.va_addr)
+    alias_words[final_event.word_offset+2:final_event.word_offset+4] = (output_address & 0xffffffff, output_address >> 32)
+    alias_buffer, _, alias_request = self.gpu_command(alias_words)
+    alias_request.timestamp = 0x16180339
+    alias_before = (bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
+                    self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
+    with self.assertRaisesRegex(RuntimeError, "overlapping A630 global store and event value"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
+    self.assertEqual(alias_request.timestamp, 0x16180339)
+    self.assertEqual((bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
+                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), alias_before)
+    self.device._gpu_free(alias_buffer)
+
+    result_view[:] = bytes(result_size)
+    signal_view = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+    signal_view[:] = bytes(16)
+    dummy_view = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
+    dummy_view[:] = b"A630"
+    queue.bind(self.device)
+    queue.submit_req.timestamp = 0x87654321
+    previous_context_timestamp = self.driver.context_timestamps[self.device.ctx]
+    queue.submit(self.device)
+    retired_command = self.device.last_cmd
+    self.assertGreater(retired_command, last_command)
+    self.assertEqual((queue.submit_req.timestamp, retired_command, self.driver.context_timestamps[self.device.ctx]),
+                     (previous_context_timestamp + 1,) * 3)
+    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    self.assertEqual(self.device.timeline_signal.value, self.device.timeline_value)
+    first_counter = struct.unpack_from("<Q", signal_view, 8)[0]
+    self.assertGreater(first_counter, 0)
+    self.assertEqual(bytes(dummy_view), bytes(4))
+
+    try:
+      result_view[:] = bytes(result_size)
+      shader_view[add_immediate_byte] = 3
+      queue.submit(self.device)
+      self.assertEqual(self.device.last_cmd, retired_command + 1)
+      self.assertEqual(list(struct.unpack(result_format, result_view)), [value + 1 for value in reference])
+      mutated_counter = struct.unpack_from("<Q", signal_view, 8)[0]
+      self.assertGreater(mutated_counter, first_counter)
+      retired_command = self.device.last_cmd
+    finally: shader_view[add_immediate_byte] = 2
+
+    result_view[:] = bytes(result_size)
+    queue.submit(self.device)
+    self.assertEqual(self.device.last_cmd, retired_command + 1)
+    self.assertGreater(struct.unpack_from("<Q", signal_view, 8)[0], mutated_counter)
+    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    retired_command = self.device.last_cmd
+
+    profile_start, profile_end = self.device.new_signal(), self.device.new_signal()
+    profile_queue = self.device.hw_compute_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1).memory_barrier() \
+      .timestamp(profile_start).exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size) \
+      .timestamp(profile_end).signal(self.device.timeline_signal, self.device.timeline_value)
+    result_view[:] = bytes(result_size)
+    effect_order:list[str] = []
+    real_counter = qcomdriver.time.perf_counter_ns
+    real_execute = qcomdriver.execute_a630
+    def ordered_counter():
+      effect_order.append("counter")
+      return real_counter()
+    def ordered_execute(*execute_args, **execute_kwargs):
+      effect_order.append("execute")
+      return real_execute(*execute_args, **execute_kwargs)
+    with mock.patch.object(qcomdriver.time, "perf_counter_ns", side_effect=ordered_counter), \
+         mock.patch.object(qcomdriver, "execute_a630", side_effect=ordered_execute):
+      profile_queue.submit(self.device)
+    self.assertEqual(effect_order, ["counter", "execute", "counter"])
+    self.assertEqual(self.device.last_cmd, retired_command + 1)
+    start_counter = profile_start.base_buf.cpu_view().view(8, 8, "Q")[0]
+    end_counter = profile_end.base_buf.cpu_view().view(8, 8, "Q")[0]
+    self.assertGreater(end_counter, start_counter)
+    self.assertGreater(profile_end.timestamp - profile_start.timestamp, 0)
+    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    retired_command = self.device.last_cmd
+
+    end_to_end = (Tensor(source_values, device=Device.DEFAULT) + 1).realize()
+    self.assertEqual(cast(list[float], end_to_end.tolist()), reference)
+    self.assertGreater(self.device.last_cmd, retired_command)
+    retired_command = self.device.last_cmd
+
+    unsatisfied_words = mutate(wait_packet, 3, self.device.timeline_signal.value + 1)
+    unsatisfied_buffer, _, unsatisfied_request = self.gpu_command(unsatisfied_words)
+    unsatisfied_request.timestamp = 0x11223344
+    result_view[:] = bytes(result_size)
+    before_wait_failure = (bytes(result_view), bytes(signal_view), bytes(dummy_view),
+                           self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter)
+    with self.assertRaisesRegex(RuntimeError, "unsatisfied memory wait"):
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=unsatisfied_request)
+    self.assertEqual((unsatisfied_request.timestamp, self.device.last_cmd), (0x11223344, retired_command))
+    self.assertEqual((bytes(result_view), bytes(signal_view), bytes(dummy_view),
+                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter), before_wait_failure)
+    self.device._gpu_free(unsatisfied_buffer)
 
     invalid_tail = list(words)
-    final_event = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and
-                   packet.opcode == mesa.CP_EVENT_WRITE and len(packet.values) == 4][-1]
     dummy_allocation = self.allocation_for(self.device.dummy_addr, 1)
     self.assertIsNotNone(dummy_allocation)
     invalid_address = dummy_allocation.addr + dummy_allocation.size
     invalid_tail[final_event.word_offset+2:final_event.word_offset+4] = (invalid_address & 0xffffffff, invalid_address >> 32)
     invalid_buffer, _, invalid_request = self.gpu_command(invalid_tail)
     invalid_request.timestamp = 0x13572468
-    before = (dict(self.driver.contexts), dict(self.driver.user_mappings), dict(self.driver.power_levels),
+    before = (dict(self.driver.contexts), dict(self.driver.context_timestamps), dict(self.driver.user_mappings),
+              dict(self.driver.power_levels), self.driver.always_on_counter, bytes(result_view), bytes(signal_view), bytes(dummy_view),
               bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
               bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
               bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)))
     with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=invalid_request)
     self.assertEqual(invalid_request.timestamp, 0x13572468)
-    self.assertEqual((self.driver.contexts, self.driver.user_mappings, self.driver.power_levels,
+    self.assertEqual((self.driver.contexts, self.driver.context_timestamps, self.driver.user_mappings,
+                      self.driver.power_levels, self.driver.always_on_counter, bytes(result_view), bytes(signal_view), bytes(dummy_view),
                       bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
                       bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
                       bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size))), before)
-    self.assertEqual(self.device.last_cmd, last_command)
+    self.assertEqual(self.device.last_cmd, retired_command)
     self.device._gpu_free(invalid_buffer)
 
   def test_production_image_descriptor_path_preflights_nested_ranges(self):
@@ -751,7 +905,7 @@ class TestQCOMDriver(unittest.TestCase):
 
     command_buffer, _, request = self.gpu_command(words)
     request.timestamp = 0x24681357
-    with self.assertRaisesRegex(RuntimeError, "execution and retirement are not implemented"):
+    with self.assertRaisesRegex(RuntimeError, "image execution is not implemented"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
     self.assertEqual((request.timestamp, self.device.last_cmd), (0x24681357, last_command))
     self.device._gpu_free(command_buffer)

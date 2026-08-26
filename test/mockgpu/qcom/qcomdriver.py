@@ -1,11 +1,11 @@
 from __future__ import annotations
-import ctypes, functools, mmap, os, struct
+import ctypes, functools, mmap, os, struct, time
 from dataclasses import dataclass
 from typing import Any, Callable, Iterator, cast
 from tinygrad.runtime.autogen import kgsl, libc
 from tinygrad.helpers import DEV, Target, to_mv
 from test.mockgpu.driver import VirtDriver, VirtFile, VirtFileDesc
-from test.mockgpu.qcom.a630 import stage_a630
+from test.mockgpu.qcom.a630 import A630Submission, execute_a630, stage_a630
 from test.mockgpu.qcom.pm4 import parse_pm4
 
 PAGE_SIZE = 0x1000
@@ -22,6 +22,15 @@ class KGSLAllocation:
   size: int
   flags: int
   addr: int|None = None
+
+@dataclass(frozen=True)
+class KGSLJournalWrite:
+  word_offset: int
+  ordinal: int
+  address: int
+  data: bytes
+  purpose: str
+  from_dispatch: bool
 
 class KGSLFileDesc(VirtFileDesc):
   def __init__(self, fd:int, driver:QCOMDriver):
@@ -50,7 +59,9 @@ class QCOMDriver(VirtDriver):
     self.allocations:dict[int, KGSLAllocation] = {}
     self.user_mappings:dict[int, tuple[int, int]] = {}
     self.contexts:dict[int, tuple[int, int]] = {}
+    self.context_timestamps:dict[int, int] = {}
     self.power_levels:dict[int, int] = {}
+    self.always_on_counter = 0
     self.tracked_files.append(VirtFile('/dev/kgsl-3d0', functools.partial(KGSLFileDesc, driver=self)))
     self._ioctls:dict[int, tuple[Any, Callable[[int, Any], int]]] = {
       ioctl_code(kgsl.IOCTL_KGSL_GPUOBJ_ALLOC): (kgsl.struct_kgsl_gpuobj_alloc, self._gpuobj_alloc),
@@ -87,6 +98,7 @@ class QCOMDriver(VirtDriver):
     for gpuaddr in [gpuaddr for gpuaddr,(owner,_) in self.user_mappings.items() if owner == fd]: self.user_mappings.pop(gpuaddr)
     for context_id in [context_id for context_id,(owner,_) in self.contexts.items() if owner == fd]:
       self.contexts.pop(context_id)
+      self.context_timestamps.pop(context_id)
       self.power_levels.pop(context_id, None)
     self.open_fds.remove(fd)
     self._require(not unmap_failed, f"failed to unmap descriptor {fd} allocation")
@@ -178,6 +190,7 @@ class QCOMDriver(VirtDriver):
     self._require(preemption == kgsl.KGSL_CONTEXT_PREEMPT_STYLE_FINEGRAIN, f"unsupported preemption style {preemption}")
     req.drawctxt_id, self.next_context_id = self.next_context_id, self.next_context_id + 1
     self.contexts[req.drawctxt_id] = (fd, req.flags)
+    self.context_timestamps[req.drawctxt_id] = 0
     return 0
 
   def _drawctxt_destroy(self, fd:int, req:kgsl.struct_kgsl_drawctxt_destroy) -> int:
@@ -185,6 +198,7 @@ class QCOMDriver(VirtDriver):
     assert context is not None
     self._require(context[0] == fd, f"context {req.drawctxt_id} belongs to another descriptor")
     self.contexts.pop(req.drawctxt_id)
+    self.context_timestamps.pop(req.drawctxt_id)
     self.power_levels.pop(req.drawctxt_id, None)
     return 0
 
@@ -232,6 +246,80 @@ class QCOMDriver(VirtDriver):
     self.user_mappings.pop(req.gpuaddr)
     return 0
 
+  @staticmethod
+  def _overlaps(left_address:int, left_size:int, right_address:int, right_size:int) -> bool:
+    return left_address + left_size > right_address and right_address + right_size > left_address
+
+  def _plan_a630_retirement(self, fd:int, submission:A630Submission, command_address:int, command_size:int) \
+      -> tuple[tuple[KGSLJournalWrite, ...], int]:
+    self._require(len(submission.dispatches) <= 1, "A630 retirement supports at most one dispatch")
+    effects = [write.word_offset for write in submission.writes] + [dispatch.word_offset for dispatch in submission.dispatches]
+    self._require(all(not effects or wait.word_offset < min(effects) for wait in submission.waits),
+                  "memory wait after a submission effect")
+    for wait in submission.waits:
+      current = struct.unpack("<I", bytes(self.resolve_owned(fd, wait.address, 4)))[0]
+      # The pinned adreno_pm4.xml WRITE_GE condition compares the two masked values as unsigned words.
+      self._require((current & wait.mask) >= (wait.reference & wait.mask),
+                    f"unsatisfied memory wait at {wait.address:#x}: {current & wait.mask:#x} < {wait.reference & wait.mask:#x}")
+
+    journal:list[KGSLJournalWrite] = []
+    planned_counter = self.always_on_counter
+    ordered_effects = [(write.word_offset, False, index) for index,write in enumerate(submission.writes)]
+    if submission.dispatches: ordered_effects.append((submission.dispatches[0].word_offset, True, 0))
+    for word_offset,is_dispatch,index in sorted(ordered_effects):
+      if is_dispatch:
+        for ordinal,execution_write in enumerate(execute_a630(submission, lambda address,size: self.resolve_owned(fd, address, size))):
+          journal.append(KGSLJournalWrite(word_offset, ordinal, execution_write.address,
+                                          execution_write.data, "A630 global store", True))
+        continue
+      pm4_write = submission.writes[index]
+      if pm4_write.value is None:
+        # QCOMSignal interprets A6XX_CP_ALWAYS_ON_COUNTER at 19.2 ticks per microsecond.
+        planned_counter = max(planned_counter + 1, time.perf_counter_ns() * 12 // 625)
+        self._require(planned_counter < 1 << 64, "always-on counter overflow")
+        data = struct.pack("<Q", planned_counter)
+      else: data = struct.pack("<I", pm4_write.value)
+      journal.append(KGSLJournalWrite(word_offset, index, pm4_write.address, data, pm4_write.purpose, False))
+    journal.sort(key=lambda journal_write: (journal_write.word_offset, journal_write.ordinal))
+
+    for journal_write in journal:
+      self._require(not self._overlaps(journal_write.address, len(journal_write.data), command_address, command_size),
+                    f"{journal_write.purpose} aliases the command image")
+    for index,left in enumerate(journal):
+      for right in journal[index+1:]:
+        if not self._overlaps(left.address, len(left.data), right.address, len(right.data)): continue
+        repeated_pm4_target = not left.from_dispatch and not right.from_dispatch and \
+          (left.address, len(left.data)) == (right.address, len(right.data))
+        self._require(repeated_pm4_target, f"overlapping {left.purpose} and {right.purpose}")
+
+    if submission.dispatches:
+      dispatch = submission.dispatches[0]
+      input_address = struct.unpack_from("<Q", dispatch.constants_image, 8)[0]
+      immutable_reads = [(memory_range.address, memory_range.size, memory_range.purpose)
+                         for memory_range in submission.memory_ranges if memory_range.read and memory_range.purpose != "wait value"]
+      immutable_reads.append((input_address, dispatch.local_size[0] * 4, "A630 global input"))
+      for journal_write in journal:
+        for address,size,purpose in immutable_reads:
+          self._require(not self._overlaps(journal_write.address, len(journal_write.data), address, size),
+                        f"{journal_write.purpose} aliases snapshotted {purpose}")
+
+    return tuple(journal), planned_counter
+
+  def _commit_a630_journal(self, fd:int, journal:tuple[KGSLJournalWrite, ...]) -> None:
+    targets:list[tuple[KGSLJournalWrite, memoryview]] = []
+    originals:dict[tuple[int, int], tuple[memoryview, bytes]] = {}
+    for write in journal:
+      view = self.resolve_owned(fd, write.address, len(write.data))
+      self._require(len(view) == len(write.data), f"short resolved {write.purpose} range")
+      self._require(not view.readonly, f"read-only {write.purpose} range")
+      targets.append((write, view))
+      originals.setdefault((write.address, len(write.data)), (view, bytes(view)))
+    try:
+      for write,view in targets: view[:] = write.data
+    except Exception as error:
+      for view,image in reversed(tuple(originals.values())): view[:] = image
+      raise RuntimeError(f"invalid KGSL request: failed to commit A630 retirement: {error}") from error
+
   def _gpu_command(self, fd:int, req:kgsl.struct_kgsl_gpu_command) -> int:
     self._require(req.flags == 0, f"unsupported GPU command flags {req.flags:#x}")
     self._require(req.cmdlist != 0 and req.cmdlist % ctypes.alignment(ctypes.c_uint64) == 0 and
@@ -253,6 +341,13 @@ class QCOMDriver(VirtDriver):
     command_bytes = bytes(self.resolve_owned(fd, command.gpuaddr, command.size, internal_only=True))
     try:
       packets = parse_pm4(struct.unpack(f"<{command.size // 4}I", command_bytes))
-      stage_a630(packets, lambda address,size: self.resolve_owned(fd, address, size))
+      submission = stage_a630(packets, lambda address,size: self.resolve_owned(fd, address, size))
+      journal,planned_counter = self._plan_a630_retirement(fd, submission, command.gpuaddr, command.size)
     except ValueError as error: raise RuntimeError(f"invalid KGSL request: {error}") from error
-    raise RuntimeError("A630 PM4 execution and retirement are not implemented")
+    timestamp = self.context_timestamps[req.context_id]
+    self._require(timestamp < 0xffffffff, f"context {req.context_id} timestamp overflow")
+    self._commit_a630_journal(fd, journal)
+    self.always_on_counter = planned_counter
+    # KGSL assigns a separate per-context command sequence after accepting the complete submission.
+    self.context_timestamps[req.context_id] = req.timestamp = timestamp + 1
+    return 0
