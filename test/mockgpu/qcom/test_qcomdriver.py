@@ -540,6 +540,63 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(name=name), self.assertRaisesRegex(ValueError, f"unsupported IR3 instruction {name}"):
         decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))
 
+  def test_ir3_typed_instruction_and_modifier_contracts(self):
+    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+
+    end = 6 << 55
+    words = (
+      0x47180803201f0000,  # ashr.b
+      0x46d8080320020003,  # shl.b
+      0x650004030003301e,  # shrg
+      0x421000050008000a,  # add.u
+      0x4290400010020004,  # cmps.u.lt
+      0x2009400a00000000,  # cov.u16s32
+      0x10000000000,       # nop with one repeated no-op
+      0xc006000b01810001,  # ldg.u32
+      0x5018080b2802000b,  # add.f with FLUT[2]
+      0xc0c60d0001800016,  # stg.u32
+    )
+    decoded = decode_a630_ir3(b"".join(word.to_bytes(8, "little") for word in words + (end,)))
+    self.assertEqual(tuple(instruction.opcode for instruction in decoded),
+                     ("ashr.b", "shl.b", "shrg", "add.u", "cmps.u.lt", "cov.u16s32", "nop",
+                      "ldg.u32", "add.f", "stg.u32", "end"))
+
+    def decode_one(word): return decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))[0]
+
+    cov = words[5] & ~((0xff << 32) | 0xff) | 9 << 32 | 3
+    self.assertEqual((decode_one(cov).dst, decode_one(cov).srcs),
+                     (A630IR3Operand("gpr", 9), (A630IR3Operand("half", 3),)))
+    ldg = words[7] & ~((0xff << 32) | (0xff << 14)) | 12 << 32 | 8 << 14
+    self.assertEqual((decode_one(ldg).dst, decode_one(ldg).srcs),
+                     (A630IR3Operand("gpr", 12), (A630IR3Operand("gpr", 8),)))
+    stg = words[9] & ~((0xff << 41) | (0xff << 1)) | 8 << 41 | 12 << 1
+    self.assertEqual(decode_one(stg).srcs, (A630IR3Operand("gpr", 8), A630IR3Operand("gpr", 12)))
+    self.assertEqual(decode_one(words[8] | 1 << 16).srcs[1], A630IR3Operand("flut", 3))
+
+    # SY/SS serialize dependencies in hardware; the lane interpreter is already sequential.
+    scheduled = decode_one(words[3] | 1 << 60 | 1 << 44)
+    self.assertEqual((scheduled.opcode, scheduled.srcs),
+                     ("add.u", (A630IR3Operand("gpr", 10), A630IR3Operand("gpr", 8))))
+    self.assertTrue({("SY", 1), ("SS", 1)} <= set(scheduled.fields))
+
+    rejected_modifiers = {
+      "saturate": words[3] | 1 << 42,
+      "jump-target": words[3] | 1 << 59,
+      "repeat": words[3] | 1 << 40,
+      "absolute/negate": words[3] | 1 << 14,
+      "A7xx last-use": words[3] | 1 << 10,
+      "half sources": words[3] ^ 1 << 52,
+      "converted destination": words[3] | 1 << 46,
+      "conversion-rounding": words[5] | 1 << 55,
+      "shrg wrong precision": words[2] ^ 1 << 42,
+      "global-load jump-target": words[7] | 1 << 59,
+      "global-store destination offset": words[9] ^ 1 << 40,
+    }
+    for modifier,word in rejected_modifiers.items():
+      with self.subTest(modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
+      decode_one(words[7] | 1 << 41)
+
   def test_production_add_machine_execution_and_retirement(self):
     import struct
     from tinygrad import Device, Tensor
@@ -633,6 +690,59 @@ class TestQCOMDriver(unittest.TestCase):
     finally:
       shader_view[add_immediate_byte] = 2
       result_view[:] = bytes(result_size)
+
+    # SY changes the mapped machine image but only serializes dependencies already ordered by the lane interpreter.
+    schedule_byte = 13 * 8 + 7
+    self.assertEqual(shader_view[schedule_byte] & 0x10, 0)
+    try:
+      shader_view[schedule_byte] |= 0x10
+      scheduled_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      self.assertIn(("SY", 1), scheduled_submission.dispatches[0].instructions[13].fields)
+      scheduled_journal = execute_a630(scheduled_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      for write in scheduled_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
+      self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    finally:
+      shader_view[schedule_byte] &= ~0x10
+      result_view[:] = bytes(result_size)
+
+    # Rename a temporary within the declared full-register footprint and prove execution follows the decoded register ids.
+    cov_dst_byte,add_src_byte = 10 * 8 + 4, 13 * 8
+    self.assertEqual((shader_view[cov_dst_byte], shader_view[add_src_byte]), (10, 10))
+    try:
+      shader_view[cov_dst_byte] = shader_view[add_src_byte] = 13
+      renamed_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      self.assertEqual((renamed_submission.dispatches[0].instructions[10].dst,
+                        renamed_submission.dispatches[0].instructions[13].srcs[0].value),
+                       (renamed_submission.dispatches[0].instructions[13].srcs[0], 13))
+      renamed_journal = execute_a630(renamed_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      for write in renamed_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
+      self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    finally:
+      shader_view[cov_dst_byte] = shader_view[add_src_byte] = 10
+      result_view[:] = bytes(result_size)
+
+    def stage_instruction(index, raw):
+      original = struct.unpack_from("<Q", shader_view, index * 8)[0]
+      struct.pack_into("<Q", shader_view, index * 8, raw)
+      try: return stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      finally: struct.pack_into("<Q", shader_view, index * 8, original)
+
+    redirected_load = dispatch.instructions[16].raw & ~(0xff << 14) | 6 << 14
+    with self.assertRaisesRegex(ValueError, "global load 0 does not address its f32 input"):
+      execute_a630(stage_instruction(16, redirected_load), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    redirected_add = dispatch.instructions[17].raw & ~0xff | 6
+    with self.assertRaisesRegex(ValueError, "f32 add does not consume the global load"):
+      execute_a630(stage_instruction(17, redirected_add), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    redirected_store = dispatch.instructions[19].raw & ~(0xff << 1) | 6 << 1
+    with self.assertRaisesRegex(ValueError, "global store does not consume the f32 add"):
+      execute_a630(stage_instruction(19, redirected_store), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    with self.assertRaisesRegex(ValueError, "unsupported A630 f32-add instruction inventory"):
+      execute_a630(stage_instruction(15, dispatch.instructions[13].raw),
+                   lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    for kind,index in (("full", 13), ("half", 8)):
+      with self.subTest(shared_register=kind), self.assertRaisesRegex(ValueError, "unsupported shared or special IR3 register"):
+        execute_a630(stage_instruction(index, dispatch.instructions[index].raw & ~(0xff << 32) | 0xc0 << 32),
+                     lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
 
     constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
     original_output_pointer = bytes(constants_view[:8])
@@ -736,6 +846,12 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(word=next(i for i,(left,right) in enumerate(zip(words, mutated)) if left != right)), self.assertRaises(ValueError):
         stage_a630(parse_pm4(mutated), resolver)
       resolver.assert_not_called()
+
+    overdeclared = mutate(cntl_packet, 0, cntl_packet.values[0] + 0x80)
+    overdeclared_submission = stage_a630(parse_pm4(overdeclared),
+                                        lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    with self.assertRaisesRegex(ValueError, "register footprints do not match decoded operands"):
+      execute_a630(overdeclared_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
 
     repeated_queue = self.device.hw_compute_queue_t()
     repeated_queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
@@ -889,7 +1005,7 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad.codegen import to_program
     from tinygrad.engine.realize import get_runtime
     from tinygrad.runtime.autogen import kgsl, mesa
-    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.a630 import execute_a630, stage_a630
     from test.mockgpu.qcom.pm4 import parse_pm4
 
     left_values, right_values = [1.0, -2.5, 1024.0], [4.0, 0.5, -24.0]
@@ -917,6 +1033,15 @@ class TestQCOMDriver(unittest.TestCase):
                      ("ldg.u32", "cov.u16s32", "ldg.u32", "nop", "add.u", "add.f", "nop", "stg.u32", "end"))
     self.assertEqual(struct.unpack_from("<3Q", dispatch.constants_image),
                      (int(result_buffer._buf.va_addr), int(left_buffer._buf.va_addr), int(right_buffer._buf.va_addr)))
+
+    shader_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    second_load = dispatch.instructions[20].raw
+    struct.pack_into("<Q", shader_view, 20 * 8, second_load & ~(0xff << 14) | 4 << 14)
+    try:
+      redirected = stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    finally: struct.pack_into("<Q", shader_view, 20 * 8, second_load)
+    with self.assertRaisesRegex(ValueError, "global load 1 does not address its f32 input"):
+      execute_a630(redirected, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
 
     result_size = len(left_values) * 4
     result_view = self.driver.resolve_owned(self.device.fd.fd, int(result_buffer._buf.va_addr), result_size)
