@@ -75,6 +75,40 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertIsNotNone(self.allocation_for(int(buffer.va_addr), buffer.size))
     self.assertIsNotNone(self.allocation_for(self.device.dummy_addr, 0x1000))
 
+  def test_ir3_renderer_requests_fp32_round_to_nearest_even(self):
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.runtime.autogen import mesa
+    from tinygrad.runtime.support.compiler_mesa import deserialize
+    from tinygrad.uop import Ops
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+
+    conversions = []
+    for dtype,value,src_type in ((dtypes.int, dtypes.int.max, 5), (dtypes.uint, dtypes.uint.max, 3)):
+      source = Tensor([value], dtype=dtype, device=Device.DEFAULT).realize()
+      result = source.cast(dtypes.float)
+      kernel = next(call.src[0] for call in result.schedule_linear().src if call.src[0].op is Ops.SINK)
+      program_spec = to_program(kernel, self.device.renderer)
+      shader = deserialize(next(src.arg for src in program_spec.src if src.op is Ops.SOURCE), self.device.renderer.nir_options)
+      try:
+        rounding_mask = (1 << 16) | (1 << 19)
+        self.assertEqual(shader.contents.info.float_controls_execution_mode & rounding_mask, 1 << 16)
+      finally: mesa.ralloc_free(shader)
+      runtime = get_runtime(self.device.device, program_spec)
+      mapped_image = bytes(self.driver.resolve_owned(self.device.fd.fd, int(runtime.lib_gpu.va_addr), runtime.image_size))
+      self.assertEqual(mapped_image, runtime.image)
+      typed = tuple(instruction for instruction in decode_a630_ir3(mapped_image)
+                    if instruction.category == 1 and dict(instruction.fields).get("SRC_TYPE") == src_type and
+                    dict(instruction.fields).get("DST_TYPE") == 1)
+      self.assertEqual(len(typed), 1)
+      conversions.append(typed[0])
+
+    self.assertEqual(Device.DEFAULT, "QCOM")
+    for conversion,src_type in zip(conversions, (5, 3)):
+      self.assertLessEqual({("SRC_TYPE", src_type), ("DST_TYPE", 1), ("ROUND", 1), ("DST_HALF", 0), ("HALF", 0)},
+                           set(conversion.fields))
+
   def test_allocate_map_and_free(self):
     buffer = self.device._gpu_alloc(0x1234, fill_zeroes=True)
     allocation_id = buffer.meta[0].id

@@ -11,6 +11,9 @@ import base64, ctypes, struct, functools, inspect, itertools
 def g(s:str): return getattr(mesa, s)
 def nsrc(d:mesa.nir_def) -> mesa.nir_src: return mesa.nir_src(ssa=ctypes.pointer(d))
 
+# Mesa 461196a1c827769168304ff3f5b36360f16618ca src/compiler/shader_enums.h assigns this bit.
+_FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32 = 1 << 16
+
 def glsl_type(t:DType): return {
   **{getattr(dtypes,k):g(f"glsl_type_builtin_{v}") for k,v in [('double','double'),('float','float'),('float16','float16_t'),('bool','uint8_t')]},
   **{d:g(f"glsl_type_builtin_{'u' * (d in dtypes.uints)}int{str(d.bitsize)+'_t' if d.itemsize != 4 else ''}") for d in dtypes.ints}}[t]
@@ -309,6 +312,7 @@ class IR3Renderer(NIRRenderer):
 
   def prerender(self, uops:list[UOp]):
     super().prerender(uops)
+    self.b.shader.contents.info.float_controls_execution_mode |= _FLOAT_CONTROLS_ROUNDING_MODE_RTE_FP32
     self.texs:set[UOp] = set()
     self.img_idx = 0
     self.param_sz = functools.reduce(padded_idx, (u.element_size() if u.addrspace is AddrSpace.ALU else 8
