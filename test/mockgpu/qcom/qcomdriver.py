@@ -323,10 +323,10 @@ class QCOMDriver(VirtDriver):
       dispatch = submission.dispatches[0]
       immutable_reads = [(memory_range.address, memory_range.size, memory_range.purpose)
                          for memory_range in submission.memory_ranges if memory_range.read and memory_range.purpose != "wait value"]
-      # The exact executable images have one ordered buffer-pointer constant per ldg; preserve every snapshotted input until commit.
+      # Supported scalar kernels have one ordered buffer-pointer constant per ldg; preserve every snapshotted input until commit.
       input_count = sum(instruction.opcode == "ldg.u32" for instruction in dispatch.instructions)
-      self._require(input_count in (1, 2), f"unsupported A630 global input count {input_count}")
-      immutable_reads.extend((struct.unpack_from("<Q", dispatch.constants_image, 8 * (index + 1))[0], dispatch.local_size[0] * 4,
+      self._require(input_count in (0, 1, 2), f"unsupported A630 global input count {input_count}")
+      immutable_reads.extend((struct.unpack_from("<Q", dispatch.constants_image, 8 * (index + 1))[0], dispatch.global_size[0] * 4,
                               f"A630 global input {index}") for index in range(input_count))
       for journal_write in journal:
         for address,size,purpose in immutable_reads:

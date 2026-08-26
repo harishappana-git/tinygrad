@@ -563,6 +563,13 @@ class TestQCOMDriver(unittest.TestCase):
 
     def decode_one(word): return decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))[0]
 
+    mov_shared = decode_one(0x200cc001000000c0)
+    self.assertEqual((mov_shared.opcode, mov_shared.dst, mov_shared.srcs),
+                     ("mov.u32", A630IR3Operand("gpr", 1), (A630IR3Operand("shared", 0xc0),)))
+    mov_immediate = decode_one(0x204cc0033f800000)
+    self.assertEqual((mov_immediate.opcode, mov_immediate.dst, mov_immediate.srcs),
+                     ("mov.u32", A630IR3Operand("gpr", 3), (A630IR3Operand("uim", 0x3f800000),)))
+
     cov = words[5] & ~((0xff << 32) | 0xff) | 9 << 32 | 3
     self.assertEqual((decode_one(cov).dst, decode_one(cov).srcs),
                      (A630IR3Operand("gpr", 9), (A630IR3Operand("half", 3),)))
@@ -591,9 +598,19 @@ class TestQCOMDriver(unittest.TestCase):
       "shrg wrong precision": words[2] ^ 1 << 42,
       "global-load jump-target": words[7] | 1 << 59,
       "global-store destination offset": words[9] ^ 1 << 40,
+      "shared-move repeat": 0x200cc001000000c0 | 1 << 40,
+      "shared-move relative destination": 0x200cc001000000c0 | 1 << 49,
+      "shared-move shared destination": 0x200cc0c0000000c0,
+      "shared-move special source": 0x200cc001000000e0,
+      "immediate-move jump-target": 0x204cc0033f800000 | 1 << 59,
+      "immediate-move repeat": 0x204cc0033f800000 | 1 << 40,
+      "immediate-move unsigned-low": 0x204cc0033f800000 | 1 << 45,
+      "immediate-move rounding": 0x204cc0033f800000 | 1 << 55,
     }
     for modifier,word in rejected_modifiers.items():
       with self.subTest(modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
+      decode_one(0x200cc001000000c0 | 1 << 8)
     with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
       decode_one(words[7] | 1 << 41)
 
@@ -736,7 +753,7 @@ class TestQCOMDriver(unittest.TestCase):
     redirected_store = dispatch.instructions[19].raw & ~(0xff << 1) | 6 << 1
     with self.assertRaisesRegex(ValueError, "global store does not consume the f32 add"):
       execute_a630(stage_instruction(19, redirected_store), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    with self.assertRaisesRegex(ValueError, "unsupported A630 f32-add instruction inventory"):
+    with self.assertRaisesRegex(ValueError, "unsupported A630 scalar instruction inventory"):
       execute_a630(stage_instruction(15, dispatch.instructions[13].raw),
                    lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
     for kind,index in (("full", 13), ("half", 8)):
@@ -1066,6 +1083,155 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((bytes(result_view), bytes(right_view), self.driver.context_timestamps[self.device.ctx], self.device.last_cmd), before)
       self.device._gpu_free(alias_buffer)
     finally: constants_view[:8] = original_output_pointer
+
+  def test_production_symbolic_workgroups_execute_mapped_system_values(self):
+    import struct
+    from dataclasses import replace
+    from tinygrad import Device, Tensor, Variable
+    from tinygrad.runtime.autogen import kgsl, mesa
+    from test.mockgpu.qcom import qcomdriver
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+
+    submissions,command_images = [],[]
+    real_execute = qcomdriver.execute_a630
+    real_plan = self.driver._plan_a630_retirement
+    def capture_execution(submission, resolver):
+      submissions.append(submission)
+      return real_execute(submission, resolver)
+    def capture_plan(fd, submission, command_address, command_size):
+      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
+      return real_plan(fd, submission, command_address, command_size)
+
+    size = Variable("qcom_symbolic_size", 1, 10)
+    ones = Tensor.ones(10, device=Device.DEFAULT).contiguous()
+    actual = []
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
+         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+      for value in (2, 5): actual.append((ones[:size.bind(value)] + 1).contiguous()[:value].tolist())
+    reference = [(Tensor.ones(value, device="PYTHON") + 1).tolist() for value in (2, 5)]
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(actual, reference)
+
+    distinct_values = [-7.5, 0.25, 1024.0, -0.0, 3.5, 19.0, -2.0, 8.25, 11.0, -4.5]
+    distinct_size = Variable("qcom_distinct_size", 1, 10)
+    distinct = Tensor(distinct_values, device=Device.DEFAULT).realize()
+    distinct_actual = [(distinct[:distinct_size.bind(value)] + 1).contiguous()[:value].tolist() for value in (2, 5)]
+    distinct_reference = [(Tensor(distinct_values[:value], device="PYTHON") + 1).tolist() for value in (2, 5)]
+    self.assertEqual(distinct_actual, distinct_reference)
+
+    self.assertEqual((len(submissions), len(command_images)), (5, 5))
+    dispatches = [submission.dispatches[0] for submission in submissions]
+    shapes = [(dispatch.local_size, dispatch.groups, dispatch.global_size) for dispatch in dispatches]
+    self.assertEqual(shapes, [((2, 1, 1), (5, 1, 1), (10, 1, 1)),
+                              ((1, 1, 1), (2, 1, 1), (2, 1, 1)),
+                              ((2, 1, 1), (1, 1, 1), (2, 1, 1)),
+                              ((1, 1, 1), (5, 1, 1), (5, 1, 1)),
+                              ((1, 1, 1), (5, 1, 1), (5, 1, 1))])
+    kernel_kinds = [(sum(instruction.opcode == "ldg.u32" for instruction in dispatch.instructions),
+                     sum(instruction.opcode == "add.f" for instruction in dispatch.instructions)) for dispatch in dispatches]
+    self.assertEqual(kernel_kinds, [(0, 0), (1, 1), (1, 0), (1, 1), (1, 0)])
+    for dispatch in dispatches:
+      system = dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+      if dispatch.groups[0] > 1: self.assertEqual(system & 0xff, 0xc0)
+
+    multi_add = submissions[3]
+    dispatch = multi_add.dispatches[0]
+    system = dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+    def with_register(register, value):
+      return replace(dispatch, registers=tuple((reg, value if reg == register else current) for reg,current in dispatch.registers))
+    invalid_system_mappings = (
+      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~0xff | 0xfc), "lacks a workgroup-id mapping"),
+      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~0xff00), "unsupported A630 system-value register mapping"),
+      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~(0xff << 24) | 0xc0 << 24), "invalid A630 local-id"),
+      (with_register(mesa.REG_A6XX_SP_CS_WGE_CNTL, 0), "unsupported A630 system-value register mapping"),
+    )
+    for mutated_dispatch,message in invalid_system_mappings:
+      with self.subTest(system_mapping=message), self.assertRaisesRegex(ValueError, message):
+        real_execute(replace(multi_add, dispatches=(mutated_dispatch,)),
+                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+    for mutated_dispatch in (replace(dispatch, groups=(0, 1, 1), global_size=(0, 1, 1)),
+                             replace(dispatch, groups=(0x10001, 1, 1), global_size=(0x10001, 1, 1)),
+                             replace(dispatch, groups=(5, 2, 1), global_size=(5, 2, 1))):
+      with self.subTest(dispatch_shape=mutated_dispatch.global_size), self.assertRaisesRegex(ValueError, "bounded one-dimensional"):
+        real_execute(replace(multi_add, dispatches=(mutated_dispatch,)),
+                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+
+    constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
+    constants_before = bytes(constants_view)
+    input_base = struct.unpack_from("<Q", constants_before, 8)[0]
+    input_view = self.driver.resolve_owned(self.device.fd.fd, input_base, dispatch.global_size[0] * 4 + 4)
+    output_base = struct.unpack_from("<Q", constants_before)[0]
+    output_view = self.driver.resolve_owned(self.device.fd.fd, output_base, dispatch.global_size[0] * 4)
+    alias_words = struct.unpack(f"<{len(command_images[3]) // 4}I", command_images[3])
+    alias_buffer,_,alias_request = self.gpu_command(alias_words)
+    alias_request.timestamp = 0x24681357
+    state_before = (bytes(input_view), bytes(output_view), self.driver.context_timestamps[self.device.ctx],
+                    self.driver.always_on_counter, self.device.last_cmd)
+    try:
+      struct.pack_into("<Q", constants_view, 0, input_base + 4)
+      with self.assertRaisesRegex(RuntimeError, "global store aliases snapshotted A630 global input 0"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
+      self.assertEqual((alias_request.timestamp, bytes(input_view), bytes(output_view), self.driver.context_timestamps[self.device.ctx],
+                        self.driver.always_on_counter, self.device.last_cmd), (0x24681357, *state_before))
+    finally:
+      constants_view[:] = constants_before
+      self.device._gpu_free(alias_buffer)
+
+    instruction = next(instruction for instruction in dispatch.instructions if instruction.opcode == "shl.b" and
+                       any(operand.kind == "shared" for operand in instruction.srcs))
+    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    shared_instructions = tuple(instruction for instruction in dispatch.instructions
+                                if any(operand.kind == "shared" for operand in instruction.srcs))
+    shared_original = bytes(shader)
+    try:
+      for shared_instruction in shared_instructions:
+        self.assertEqual(shader[shared_instruction.index*8], 0xc0)
+        shader[shared_instruction.index*8] = 0xc4
+      image = bytes(shader)
+      renamed_registers = tuple((reg, system & ~0xff | 0xc4 if reg == mesa.REG_A6XX_SP_CS_CONST_CONFIG_0 else current)
+                                for reg,current in dispatch.registers)
+      renamed_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image), registers=renamed_registers)
+      renamed_journal = real_execute(replace(multi_add, dispatches=(renamed_dispatch,)),
+                                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      self.assertEqual(tuple(struct.unpack("<f", write.data)[0] for write in renamed_journal), (2.0,) * 5)
+    finally: shader[:] = shared_original
+
+    original = bytes(shader[instruction.index*8:(instruction.index+1)*8])
+    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+    output = self.driver.resolve_owned(self.device.fd.fd, output_base, dispatch.global_size[0] * 4)
+    output_before = bytes(output)
+    self.assertEqual(original[0], 0xc0)
+    # Redirect the compiled workgroup-X source to workgroup-Y. Decoding the changed mapped bytes must break address generation.
+    try:
+      shader[instruction.index*8] = 0xc1
+      image = bytes(shader)
+      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      mutated_submission = replace(multi_add, dispatches=(mutated_dispatch,))
+      with self.assertRaisesRegex(ValueError, "global load 0 does not address its f32 input"):
+        real_execute(mutated_submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+    finally: shader[instruction.index*8:(instruction.index+1)*8] = original
+    self.assertEqual((bytes(shader[instruction.index*8:(instruction.index+1)*8]), bytes(output)), (original, output_before))
+
+    fill = submissions[0]
+    fill_dispatch = fill.dispatches[0]
+    fill_move = next(instruction for instruction in fill_dispatch.instructions
+                     if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim")
+    fill_shader = self.driver.resolve_owned(self.device.fd.fd, fill_dispatch.shader_address, fill_dispatch.shader_size)
+    fill_original = bytes(fill_shader[fill_move.index*8:(fill_move.index+1)*8])
+    fill_output_base = struct.unpack_from("<Q", fill_dispatch.constants_image)[0]
+    fill_output = self.driver.resolve_owned(self.device.fd.fd, fill_output_base, fill_dispatch.global_size[0] * 4)
+    fill_output_before = bytes(fill_output)
+    try:
+      struct.pack_into("<I", fill_shader, fill_move.index*8, 0x40000000)
+      image = bytes(fill_shader)
+      mutated_fill = replace(fill, dispatches=(replace(fill_dispatch, shader_image=image, instructions=decode_a630_ir3(image)),))
+      with self.assertRaisesRegex(ValueError, "unsupported A630 fill literal"):
+        real_execute(mutated_fill, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+    finally: fill_shader[fill_move.index*8:(fill_move.index+1)*8] = fill_original
+    self.assertEqual((bytes(fill_shader[fill_move.index*8:(fill_move.index+1)*8]), bytes(fill_output)),
+                     (fill_original, fill_output_before))
 
   def test_production_image_descriptor_path_preflights_nested_ranges(self):
     import struct
