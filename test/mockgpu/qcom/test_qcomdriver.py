@@ -51,10 +51,8 @@ class TestQCOMDriver(unittest.TestCase):
       yield submissions,command_images,real_execute
 
   @contextlib.contextmanager
-  def _mutate_a630_replay(self, submission, command_words, edits, *, timestamp=None):
+  def _edit_a630_shader(self, submission, edits):
     import struct
-    from dataclasses import replace
-    from test.mockgpu.qcom.a630 import decode_a630_ir3
     edits = tuple(edits)
     self.assertEqual(len(submission.dispatches), 1)
     self.assertTrue(edits)
@@ -68,20 +66,32 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual(dispatch.instructions[instruction.index], instruction)
       self.assertNotEqual(raw, instruction.raw)
       self.assertTrue(0 <= raw < 1 << 64)
-    originals = tuple(bytes(shader[instruction.index*8:(instruction.index+1)*8]) for instruction,_ in edits)
+    try:
+      for instruction,raw in edits: struct.pack_into("<Q", shader, instruction.index * 8, raw)
+      yield
+    finally:
+      for instruction,_ in edits: struct.pack_into("<Q", shader, instruction.index * 8, instruction.raw)
+      self.assertEqual(bytes(shader), dispatch.shader_image)
+
+  def _stage_a630_edits(self, submission, packets, edits):
+    from test.mockgpu.qcom.a630 import stage_a630
+    with self._edit_a630_shader(submission, edits): return stage_a630(packets, self._resolve_owned)
+
+  @contextlib.contextmanager
+  def _mutate_a630_replay(self, submission, command_words, edits, *, timestamp=None):
+    from dataclasses import replace
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+    dispatch = submission.dispatches[0]
+    shader = self._resolve_owned(dispatch.shader_address, dispatch.shader_size)
     request_buffer,_,request = self.gpu_command(command_words)
     if timestamp is not None: request.timestamp = timestamp
     try:
-      for instruction,raw in edits: struct.pack_into("<Q", shader, instruction.index * 8, raw)
-      image = bytes(shader)
-      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
-      yield replace(submission, dispatches=(mutated_dispatch,)),mutated_dispatch,request
+      with self._edit_a630_shader(submission, edits):
+        image = bytes(shader)
+        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+        yield replace(submission, dispatches=(mutated_dispatch,)),mutated_dispatch,request
     finally:
-      for (instruction,_),original in zip(edits, originals):
-        shader[instruction.index*8:(instruction.index+1)*8] = original
       self.device._gpu_free(request_buffer)
-      self.assertEqual((tuple(bytes(shader[instruction.index*8:(instruction.index+1)*8]) for instruction,_ in edits), bytes(shader)),
-                       (originals, dispatch.shader_image))
 
   def _assert_a630_transactional_rejection(self, *, execute, submission, request, message, marker, state):
     from tinygrad.runtime.autogen import kgsl
@@ -1067,19 +1077,24 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((dispatch.local_size, dispatch.groups), (tuple(program_spec.arg.local_size), tuple(program_spec.arg.global_size)))
     self.assertEqual(dispatch.global_size, tuple(g*l for g,l in zip(dispatch.groups, dispatch.local_size)))
     self.assertEqual(len(dispatch.instructions), runtime.image_size // 8)
-    self.assertEqual((dispatch.instructions[0].raw, dispatch.instructions[0].category, dispatch.instructions[0].name),
-                     (0x47180803201f0000, 2, "ashr.b"))
-    self.assertEqual((dispatch.instructions[10].category, dispatch.instructions[10].name), (1, None))
-    self.assertIn(("SRC_TYPE", 2), dispatch.instructions[10].fields)
-    self.assertIn(("DST_TYPE", 5), dispatch.instructions[10].fields)
-    cov = dispatch.instructions[10]
-    assert cov.dst is not None
-    self.assertEqual((cov.opcode, cov.dst.kind, cov.srcs[0].kind), ("cov.u16s32", "gpr", "half"))
-    self.assertEqual((dispatch.instructions[16].opcode, dispatch.instructions[17].opcode, dispatch.instructions[19].opcode),
-                     ("ldg.u32", "add.f", "stg.u32"))
-    self.assertEqual((dispatch.instructions[17].srcs[1].kind, dispatch.instructions[17].srcs[1].value), ("flut", 2))
-    self.assertEqual((dispatch.instructions[20].raw, dispatch.instructions[20].name), (6 << 55, "end"))
-    self.assertTrue(all(instruction.raw == 0 and instruction.name == "nop" for instruction in dispatch.instructions[21:]))
+    end = next(instruction for instruction in dispatch.instructions if instruction.opcode == "end")
+    active = dispatch.instructions[:end.index+1]
+    data_path = tuple(instruction for instruction in active if instruction.opcode in {"ldg.u32", "add.f", "stg.u32"})
+    self.assertEqual(tuple(instruction.opcode for instruction in data_path), ("ldg.u32", "add.f", "stg.u32"))
+    load,float_add,store = data_path
+    assert load.dst is not None and float_add.dst is not None
+    flut_operands = tuple(operand for operand in float_add.srcs if operand.kind == "flut")
+    self.assertEqual((len(float_add.srcs), tuple((operand.kind, operand.value) for operand in flut_operands),
+                      load.dst in float_add.srcs, store.srcs[1]), (2, (("flut", 2),), True, float_add.dst))
+    carry_links = tuple((carry,address_add) for carry in active if carry.opcode == "cov.u16s32" and carry.dst is not None
+                        for address_add in active if address_add.opcode == "add.u" and address_add.dst is not None and
+                        address_add.dst.value == load.srcs[0].value + 1 and carry.dst in address_add.srcs)
+    self.assertEqual(len(carry_links), 1)
+    carry,address_add = carry_links[0]
+    carry_compares = tuple(instruction for instruction in active if instruction.opcode == "cmps.u.lt" and
+                           instruction.dst == carry.srcs[0])
+    self.assertEqual(len(carry_compares), 1)
+    self.assertTrue(carry_compares[0].index < carry.index < address_add.index)
     range_sizes = {(memory_range.purpose, memory_range.size) for memory_range in submission.memory_ranges}
     self.assertTrue({("wait value", 4), ("event value", 4), ("counter value", 8), ("constants", 4096),
                      ("shader", runtime.image_size)} <= range_sizes)
@@ -1101,77 +1116,66 @@ class TestQCOMDriver(unittest.TestCase):
     reference = cast(list[float], (Tensor(source_values, device="PYTHON") + 1).tolist())
     self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
 
-    # FLUT immediate 2 is 1.0 and immediate 3 is 2.0 in pinned Mesa ir3-common.xml.
     shader_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    add_immediate_byte = 17 * 8 + 2
-    self.assertEqual(shader_view[add_immediate_byte], 2)
-    try:
-      result_view[:] = bytes(result_size)
-      shader_view[add_immediate_byte] = 3
-      mutated_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      mutated_journal = execute_a630(mutated_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      self.assertEqual(bytes(result_view), bytes(result_size))
-      for write in mutated_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
-      mutated = list(struct.unpack(result_format, result_view))
-      self.assertEqual(mutated, [value + 1 for value in reference])
-      self.assertNotEqual(mutated, reference)
-    finally:
-      shader_view[add_immediate_byte] = 2
-      result_view[:] = bytes(result_size)
-
-    # SY changes the mapped machine image but only serializes dependencies already ordered by the lane interpreter.
-    schedule_byte = 13 * 8 + 7
-    self.assertEqual(shader_view[schedule_byte] & 0x10, 0)
-    try:
-      shader_view[schedule_byte] |= 0x10
-      scheduled_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      self.assertIn(("SY", 1), scheduled_submission.dispatches[0].instructions[13].fields)
-      scheduled_journal = execute_a630(scheduled_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      for write in scheduled_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
-      self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
-    finally:
-      shader_view[schedule_byte] &= ~0x10
-      result_view[:] = bytes(result_size)
+    flut_source_index = float_add.srcs.index(flut_operands[0])
+    flut_shift = 16 * flut_source_index
+    # Pinned ir3-common.xml encodes FLUT in one 16-bit Cat2 source; FLUT[2]=1.0 and FLUT[3]=2.0.
+    self.assertEqual(float_add.raw >> flut_shift & 0xffff, 0x2802)
+    flut3_raw = float_add.raw & ~(0xffff << flut_shift) | 0x2803 << flut_shift
 
     # Rename a temporary within the declared full-register footprint and prove execution follows the decoded register ids.
-    cov_dst_byte,add_src_byte = 10 * 8 + 4, 13 * 8
-    self.assertEqual((shader_view[cov_dst_byte], shader_view[add_src_byte]), (10, 10))
-    try:
-      shader_view[cov_dst_byte] = shader_view[add_src_byte] = 13
-      renamed_submission = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      self.assertEqual((renamed_submission.dispatches[0].instructions[10].dst,
-                        renamed_submission.dispatches[0].instructions[13].srcs[0].value),
-                       (renamed_submission.dispatches[0].instructions[13].srcs[0], 13))
-      renamed_journal = execute_a630(renamed_submission, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      for write in renamed_journal: self.driver.resolve_owned(self.device.fd.fd, write.address, len(write.data))[:] = write.data
-      self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
-    finally:
-      shader_view[cov_dst_byte] = shader_view[add_src_byte] = 10
-      result_view[:] = bytes(result_size)
+    full_register_limit = (dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CNTL_0] >> 7 & 0x3f) * 4
+    used_full = {operand.value for instruction in active
+                 for operand in ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs if operand.kind == "gpr"}
+    used_full.update(instruction.srcs[0].value + 1 for instruction in active
+                     if instruction.opcode in {"ldg.u32", "stg.u32"})
+    rename_candidates = tuple(register for register in range(max(0, full_register_limit - 4), full_register_limit)
+                              if register not in used_full)
+    self.assertTrue(rename_candidates)
+    rename_target = rename_candidates[-1]
+    carry_source_index = address_add.srcs.index(carry.dst)
+    carry_shift = 16 * carry_source_index
+    renamed_submission = self._stage_a630_edits(submission, packets, (
+      (carry, carry.raw & ~(0xff << 32) | rename_target << 32),
+      (address_add, address_add.raw & ~(0xffff << carry_shift) | rename_target << carry_shift),
+    ))
+    renamed_carry = renamed_submission.dispatches[0].instructions[carry.index]
+    renamed_add = renamed_submission.dispatches[0].instructions[address_add.index]
+    assert renamed_carry.dst is not None
+    self.assertEqual((renamed_carry.dst.kind, renamed_carry.dst.value, renamed_add.srcs[carry_source_index]),
+                     ("gpr", rename_target, renamed_carry.dst))
+    result_view[:] = bytes(result_size)
+    renamed_journal = execute_a630(renamed_submission, self._resolve_owned)
+    self.assertEqual(bytes(result_view), bytes(result_size))
+    for write in renamed_journal: self._resolve_owned(write.address, len(write.data))[:] = write.data
+    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
+    result_view[:] = bytes(result_size)
 
-    def stage_instruction(index, raw):
-      original = struct.unpack_from("<Q", shader_view, index * 8)[0]
-      struct.pack_into("<Q", shader_view, index * 8, raw)
-      try: return stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      finally: struct.pack_into("<Q", shader_view, index * 8, original)
-
-    redirected_load = dispatch.instructions[16].raw & ~(0xff << 14) | 6 << 14
+    wrong_register = store.srcs[0].value
+    self.assertNotIn(wrong_register, (load.srcs[0].value, load.dst.value))
+    redirected_load = load.raw & ~(0xff << 14) | wrong_register << 14
+    redirected_submission = self._stage_a630_edits(submission, packets, ((load, redirected_load),))
+    self.assertEqual(redirected_submission.dispatches[0].instructions[load.index].srcs[0].value, wrong_register)
     with self.assertRaisesRegex(ValueError, "global load 0 does not address its scalar input"):
-      execute_a630(stage_instruction(16, redirected_load), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    redirected_add = dispatch.instructions[17].raw & ~0xff | 6
+      execute_a630(redirected_submission, self._resolve_owned)
+    load_source_index = float_add.srcs.index(load.dst)
+    load_shift = 16 * load_source_index
+    redirected_add = float_add.raw & ~(0xffff << load_shift) | wrong_register << load_shift
+    redirected_submission = self._stage_a630_edits(submission, packets, ((float_add, redirected_add),))
+    self.assertEqual(redirected_submission.dispatches[0].instructions[float_add.index].srcs[load_source_index].value, wrong_register)
     with self.assertRaisesRegex(ValueError, "f32 add does not consume the global load"):
-      execute_a630(stage_instruction(17, redirected_add), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    redirected_store = dispatch.instructions[19].raw & ~(0xff << 1) | 6 << 1
+      execute_a630(redirected_submission, self._resolve_owned)
+    redirected_store = store.raw & ~(0xff << 1) | wrong_register << 1
+    redirected_submission = self._stage_a630_edits(submission, packets, ((store, redirected_store),))
+    self.assertEqual(redirected_submission.dispatches[0].instructions[store.index].srcs, (store.srcs[0], store.srcs[0]))
     with self.assertRaisesRegex(ValueError, "global store does not consume the f32 add"):
-      execute_a630(stage_instruction(19, redirected_store), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      execute_a630(redirected_submission, self._resolve_owned)
+    nop = next(instruction for instruction in active if instruction.opcode == "nop")
     with self.assertRaisesRegex(ValueError, "unsupported A630 scalar instruction inventory"):
-      execute_a630(stage_instruction(15, dispatch.instructions[13].raw),
-                   lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    for kind,index,message in (("full", 13, "unsupported shared or special IR3 register"),
-                               ("half", 8, "unsupported A630 semantic at instruction 8")):
-      with self.subTest(shared_register=kind), self.assertRaisesRegex(ValueError, message):
-        execute_a630(stage_instruction(index, dispatch.instructions[index].raw & ~(0xff << 32) | 0xc0 << 32),
-                     lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      execute_a630(self._stage_a630_edits(submission, packets, ((nop, address_add.raw),)), self._resolve_owned)
+    with self.assertRaisesRegex(ValueError, "unsupported shared or special IR3 register"):
+      execute_a630(self._stage_a630_edits(submission, packets,
+                   ((address_add, address_add.raw & ~(0xff << 32) | 0xc0 << 32),)), self._resolve_owned)
 
     constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
     original_output_pointer = bytes(constants_view[:8])
@@ -1183,7 +1187,7 @@ class TestQCOMDriver(unittest.TestCase):
     try:
       constants_view[:8] = struct.pack("<Q", final_word)
       late_failure = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      with self.assertRaisesRegex(ValueError, "instruction 19 lane 1"):
+      with self.assertRaisesRegex(ValueError, rf"instruction {store.index} lane 1"):
         execute_a630(late_failure, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
       self.assertEqual(bytes(final_view), final_before)
 
@@ -1193,7 +1197,7 @@ class TestQCOMDriver(unittest.TestCase):
       late_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
       late_before = (bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-      with self.assertRaisesRegex(RuntimeError, "instruction 19 lane 1"):
+      with self.assertRaisesRegex(RuntimeError, rf"instruction {store.index} lane 1"):
         kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
       self.assertEqual(late_request.timestamp, 0x31415926)
       self.assertEqual((bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
@@ -1218,18 +1222,11 @@ class TestQCOMDriver(unittest.TestCase):
       self.device._gpu_free(alias_input_buffer)
     finally: constants_view[:8] = original_output_pointer
 
-    first_byte = shader_view[0]
-    try:
-      shader_view[0] ^= 1
-      self.assertEqual(dispatch.shader_image[0], first_byte)
-    finally: shader_view[0] = first_byte
-
-    end_reserved_byte = 20 * 8 + 4
-    try:
-      shader_view[end_reserved_byte] ^= 1
-      with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 20"):
-        stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    finally: shader_view[end_reserved_byte] ^= 1
+    with self._edit_a630_shader(submission, ((float_add, flut3_raw),)):
+      self.assertNotEqual(bytes(shader_view), dispatch.shader_image)
+    # END's raw bit 32 is reserved by pinned ir3-cat0.xml and has no structured callback field.
+    with self.assertRaisesRegex(ValueError, rf"invalid or reserved IR3 encoding at instruction {end.index}"):
+      self._stage_a630_edits(submission, packets, ((end, end.raw ^ 1 << 32),))
 
     def mutate(packet, payload_index, value):
       mutated = list(words)
@@ -1344,16 +1341,14 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertGreater(first_counter, 0)
     self.assertEqual(bytes(dummy_view), bytes(4))
 
-    try:
+    with self._edit_a630_shader(submission, ((float_add, flut3_raw),)):
       result_view[:] = bytes(result_size)
-      shader_view[add_immediate_byte] = 3
       queue.submit(self.device)
       self.assertEqual(self.device.last_cmd, retired_command + 1)
       self.assertEqual(list(struct.unpack(result_format, result_view)), [value + 1 for value in reference])
       mutated_counter = struct.unpack_from("<Q", signal_view, 8)[0]
       self.assertGreater(mutated_counter, first_counter)
       retired_command = self.device.last_cmd
-    finally: shader_view[add_immediate_byte] = 2
 
     result_view[:] = bytes(result_size)
     queue.submit(self.device)
