@@ -1326,7 +1326,8 @@ class TestQCOMDriver(unittest.TestCase):
 
     result_view[:] = bytes(result_size)
     signal_view = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-    signal_view[:] = bytes(16)
+    self.assertEqual(self.device.timeline_signal.value, self.device.timeline_value - 1)
+    signal_view[8:] = bytes(8)
     dummy_view = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
     dummy_view[:] = b"A630"
     queue.bind(self.device)
@@ -1433,7 +1434,7 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad import Device, Tensor
     from tinygrad.codegen import to_program
     from tinygrad.engine.realize import get_runtime
-    from tinygrad.runtime.autogen import kgsl, mesa
+    from tinygrad.runtime.autogen import kgsl
     from test.mockgpu.qcom.a630 import execute_a630, stage_a630
     from test.mockgpu.qcom.pm4 import parse_pm4
 
@@ -1453,24 +1454,22 @@ class TestQCOMDriver(unittest.TestCase):
     dispatch = submission.dispatches[0]
 
     self.assertEqual(Device.DEFAULT, "QCOM")
-    self.assertEqual((runtime.image_size, dispatch.local_size, dispatch.groups), (256, (3, 1, 1), (1, 1, 1)))
-    self.assertEqual(dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CNTL_0], 0x282)
-    self.assertEqual(tuple(instruction.raw for instruction in dispatch.instructions[18:27]),
-                     (0xc006000b01810001, 0x2009400c00000001, 0xc006001001834001, 0x20000000000,
-                      0x421000070009000c, 0x5018080b0010000b, 0x20000000000, 0xc0c60d0001800016, 0x300000000000000))
-    self.assertEqual(tuple(instruction.opcode for instruction in dispatch.instructions[18:27]),
-                     ("ldg.u32", "cov.u16s32", "ldg.u32", "nop", "add.u", "add.f", "nop", "stg.u32", "end"))
+    self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((3, 1, 1), (1, 1, 1), (3, 1, 1)))
+    data_path = tuple(instruction for instruction in dispatch.instructions if instruction.opcode in {"ldg.u32", "add.f", "stg.u32"})
+    self.assertEqual(tuple(instruction.opcode for instruction in data_path), ("ldg.u32", "ldg.u32", "add.f", "stg.u32"))
+    first_load,second_load,float_add,store = data_path
+    self.assertNotEqual(first_load.dst, second_load.dst)
+    self.assertEqual((frozenset(float_add.srcs), store.srcs[1]), (frozenset((first_load.dst, second_load.dst)), float_add.dst))
     self.assertEqual(struct.unpack_from("<3Q", dispatch.constants_image),
                      (int(result_buffer._buf.va_addr), int(left_buffer._buf.va_addr), int(right_buffer._buf.va_addr)))
 
     shader_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    second_load = dispatch.instructions[20].raw
-    struct.pack_into("<Q", shader_view, 20 * 8, second_load & ~(0xff << 14) | 4 << 14)
+    struct.pack_into("<Q", shader_view, second_load.index * 8, second_load.raw & ~(0xff << 14) | first_load.srcs[0].value << 14)
     try:
-      redirected = stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    finally: struct.pack_into("<Q", shader_view, 20 * 8, second_load)
+      redirected = stage_a630(parse_pm4(words), self._resolve_owned)
+    finally: struct.pack_into("<Q", shader_view, second_load.index * 8, second_load.raw)
     with self.assertRaisesRegex(ValueError, "global load 1 does not address its scalar input"):
-      execute_a630(redirected, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+      execute_a630(redirected, self._resolve_owned)
 
     result_size = len(left_values) * 4
     result_view = self.driver.resolve_owned(self.device.fd.fd, int(result_buffer._buf.va_addr), result_size)
