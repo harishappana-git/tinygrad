@@ -569,6 +569,11 @@ class TestQCOMDriver(unittest.TestCase):
     mov_immediate = decode_one(0x204cc0033f800000)
     self.assertEqual((mov_immediate.opcode, mov_immediate.dst, mov_immediate.srcs),
                      ("mov.u32", A630IR3Operand("gpr", 3), (A630IR3Operand("uim", 0x3f800000),)))
+    integer_add = decode_one(0x5218080b0010000b)
+    self.assertEqual((integer_add.opcode, integer_add.dst, integer_add.srcs),
+                     ("add.u", A630IR3Operand("gpr", 11),
+                      (A630IR3Operand("gpr", 11), A630IR3Operand("gpr", 16))))
+    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_add.fields))
 
     cov = words[5] & ~((0xff << 32) | 0xff) | 9 << 32 | 3
     self.assertEqual((decode_one(cov).dst, decode_one(cov).srcs),
@@ -588,6 +593,7 @@ class TestQCOMDriver(unittest.TestCase):
 
     rejected_modifiers = {
       "saturate": words[3] | 1 << 42,
+      "signed-add opcode": 0x5238080b0010000b,
       "jump-target": words[3] | 1 << 59,
       "repeat": words[3] | 1 << 40,
       "absolute/negate": words[3] | 1 << 14,
@@ -745,7 +751,7 @@ class TestQCOMDriver(unittest.TestCase):
       finally: struct.pack_into("<Q", shader_view, index * 8, original)
 
     redirected_load = dispatch.instructions[16].raw & ~(0xff << 14) | 6 << 14
-    with self.assertRaisesRegex(ValueError, "global load 0 does not address its f32 input"):
+    with self.assertRaisesRegex(ValueError, "global load 0 does not address its scalar input"):
       execute_a630(stage_instruction(16, redirected_load), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
     redirected_add = dispatch.instructions[17].raw & ~0xff | 6
     with self.assertRaisesRegex(ValueError, "f32 add does not consume the global load"):
@@ -1057,7 +1063,7 @@ class TestQCOMDriver(unittest.TestCase):
     try:
       redirected = stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
     finally: struct.pack_into("<Q", shader_view, 20 * 8, second_load)
-    with self.assertRaisesRegex(ValueError, "global load 1 does not address its f32 input"):
+    with self.assertRaisesRegex(ValueError, "global load 1 does not address its scalar input"):
       execute_a630(redirected, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
 
     result_size = len(left_values) * 4
@@ -1083,6 +1089,85 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((bytes(result_view), bytes(right_view), self.driver.context_timestamps[self.device.ctx], self.device.last_cmd), before)
       self.device._gpu_free(alias_buffer)
     finally: constants_view[:8] = original_output_pointer
+
+  def test_production_integer_add_wraps_from_mapped_machine_bytes(self):
+    import struct
+    from dataclasses import replace
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom import qcomdriver
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+
+    submissions,command_images = [],[]
+    real_execute = qcomdriver.execute_a630
+    real_plan = self.driver._plan_a630_retirement
+    def capture_execution(submission, resolver):
+      submissions.append(submission)
+      return real_execute(submission, resolver)
+    def capture_plan(fd, submission, command_address, command_size):
+      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
+      return real_plan(fd, submission, command_address, command_size)
+
+    cases = ((dtypes.int, [dtypes.int.max, dtypes.int.min, -7], [1, -1, 3], [dtypes.int.min, dtypes.int.max, -4]),
+             (dtypes.uint, [dtypes.uint.max, 0x80000000, 7], [1, 0x80000000, 5], [0, 0, 12]))
+    actual = []
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
+         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+      for dtype,left,right,_ in cases:
+        actual.append((Tensor(left, dtype=dtype, device=Device.DEFAULT) + Tensor(right, dtype=dtype, device=Device.DEFAULT)).tolist())
+    reference = [(Tensor(left, dtype=dtype, device="PYTHON") + Tensor(right, dtype=dtype, device="PYTHON")).tolist()
+                 for dtype,left,right,_ in cases]
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(actual, reference)
+    self.assertEqual(actual, [expected for *_,expected in cases])
+    self.assertEqual((len(submissions), len(command_images)), (2, 2))
+    decoded_dispatches = []
+    for submission in submissions:
+      dispatch = submission.dispatches[0]
+      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((3, 1, 1), (1, 1, 1), (3, 1, 1)))
+      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
+      load_destinations = frozenset(instruction.dst for instruction in loads)
+      data_adds = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                        frozenset(instruction.srcs) == load_destinations)
+      self.assertEqual((len(loads), len(stores), len(data_adds)), (2, 1, 1))
+      self.assertIn(("SY", 1), data_adds[0].fields)
+      self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
+      decoded_dispatches.append((dispatch, data_adds[0]))
+
+    submission = submissions[0]
+    dispatch,data_add = decoded_dispatches[0]
+    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    original = bytes(shader[data_add.index*8:(data_add.index+1)*8])
+    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+    output = self.driver.resolve_owned(self.device.fd.fd, output_base, len(cases[0][1]) * 4)
+    output_before = bytes(output)
+    mutated_raw = data_add.raw & ~(0xffff << 16) | data_add.srcs[0].value << 16
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0]))
+    request.timestamp = 0x10293847
+    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+    state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                    self.driver.always_on_counter, self.device.last_cmd)
+    try:
+      struct.pack_into("<Q", shader, data_add.index * 8, mutated_raw)
+      image = bytes(shader)
+      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      self.assertEqual(mutated_dispatch.instructions[data_add.index].srcs, (data_add.srcs[0], data_add.srcs[0]))
+      with self.assertRaisesRegex(ValueError, "u32 add does not consume both global loads"):
+        real_execute(replace(submission, dispatches=(mutated_dispatch,)),
+                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      with self.assertRaisesRegex(RuntimeError, "u32 add does not consume both global loads"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                        self.driver.always_on_counter, self.device.last_cmd), (0x10293847, *state_before))
+    finally:
+      shader[data_add.index*8:(data_add.index+1)*8] = original
+      self.device._gpu_free(request_buffer)
+    self.assertEqual((bytes(shader[data_add.index*8:(data_add.index+1)*8]), bytes(output)), (original, output_before))
+    self.assertEqual((Tensor([9, 2, -7], dtype=dtypes.int, device=Device.DEFAULT) +
+                      Tensor([-4, 0, 3], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5, 2, -4])
 
   def test_production_symbolic_workgroups_execute_mapped_system_values(self):
     import struct
@@ -1209,7 +1294,7 @@ class TestQCOMDriver(unittest.TestCase):
       image = bytes(shader)
       mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
       mutated_submission = replace(multi_add, dispatches=(mutated_dispatch,))
-      with self.assertRaisesRegex(ValueError, "global load 0 does not address its f32 input"):
+      with self.assertRaisesRegex(ValueError, "global load 0 does not address its scalar input"):
         real_execute(mutated_submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
     finally: shader[instruction.index*8:(instruction.index+1)*8] = original
     self.assertEqual((bytes(shader[instruction.index*8:(instruction.index+1)*8]), bytes(output)), (original, output_before))
