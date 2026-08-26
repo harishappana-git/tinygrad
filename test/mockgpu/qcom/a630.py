@@ -177,7 +177,7 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R")):
       return "cov.u16s32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("half", _same_int_field(fields, "SRC")),)
-  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "cmps.u", "add.f"} and _has_no_repeat(fields) and \
+  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "cmps.u", "add.f"} and _has_no_repeat(fields) and \
      all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "ABSNEG", "SRC_R")) and \
      (raw >> 52 & 1, raw >> 46 & 1) == (1, int(name == "cmps.u")):
     dst = A630IR3Operand("half" if _same_int_field(fields, "DST_HALF") else "gpr", _same_int_field(fields, "DST"))
@@ -614,10 +614,10 @@ def _system_registers(dispatch:A630Dispatch) -> tuple[int, int]:
   _require(dispatch.local_size[0] == 1 or lid != invalid, "multi-lane A630 dispatch lacks a local-id mapping")
   return wgid,lid
 
-def _u32_add_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3Instruction|None:
+def _u32_binary_instruction(instructions:Sequence[A630IR3Instruction], opcode:str) -> A630IR3Instruction|None:
   load_destinations = frozenset(instruction.dst for instruction in instructions if instruction.opcode == "ldg.u32")
   if len(load_destinations) != 2: return None
-  matches = tuple(instruction for instruction in instructions if instruction.opcode == "add.u" and
+  matches = tuple(instruction for instruction in instructions if instruction.opcode == opcode and
                   len(instruction.srcs) == 2 and frozenset(instruction.srcs) == load_destinations)
   return matches[0] if len(matches) == 1 else None
 
@@ -661,19 +661,32 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   input_count = opcodes.count("ldg.u32")
   float_add_count = opcodes.count("add.f")
   _require(input_count in (0, 1, 2), "A630 execution supports at most two global loads")
-  has_integer_add = (input_count, float_add_count) == (2, 0)
   _require((input_count, float_add_count) in ((0, 0), (1, 0), (1, 1), (2, 0), (2, 1)), "unsupported A630 scalar kernel shape")
+  integer_instruction:A630IR3Instruction|None = None
+  if opcodes.count("sub.u"):
+    integer_instruction = _u32_binary_instruction(active, "sub.u")
+    _require((input_count, float_add_count, opcodes.count("sub.u")) == (2, 0, 1) and integer_instruction is not None,
+             "u32 subtraction does not consume both global loads")
+  elif (input_count, float_add_count) == (2, 0):
+    integer_instruction = _u32_binary_instruction(active, "add.u")
+    _require(integer_instruction is not None, "u32 add does not consume both global loads")
+  has_integer_add = integer_instruction is not None and integer_instruction.opcode == "add.u"
   shared_uses = tuple(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "shared")
   uses_constant_pointers = _validate_constant_pointer_moves(active)
   if input_count == 0:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
   elif uses_constant_pointers:
-    _require(has_integer_add and not shared_uses, "constant-pointer A630 execution supports only scalar u32 addition")
+    _require(integer_instruction is not None and not shared_uses,
+             "constant-pointer A630 execution supports only scalar u32 addition or subtraction")
+    assert integer_instruction is not None
+    assert integer_instruction.opcode is not None
     _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
              "constant-pointer A630 execution requires one scalar invocation")
-    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, "add.u":1, "stg.u32":1, "end":1}
+    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, integer_instruction.opcode:1, "stg.u32":1, "end":1}
   else:
+    _require(integer_instruction is None or integer_instruction.opcode == "add.u",
+             "u32 subtraction currently requires the scalar constant-pointer ABI")
     uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
                        "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3 + int(uses_workgroup_id),
@@ -695,6 +708,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "shrg": valid = dst_kind == "gpr" and src_kinds == ("iim", "gpr", "gpr") and instruction.srcs[0].value == 30
     elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("shared",), ("const",), ("uim",))
     elif instruction.opcode == "add.u": valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
+    elif instruction.opcode == "sub.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
     elif instruction.opcode == "ldg.u32": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
@@ -704,12 +718,11 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "stg.u32": valid = dst_kind is None and src_kinds == ("gpr", "gpr")
     _require(valid, f"unsupported A630 operand contract at instruction {instruction.index}")
 
-  if has_integer_add:
-    data_add = _u32_add_instruction(active)
-    _require(data_add is not None, "u32 add does not consume both global loads")
-    assert data_add is not None and data_add.dst is not None
+  if integer_instruction is not None:
+    assert integer_instruction.dst is not None
     store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
-    _require(store.srcs[1] == data_add.dst, "global store does not consume the u32 add")
+    semantic = "add" if integer_instruction.opcode == "add.u" else "subtraction"
+    _require(store.srcs[1] == integer_instruction.dst, f"global store does not consume the u32 {semantic}")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
   expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
@@ -768,7 +781,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
   loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
-  integer_add_instruction = _u32_add_instruction(active)
+  integer_instruction = _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "add.u")
   load_ordinals = {instruction.index:index for index,instruction in enumerate(loads)}
   output_base = constants[0] | constants[1] << 32
   input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
@@ -795,13 +808,13 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
           if opcode == "mov.u32":
             value = src[0]
             if instruction.srcs[0].kind == "uim": origin = ("fill", value)
-          elif opcode == "add.u":
-            value = src[0] + src[1]
-            if integer_add_instruction is not None and instruction.index == integer_add_instruction.index:
+          elif opcode in {"add.u", "sub.u"}:
+            value = src[0] + src[1] if opcode == "add.u" else src[0] - src[1]
+            if integer_instruction is not None and instruction.index == integer_instruction.index:
               source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
-                       "u32 add does not consume both global loads")
-              origin = ("u32-add", 0)
+                       f"u32 {'add' if opcode == 'add.u' else 'subtraction'} does not consume both global loads")
+              origin = ("u32-add" if opcode == "add.u" else "u32-subtract", 0)
           elif opcode == "shl.b": value = src[0] << (src[1] & 31)
           elif opcode == "ashr.b":
             signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
@@ -842,7 +855,9 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
             if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
             elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
-            elif integer_add_instruction is not None: expected_origin,store_source = ("u32-add", 0),"u32 add"
+            elif integer_instruction is not None:
+              if integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
+              else: expected_origin,store_source = ("u32-subtract", 0),"u32 subtraction"
             else: expected_origin,store_source = ("load", 0),"global load"
             _require(origins[lane].get(instruction.srcs[1].value) == expected_origin,
                      f"global store does not consume the {store_source}")
