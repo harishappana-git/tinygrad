@@ -55,6 +55,9 @@ class FileIOInterface:
   @staticmethod
   def eventfd(initval, flags=None): return FileIOInterface(fd=os.eventfd(initval, flags))  # type: ignore[attr-defined]
 
+class HCQSubmissionRejected(RuntimeError):
+  """The backend guarantees that no command was accepted and none can later retire the reserved timeline."""
+
 if DEV.interface.startswith("MOCK"): from test.mockgpu.mockgpu import MockFileIOInterface as FileIOInterface  # noqa: F401 # pylint: disable=unused-import
 
 # **************** for HCQ Compatible Devices ****************
@@ -375,10 +378,16 @@ class HCQProgram(Program[HCQDeviceType]):
     q = unwrap(self.dev.hw_compute_queue_t)().wait(self.dev.timeline_signal, self.dev.timeline_value - 1).memory_barrier()
 
     self.dev.prof_exec_counter += 1
-    with hcq_profile(self.dev, queue=q, desc=self.name, enabled=wait or PROFILE, profile_key=self.profile_key) as (sig_st, sig_en):
-      q.exec(self, kernargs, global_size, local_size)
-
-    q.signal(self.dev.timeline_signal, self.dev.next_timeline()).submit(self.dev)
+    try:
+      with hcq_profile(self.dev, queue=q, desc=self.name, enabled=wait or PROFILE, profile_key=self.profile_key) as (sig_st, sig_en):
+        q.exec(self, kernargs, global_size, local_size)
+      self.dev.submit_timeline(q)
+    except HCQSubmissionRejected:
+      for index,record in enumerate(self.dev.sig_prof_records):
+        if record[0] is sig_st and record[1] is sig_en:
+          self.dev.sig_prof_records.pop(index)
+          break
+      raise
 
     if wait: self.dev.synchronize(timeout=timeout)
     return (float(sig_en.timestamp - sig_st.timestamp) / 1e6) if wait else None
@@ -446,6 +455,13 @@ class HCQCompiled(Compiled, Generic[SignalType]):
   def next_timeline(self):
     self.timeline_value += 1
     return self.timeline_value - 1
+
+  def submit_timeline(self, queue:HWQueue, var_vals:dict[str, int]|None=None):
+    target = self.next_timeline()
+    try: return queue.signal(self.timeline_signal, target).submit(self, var_vals)
+    except HCQSubmissionRejected:
+      if self.timeline_value == target + 1: self.timeline_value = target
+      raise
 
   def new_signal(self, **kwargs) -> SignalType:
     assert self.signal_t is not None, "Device does not support signals"

@@ -415,6 +415,100 @@ class TestQCOMDriver(unittest.TestCase):
     self.device.timeline_signal._sleep(0)
     self.device.synchronize()
 
+  def test_rejected_hcq_program_recovers_timeline_for_next_kernel(self):
+    import struct
+    from tinygrad import Device, Tensor
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.helpers import Context
+    from tinygrad.runtime.support.hcq import HCQSubmissionRejected
+
+    left_values, right_values = [1.0, -2.5, 1024.0], [4.0, 0.5, -24.0]
+    left, right = Tensor(left_values, device=Device.DEFAULT).realize(), Tensor(right_values, device=Device.DEFAULT).realize()
+    result = left + right
+    program_spec = to_program(result.schedule_linear().src[-1].src[0], self.device.renderer)
+    runtime = get_runtime(self.device.device, program_spec)
+    result_buffer, left_buffer, right_buffer = (cast(Any, tensor.uop.buffer) for tensor in (result, left, right))
+    result_buffer.allocate()
+    runtime_args = (result_buffer._buf, left_buffer._buf, right_buffer._buf)
+    runtime_sizes = {"global_size": program_spec.arg.global_size, "local_size": program_spec.arg.local_size}
+
+    result_size = len(left_values) * 4
+    result_view = self.driver.resolve_owned(self.device.fd.fd, int(result_buffer._buf.va_addr), result_size)
+    timeline_view = self.device.timeline_signal.base_buf.cpu_view().mv[:16]
+    dummy_view = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
+    original_dummy = bytes(dummy_view)
+    blocker = self.device.new_signal(value=0)
+    result_view[:] = bytes(result_size)
+    dummy_view[:] = b"A630"
+
+    def state():
+      return {"timeline_value": self.device.timeline_value, "timeline_image": bytes(timeline_view),
+              "context_timestamp": self.driver.context_timestamps[self.device.ctx], "last_cmd": self.device.last_cmd,
+              "counter": self.driver.always_on_counter, "error_state": self.device.error_state, "blocker": blocker.value,
+              "result": bytes(result_view), "dummy": bytes(dummy_view), "profile_records": tuple(self.device.sig_prof_records)}
+
+    before, before_prof_exec = state(), self.device.prof_exec_counter
+    rejected_state, completed = None, False
+    def restore_before():
+      self.device.timeline_value, timeline_view[:] = before["timeline_value"], before["timeline_image"]
+      self.driver.context_timestamps[self.device.ctx], self.device.last_cmd = before["context_timestamp"], before["last_cmd"]
+      self.driver.always_on_counter, self.device.error_state = before["counter"], before["error_state"]
+      blocker.value, result_view[:], dummy_view[:] = before["blocker"], before["result"], before["dummy"]
+      self.device.sig_prof_records[:] = before["profile_records"]
+      self.device.prof_exec_counter = before_prof_exec
+
+    try:
+      queue_type = self.device.hw_compute_queue_t
+      with Context(PROFILE=1), mock.patch.object(self.device, "hw_compute_queue_t", side_effect=lambda: queue_type().wait(blocker, 1)), \
+           self.assertRaisesRegex(HCQSubmissionRejected, "unsatisfied memory wait"):
+        runtime(*runtime_args, **runtime_sizes)
+      rejected_state = state()
+      if rejected_state != before: restore_before()
+      self.assertEqual(rejected_state, before)
+      self.assertEqual(self.device.prof_exec_counter, before_prof_exec + 1)
+
+      runtime(*runtime_args, **runtime_sizes)
+      self.device.synchronize()
+      reference = cast(list[float], (Tensor(left_values, device="PYTHON") + Tensor(right_values, device="PYTHON")).tolist())
+      self.assertEqual(list(struct.unpack(f"<{len(left_values)}f", result_view)), reference)
+      self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value),
+                       (before["timeline_value"] + 1, before["timeline_value"]))
+      self.assertEqual((self.driver.context_timestamps[self.device.ctx], self.device.last_cmd),
+                       (before["context_timestamp"] + 1, before["last_cmd"] + 1))
+      self.assertEqual((self.driver.always_on_counter, self.device.error_state, blocker.value, bytes(dummy_view)),
+                       (before["counter"], None, 0, bytes(4)))
+      completed = True
+    finally:
+      if not completed: restore_before()
+      dummy_view[:] = original_dummy
+
+  def test_timeline_rollback_requires_latest_definite_rejection(self):
+    from tinygrad.runtime.support.hcq import HCQSubmissionRejected
+
+    before = self.device.timeline_value
+    ambiguous_timeline = later_timeline = None
+    try:
+      ambiguous = self.device.hw_compute_queue_t()
+      with mock.patch.object(ambiguous, "_submit", side_effect=RuntimeError("ambiguous acceptance")), \
+           self.assertRaisesRegex(RuntimeError, "ambiguous acceptance") as raised:
+        self.device.submit_timeline(ambiguous)
+      self.assertIs(type(raised.exception), RuntimeError)
+      ambiguous_timeline = self.device.timeline_value
+      self.device.timeline_value = before
+
+      def reject_after_later_reservation(_):
+        self.device.next_timeline()
+        raise HCQSubmissionRejected("definite rejection after a later reservation")
+      non_lifo = self.device.hw_compute_queue_t()
+      with mock.patch.object(non_lifo, "_submit", side_effect=reject_after_later_reservation), \
+           self.assertRaisesRegex(HCQSubmissionRejected, "after a later reservation"):
+        self.device.submit_timeline(non_lifo)
+      later_timeline = self.device.timeline_value
+    finally: self.device.timeline_value = before
+
+    self.assertEqual((ambiguous_timeline, later_timeline), (before + 1, before + 2))
+
   def test_ir3_decoder_rejects_invalid_and_private_encodings(self):
     from test.mockgpu.qcom.a630 import decode_a630_ir3
 

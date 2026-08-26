@@ -119,7 +119,14 @@ class QCOMDriver(VirtDriver):
     if (entry:=self._ioctls.get(request)) is None: raise RuntimeError(f"unsupported KGSL ioctl {request:#x}")
     self._require(argp != 0, "null ioctl payload")
     struct_type, handler = entry
-    return handler(fd, struct_type.from_address(argp))
+    payload = struct_type.from_address(argp)
+    try: return handler(fd, payload)
+    except RuntimeError as error:
+      if request == ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND):
+        # _gpu_command publishes retirement state only after its rollback-capable journal commit.
+        from tinygrad.runtime.support.hcq import HCQSubmissionRejected
+        raise HCQSubmissionRejected(str(error)) from error
+      raise
 
   def mmap(self, fd:int, start:int, size:int, prot:int, flags:int, offset:int) -> int:
     self._require(fd in self.open_fds, f"closed descriptor {fd}")
