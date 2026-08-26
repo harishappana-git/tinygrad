@@ -605,6 +605,22 @@ class TestQCOMDriver(unittest.TestCase):
                      ("and.b", A630IR3Operand("gpr", 2),
                       (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
     self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_and.fields))
+    integer_or = decode_one(0x53b8080200070002)
+    self.assertEqual((integer_or.opcode, integer_or.dst, integer_or.srcs),
+                     ("or.b", A630IR3Operand("gpr", 2),
+                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
+    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_or.fields))
+    for nop_count in range(4):
+      scheduled_or = decode_one(integer_or.raw & ~((1 << 43) | (1 << 51)) |
+                                (nop_count & 1) << 43 | (nop_count >> 1) << 51)
+      self.assertEqual((scheduled_or.opcode, scheduled_or.dst, scheduled_or.srcs),
+                       (integer_or.opcode, integer_or.dst, integer_or.srcs))
+      self.assertIn(("REPEAT", 0) if nop_count == 0 else ("NOP", nop_count), scheduled_or.fields)
+    self.assertEqual(decode_one(integer_or.raw | 1 << 44).opcode, "or.b")
+    for reserved_bit in range(48, 51):
+      with self.subTest(or_reserved_bit=reserved_bit), \
+           self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
+        decode_one(integer_or.raw | 1 << reserved_bit)
     scheduled_sub = decode_one(integer_sub.raw | 1 << 44)
     self.assertEqual((scheduled_sub.opcode, scheduled_sub.dst, scheduled_sub.srcs),
                      (integer_sub.opcode, integer_sub.dst, integer_sub.srcs))
@@ -712,7 +728,7 @@ class TestQCOMDriver(unittest.TestCase):
     }
     for modifier,word in rejected_subtract.items():
       with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for bitwise in (integer_xor, integer_and):
+    for bitwise in (integer_xor, integer_and, integer_or):
       rejected_bitwise = {
         "saturate": bitwise.raw | 1 << 42,
         "repeat": bitwise.raw | 1 << 40,
@@ -744,9 +760,6 @@ class TestQCOMDriver(unittest.TestCase):
       }
       for modifier,word in rejected_bitwise.items():
         with self.subTest(bitwise_opcode=bitwise.name, bitwise_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    integer_or = decode_one(0x53b8080200070002)
-    self.assertEqual((integer_or.name, integer_or.opcode), ("or.b", None))
-    self.assertIn(("NAME", "or.b"), integer_or.fields)
     for compare in (signed_compare, unsigned_compare, equality_compare):
       rejected_compare = {
         "condition": compare.raw | 1 << 48,
@@ -1635,8 +1648,8 @@ class TestQCOMDriver(unittest.TestCase):
     redirected = next(operand for operand in bitwise.srcs if operand != bitwise.dst)
     reject_mapped_mutation(store, store.raw & ~(0xff << 1) | redirected.value << 1, "stg.u32",
                            (store.srcs[0], redirected), f"global store does not consume the u32 {operation}")
-    reject_mapped_mutation(bitwise, bitwise.raw & ~(0x3f << 53) | 0x1d << 53, None, (),
-                           f"unsupported A630 semantic at instruction {bitwise.index}", expected_name="or.b")
+    reject_mapped_mutation(bitwise, bitwise.raw | 1 << 14, None, (),
+                           f"unsupported A630 semantic at instruction {bitwise.index}", expected_name=opcode)
 
   def test_production_integer_xor_uses_mapped_machine_bytes(self):
     import operator
@@ -1677,6 +1690,26 @@ class TestQCOMDriver(unittest.TestCase):
       mutation_opcode="xor.b", mutation_opcode_bits=0x1f, mutation_expected=0x7ffffffe)
     self.assertEqual(operator.and_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                    Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x0a0a0a0a])
+
+  def test_production_integer_or_uses_mapped_machine_bytes(self):
+    import operator
+    from tinygrad import Device, Tensor, dtypes
+    cases = ((dtypes.int, 0, 0, 0),
+             (dtypes.int, -1, 0, -1),
+             (dtypes.int, -1, 1, -1),
+             (dtypes.int, dtypes.int.min, dtypes.int.max, -1),
+             (dtypes.int, dtypes.int.min, 0, dtypes.int.min),
+             (dtypes.int, -1431655766, 252645135, -1347440721),
+             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
+             (dtypes.uint, 0x80000000, 0x7fffffff, dtypes.uint.max),
+             (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xafafafaf),
+             (dtypes.uint, dtypes.uint.max, 0x80000001, dtypes.uint.max))
+    # The opcode-only AND.B mutation changes uint.max OR 0x80000001 from uint.max to 0x80000001.
+    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+      tensor_operator=operator.or_, opcode="or.b", opcode_bits=0x1d, operation="bitwise OR", cases=cases,
+      mutation_opcode="and.b", mutation_opcode_bits=0x1c, mutation_expected=0x80000001)
+    self.assertEqual(operator.or_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
+                                  Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xafafafaf])
 
   def test_production_integer_multiply_wraps_from_mapped_machine_bytes(self):
     import struct
