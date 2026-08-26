@@ -157,6 +157,13 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
      all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R", "LAST")):
     dst,src = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC"), True)
     if dst is not None and dst.kind == "gpr" and src is not None: return "mov.u32", dst, (src,)
+  mov_const_variable = (0xff << 32) | 0x7ff | cat1_schedule
+  if category == 1 and raw & ~mov_const_variable == 0x202cc00000000000 and \
+     (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "DST_HALF"),
+      _same_int_field(fields, "HALF")) == (3, 3, 0, 0) and _has_no_repeat(fields) and \
+     all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R")):
+    dst = _register_operand(_same_int_field(fields, "DST"), True)
+    if dst is not None and dst.kind == "gpr": return "mov.u32", dst, (A630IR3Operand("const", _same_int_field(fields, "SRC")),)
   mov_immediate_variable = (0xff << 32) | 0xffffffff | cat1_schedule
   if category == 1 and raw & ~mov_immediate_variable == 0x204cc00000000000 and \
      (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "DST_HALF")) == (3, 3, 0) and \
@@ -614,6 +621,26 @@ def _u32_add_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3In
                   len(instruction.srcs) == 2 and frozenset(instruction.srcs) == load_destinations)
   return matches[0] if len(matches) == 1 else None
 
+def _validate_constant_pointer_moves(instructions:Sequence[A630IR3Instruction]) -> bool:
+  moves = tuple(instruction for instruction in instructions if instruction.opcode == "mov.u32" and
+                instruction.srcs[0].kind == "const")
+  if not moves: return False
+  loads = tuple(instruction for instruction in instructions if instruction.opcode == "ldg.u32")
+  stores = tuple(instruction for instruction in instructions if instruction.opcode == "stg.u32")
+  _require(len(stores) == 1 and len(moves) == 2 * (len(loads) + 1), "unsupported A630 constant-pointer move inventory")
+  destinations:dict[int, int] = {}
+  for instruction in moves:
+    assert instruction.dst is not None
+    constant = instruction.srcs[0].value
+    _require(constant not in destinations and instruction.dst.value not in destinations.values(),
+             "duplicate A630 constant-pointer move")
+    destinations[constant] = instruction.dst.value
+  _require(set(destinations) == set(range(2 * (len(loads) + 1))), "unsupported A630 constant-pointer source")
+  bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
+  _require(all((destinations[2*index], destinations[2*index+1]) == (base, base+1) for index,base in enumerate(bases)),
+           "A630 constant-pointer moves do not match the scalar buffer argument ABI")
+  return True
+
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
@@ -637,9 +664,15 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   has_integer_add = (input_count, float_add_count) == (2, 0)
   _require((input_count, float_add_count) in ((0, 0), (1, 0), (1, 1), (2, 0), (2, 1)), "unsupported A630 scalar kernel shape")
   shared_uses = tuple(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "shared")
+  uses_constant_pointers = _validate_constant_pointer_moves(active)
   if input_count == 0:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
+  elif uses_constant_pointers:
+    _require(has_integer_add and not shared_uses, "constant-pointer A630 execution supports only scalar u32 addition")
+    _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
+             "constant-pointer A630 execution requires one scalar invocation")
+    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, "add.u":1, "stg.u32":1, "end":1}
   else:
     uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
@@ -660,7 +693,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "shl.b":
       valid = dst_kind == "gpr" and src_kinds in (("gpr", "iim"), ("shared", "iim")) and instruction.srcs[1].value in (1, 2)
     elif instruction.opcode == "shrg": valid = dst_kind == "gpr" and src_kinds == ("iim", "gpr", "gpr") and instruction.srcs[0].value == 30
-    elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("shared",), ("uim",))
+    elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("shared",), ("const",), ("uim",))
     elif instruction.opcode == "add.u": valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
     elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
@@ -679,12 +712,15 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     _require(store.srcs[1] == data_add.dst, "global store does not consume the u32 add")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
-  expected_constants = sorted(value for pointer in range(input_count + 1) for value in (2*pointer, 2*pointer, 2*pointer+1))
+  expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
+    sorted(value for pointer in range(input_count + 1) for value in (2*pointer, 2*pointer, 2*pointer+1))
   _require(constant_uses == expected_constants, "A630 pointer constants do not match the scalar buffer argument ABI")
   moves = tuple(instruction for instruction in active if instruction.opcode == "mov.u32")
   if input_count == 0:
     _require(len(moves) == 1 and moves[0].srcs == (A630IR3Operand("uim", 0x3f800000),),
              "unsupported A630 fill literal")
+  elif uses_constant_pointers:
+    _require(len(moves) == 6 and all(move.srcs[0].kind == "const" for move in moves), "unsupported A630 constant-pointer moves")
   else:
     _require((not shared_uses and not moves) or
              (len(moves) == 1 and moves[0].srcs[0].kind == "shared"), "unsupported A630 scalar move contract")
