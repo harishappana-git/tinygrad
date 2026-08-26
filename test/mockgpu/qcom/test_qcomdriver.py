@@ -555,11 +555,14 @@ class TestQCOMDriver(unittest.TestCase):
       0xc006000b01810001,  # ldg.u32
       0x5018080b2802000b,  # add.f with FLUT[2]
       0xc0c60d0001800016,  # stg.u32
+      0x5650080800070002,  # mull.u
+      0x6183880800080002,  # madsh.m16 with one scheduling nop
+      0x6181080700088007,  # madsh.m16 with three scheduling nops
     )
     decoded = decode_a630_ir3(b"".join(word.to_bytes(8, "little") for word in words + (end,)))
     self.assertEqual(tuple(instruction.opcode for instruction in decoded),
                      ("ashr.b", "shl.b", "shrg", "add.u", "cmps.u.lt", "cov.u16s32", "nop",
-                      "ldg.u32", "add.f", "stg.u32", "end"))
+                      "ldg.u32", "add.f", "stg.u32", "mull.u", "madsh.m16", "madsh.m16", "end"))
 
     def decode_one(word): return decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))[0]
 
@@ -596,6 +599,18 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((scheduled_sub.opcode, scheduled_sub.dst, scheduled_sub.srcs),
                      (integer_sub.opcode, integer_sub.dst, integer_sub.srcs))
     self.assertTrue({("SY", 1), ("SS", 1), ("NOP", 3)} <= set(scheduled_sub.fields))
+    integer_multiply,first_cross_term,second_cross_term = decoded[10:13]
+    self.assertEqual((integer_multiply.dst, integer_multiply.srcs),
+                     (A630IR3Operand("gpr", 8), (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
+    self.assertEqual((first_cross_term.dst, first_cross_term.srcs),
+                     (A630IR3Operand("gpr", 8),
+                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7), A630IR3Operand("gpr", 8))))
+    self.assertEqual((second_cross_term.dst, second_cross_term.srcs),
+                     (A630IR3Operand("gpr", 7),
+                      (A630IR3Operand("gpr", 7), A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 8))))
+    self.assertTrue({("SY", 1), ("NOP", 1)} <= set(integer_multiply.fields))
+    self.assertIn(("NOP", 1), first_cross_term.fields)
+    self.assertIn(("NOP", 3), second_cross_term.fields)
 
     cov = words[5] & ~((0xff << 32) | 0xff) | 9 << 32 | 3
     self.assertEqual((decode_one(cov).dst, decode_one(cov).srcs),
@@ -664,6 +679,45 @@ class TestQCOMDriver(unittest.TestCase):
     }
     for modifier,word in rejected_subtract.items():
       with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    rejected_multiply = {
+      "jump-target": integer_multiply.raw | 1 << 59,
+      "saturate": integer_multiply.raw | 1 << 42,
+      "unsigned-low": integer_multiply.raw | 1 << 45,
+      "early input": integer_multiply.raw | 1 << 47,
+      "converted destination": integer_multiply.raw | 1 << 46,
+      "half sources": integer_multiply.raw ^ 1 << 52,
+      "repeat": integer_multiply.raw | 1 << 40,
+      "source 1 last-use": integer_multiply.raw | 1 << 10,
+      "source 1 absolute/negate": integer_multiply.raw | 1 << 14,
+      "source 2 last-use": integer_multiply.raw | 1 << 26,
+      "source 2 absolute/negate": integer_multiply.raw | 1 << 30,
+    }
+    for modifier,word in rejected_multiply.items():
+      with self.subTest(multiply_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    rejected_madsh = {
+      "different opcode": first_cross_term.raw ^ 1 << 55,
+      "jump-target": first_cross_term.raw | 1 << 59,
+      "saturate": first_cross_term.raw | 1 << 42,
+      "unsigned-low": first_cross_term.raw | 1 << 45,
+      "converted destination": first_cross_term.raw | 1 << 46,
+      "repeat": first_cross_term.raw | 1 << 40,
+      "source 1 last-use": first_cross_term.raw | 1 << 10,
+      "source 1 relative encoding": first_cross_term.raw | 1 << 11,
+      "source 1 negate": first_cross_term.raw | 1 << 14,
+      "source 2 negate": first_cross_term.raw | 1 << 30,
+      "source 3 last-use": first_cross_term.raw | 1 << 26,
+      "source 3 relative encoding": first_cross_term.raw | 1 << 27,
+      "source 3 negate": first_cross_term.raw | 1 << 31,
+      "source 3 R flag": first_cross_term.raw | 1 << 29,
+      "shared source 1": first_cross_term.raw & ~0x1fff | 0xc0,
+      "special source 2": first_cross_term.raw & ~(0xff << 47) | 0xe0 << 47,
+      "shared source 3": first_cross_term.raw & ~(0x1fff << 16) | 0xc0 << 16,
+      "shared destination": first_cross_term.raw & ~(0xff << 32) | 0xc0 << 32,
+    }
+    for modifier,word in rejected_madsh.items():
+      with self.subTest(madsh_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
+      decode_one(first_cross_term.raw | 1 << 13)
     with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
       decode_one(0x200cc001000000c0 | 1 << 8)
     with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
@@ -1353,6 +1407,127 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(bytes(shader[subtract.index*8:(subtract.index+1)*8]), original)
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) -
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
+
+  def test_production_integer_multiply_wraps_from_mapped_machine_bytes(self):
+    import struct
+    from dataclasses import replace
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom import qcomdriver
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+
+    submissions,command_images = [],[]
+    real_execute = qcomdriver.execute_a630
+    real_plan = self.driver._plan_a630_retirement
+    def capture_execution(submission, resolver):
+      submissions.append(submission)
+      return real_execute(submission, resolver)
+    def capture_plan(fd, submission, command_address, command_size):
+      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
+      return real_plan(fd, submission, command_address, command_size)
+
+    cases = ((dtypes.int, dtypes.int.min, -1, dtypes.int.min),
+             (dtypes.int, dtypes.int.max, 2, -2),
+             (dtypes.int, -7, 3, -21),
+             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 1),
+             (dtypes.uint, 0x00010002, 0x00030004, 0x000a0008))
+    actual,live_tensors = [],[]
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
+         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+      for dtype,left,right,_ in cases:
+        lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
+        result = (lhs * rhs).realize()
+        live_tensors.append((lhs, rhs, result))
+        actual.append(result.tolist())
+    reference = [(Tensor([left], dtype=dtype, device="PYTHON") * Tensor([right], dtype=dtype, device="PYTHON")).tolist()
+                 for dtype,left,right,_ in cases]
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(actual, reference)
+    self.assertEqual(actual, [[expected] for *_,expected in cases])
+    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
+    decoded_dispatches = []
+    for submission in submissions:
+      dispatch = submission.dispatches[0]
+      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
+      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
+      multiplies = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mull.u")
+      accumulates = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "madsh.m16")
+      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
+                            instruction.srcs[0].kind == "const")
+      self.assertEqual((len(loads), len(stores), len(multiplies), len(accumulates), len(pointer_moves)), (2, 1, 1, 2, 6))
+      self.assertEqual(multiplies[0].srcs, (loads[0].dst, loads[1].dst))
+      self.assertEqual(accumulates[0].srcs, (loads[0].dst, loads[1].dst, multiplies[0].dst))
+      self.assertEqual(accumulates[1].srcs, (loads[1].dst, loads[0].dst, accumulates[0].dst))
+      self.assertEqual(stores[0].srcs[1], accumulates[1].dst)
+      self.assertTrue({("SY", 1), ("NOP", 1)} <= set(multiplies[0].fields))
+      self.assertIn(("NOP", 1), accumulates[0].fields)
+      self.assertIn(("NOP", 3), accumulates[1].fields)
+      self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
+      destinations = {}
+      for instruction in pointer_moves:
+        self.assertIsNotNone(instruction.dst)
+        destinations[instruction.srcs[0].value] = instruction.dst.value
+      bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
+      self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
+                       tuple((base, base+1) for base in bases))
+      decoded_dispatches.append((dispatch, loads, multiplies[0], accumulates))
+
+    case_index = len(cases) - 1
+    submission = submissions[case_index]
+    dispatch,_,_,accumulates = decoded_dispatches[case_index]
+    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+    output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
+
+    # Swapping the first MADSH inputs preserves the legal dataflow but changes which high-half cross term is accumulated.
+    first = accumulates[0]
+    first_original = bytes(shader[first.index*8:(first.index+1)*8])
+    src1,src2 = first.raw & 0x1fff, first.raw >> 47 & 0xff
+    swapped_raw = first.raw & ~(0x1fff | (0xff << 47)) | src2 | src1 << 47
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    timestamp_before = self.driver.context_timestamps[self.device.ctx]
+    try:
+      struct.pack_into("<Q", shader, first.index * 8, swapped_raw)
+      mutated = decode_a630_ir3(bytes(shader))[first.index]
+      self.assertEqual((mutated.opcode, mutated.srcs), ("madsh.m16", (first.srcs[1], first.srcs[0], first.srcs[2])))
+      output[:] = bytes(4)
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual(struct.unpack("<I", output)[0], 0x00080008)
+      self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
+    finally:
+      shader[first.index*8:(first.index+1)*8] = first_original
+      self.device._gpu_free(request_buffer)
+
+    # Duplicating a final MADSH source breaks the two-load chain and must not publish any retirement state.
+    second = accumulates[1]
+    second_original = bytes(shader[second.index*8:(second.index+1)*8])
+    duplicate_raw = second.raw & ~(0xff << 47) | second.srcs[0].value << 47
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    request.timestamp = 0x27182818
+    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+    state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                    self.driver.always_on_counter, self.device.last_cmd)
+    try:
+      struct.pack_into("<Q", shader, second.index * 8, duplicate_raw)
+      image = bytes(shader)
+      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      self.assertEqual(mutated_dispatch.instructions[second.index].srcs, (second.srcs[0], second.srcs[0], second.srcs[2]))
+      with self.assertRaisesRegex(ValueError, "u32 multiplication sequence does not consume both global loads"):
+        real_execute(replace(submission, dispatches=(mutated_dispatch,)),
+                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      with self.assertRaisesRegex(RuntimeError, "u32 multiplication sequence does not consume both global loads"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                        self.driver.always_on_counter, self.device.last_cmd), (0x27182818, *state_before))
+    finally:
+      shader[second.index*8:(second.index+1)*8] = second_original
+      self.device._gpu_free(request_buffer)
+    self.assertEqual(bytes(shader[second.index*8:(second.index+1)*8]), second_original)
+    self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) *
+                      Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [36])
 
   def test_production_symbolic_workgroups_execute_mapped_system_values(self):
     import struct

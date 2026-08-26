@@ -7,7 +7,7 @@ from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
 # adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, ir3_shader.h,
-# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3_a6xx.c, ir3_compiler_nir.c,
+# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3_a6xx.c, ir3_compiler_nir.c, ir3_nir_imul.py,
 # nir_opcodes.py, isaspec.h, and isaspec_decode_impl.c.
 
 @dataclass(frozen=True)
@@ -177,7 +177,7 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R")):
       return "cov.u16s32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("half", _same_int_field(fields, "SRC")),)
-  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "cmps.u", "add.f"} and _has_no_repeat(fields) and \
+  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "mull.u", "cmps.u", "add.f"} and _has_no_repeat(fields) and \
      all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "ABSNEG", "SRC_R")) and \
      (raw >> 52 & 1, raw >> 46 & 1) == (1, int(name == "cmps.u")):
     dst = A630IR3Operand("half" if _same_int_field(fields, "DST_HALF") else "gpr", _same_int_field(fields, "DST"))
@@ -189,6 +189,18 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
       if name != "cmps.u" or opcode == "cmps.u.lt":
         assert srcs[0] is not None and srcs[1] is not None
         return opcode, dst, (srcs[0], srcs[1])
+  if category == 3 and name == "madsh.m16" and _has_no_repeat(fields) and \
+     all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "SRC1_NEG", "SRC2_NEG", "SRC3_NEG", "LAST")) and \
+     (raw >> 13 & 1, raw >> 29 & 1, raw >> 42 & 1, raw >> 46 & 1) == (0, 0, 0, 0) and \
+     _same_int_field(fields, "DST_HALF") == 0 and all(value == 0 for value in _field_values(fields, "HALF")):
+    dst = _register_operand(_same_int_field(fields, "DST"), True)
+    src1,src2,src3 = (_same_int_field(fields, field) for field in ("SRC1", "SRC2", "SRC3"))
+    src1_op = _register_operand(src1, True) if src1 == src1 & 0xff else None
+    src2_op = _register_operand(src2, True) if src2 == src2 & 0xff else None
+    src3_op = _register_operand(src3, True) if src3 == src3 & 0xff else None
+    if dst is not None and dst.kind == "gpr" and all(src is not None and src.kind == "gpr" for src in (src1_op, src2_op, src3_op)):
+      assert src1_op is not None and src2_op is not None and src3_op is not None
+      return "madsh.m16", dst, (src1_op, src2_op, src3_op)
   if category == 3 and name == "shrg" and _has_no_repeat(fields) and \
      all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "SRC1_NEG", "SRC2_NEG", "SRC3_NEG",
                                                                "SRC1_R", "SRC2_R", "SRC3_R")) and \
@@ -621,6 +633,20 @@ def _u32_binary_instruction(instructions:Sequence[A630IR3Instruction], opcode:st
                   len(instruction.srcs) == 2 and frozenset(instruction.srcs) == load_destinations)
   return matches[0] if len(matches) == 1 else None
 
+def _u32_multiply_sequence(instructions:Sequence[A630IR3Instruction]) \
+    -> tuple[A630IR3Instruction, A630IR3Instruction, A630IR3Instruction]|None:
+  # Pinned ir3_nir_imul.py lowers imul32 to a low-16 product followed by both low/high cross terms in two MADSH.M16s.
+  load_destinations = frozenset(instruction.dst for instruction in instructions if instruction.opcode == "ldg.u32")
+  multiplies = tuple(instruction for instruction in instructions if instruction.opcode == "mull.u")
+  accumulates = tuple(instruction for instruction in instructions if instruction.opcode == "madsh.m16")
+  if len(load_destinations) != 2 or len(multiplies) != 1 or len(accumulates) != 2: return None
+  low,first,second = multiplies[0],accumulates[0],accumulates[1]
+  if low.dst is None or first.dst is None or second.dst is None or not (low.index < first.index < second.index): return None
+  if frozenset(low.srcs) != load_destinations: return None
+  if any(len(instruction.srcs) != 3 or frozenset(instruction.srcs[:2]) != load_destinations for instruction in accumulates): return None
+  if first.srcs[2] != low.dst or second.srcs[2] != first.dst: return None
+  return low,first,second
+
 def _validate_constant_pointer_moves(instructions:Sequence[A630IR3Instruction]) -> bool:
   moves = tuple(instruction for instruction in instructions if instruction.opcode == "mov.u32" and
                 instruction.srcs[0].kind == "const")
@@ -663,13 +689,22 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(input_count in (0, 1, 2), "A630 execution supports at most two global loads")
   _require((input_count, float_add_count) in ((0, 0), (1, 0), (1, 1), (2, 0), (2, 1)), "unsupported A630 scalar kernel shape")
   integer_instruction:A630IR3Instruction|None = None
-  if opcodes.count("sub.u"):
+  integer_kind:str|None = None
+  multiply_sequence = _u32_multiply_sequence(active)
+  if opcodes.count("mull.u") or opcodes.count("madsh.m16"):
+    _require((input_count, float_add_count, opcodes.count("mull.u"), opcodes.count("madsh.m16")) == (2, 0, 1, 2) and
+             multiply_sequence is not None, "u32 multiplication sequence does not consume both global loads")
+    assert multiply_sequence is not None
+    integer_instruction,integer_kind = multiply_sequence[-1],"multiply"
+  elif opcodes.count("sub.u"):
     integer_instruction = _u32_binary_instruction(active, "sub.u")
     _require((input_count, float_add_count, opcodes.count("sub.u")) == (2, 0, 1) and integer_instruction is not None,
              "u32 subtraction does not consume both global loads")
+    integer_kind = "subtraction"
   elif (input_count, float_add_count) == (2, 0):
     integer_instruction = _u32_binary_instruction(active, "add.u")
     _require(integer_instruction is not None, "u32 add does not consume both global loads")
+    integer_kind = "add"
   has_integer_add = integer_instruction is not None and integer_instruction.opcode == "add.u"
   shared_uses = tuple(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "shared")
   uses_constant_pointers = _validate_constant_pointer_moves(active)
@@ -678,15 +713,16 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
   elif uses_constant_pointers:
     _require(integer_instruction is not None and not shared_uses,
-             "constant-pointer A630 execution supports only scalar u32 addition or subtraction")
+             "constant-pointer A630 execution supports only scalar u32 addition, subtraction, or multiplication")
     assert integer_instruction is not None
     assert integer_instruction.opcode is not None
     _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
              "constant-pointer A630 execution requires one scalar invocation")
-    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, integer_instruction.opcode:1, "stg.u32":1, "end":1}
+    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, "stg.u32":1, "end":1}
+    if integer_kind == "multiply": expected_counts.update({"mull.u":1, "madsh.m16":2})
+    else: expected_counts[integer_instruction.opcode] = 1
   else:
-    _require(integer_instruction is None or integer_instruction.opcode == "add.u",
-             "u32 subtraction currently requires the scalar constant-pointer ABI")
+    _require(integer_kind in (None, "add"), "u32 subtraction and multiplication currently require the scalar constant-pointer ABI")
     uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
                        "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3 + int(uses_workgroup_id),
@@ -709,6 +745,8 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("shared",), ("const",), ("uim",))
     elif instruction.opcode == "add.u": valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
     elif instruction.opcode == "sub.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "mull.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "madsh.m16": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr", "gpr")
     elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
     elif instruction.opcode == "ldg.u32": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
@@ -721,8 +759,8 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   if integer_instruction is not None:
     assert integer_instruction.dst is not None
     store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
-    semantic = "add" if integer_instruction.opcode == "add.u" else "subtraction"
-    _require(store.srcs[1] == integer_instruction.dst, f"global store does not consume the u32 {semantic}")
+    assert integer_kind is not None
+    _require(store.srcs[1] == integer_instruction.dst, f"global store does not consume the u32 {integer_kind}")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
   expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
@@ -781,7 +819,9 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
   loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
-  integer_instruction = _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "add.u")
+  multiply_sequence = _u32_multiply_sequence(active)
+  integer_instruction = multiply_sequence[-1] if multiply_sequence is not None else \
+    _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "add.u")
   load_ordinals = {instruction.index:index for index,instruction in enumerate(loads)}
   output_base = constants[0] | constants[1] << 32
   input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
@@ -815,6 +855,26 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
                        f"u32 {'add' if opcode == 'add.u' else 'subtraction'} does not consume both global loads")
               origin = ("u32-add" if opcode == "add.u" else "u32-subtract", 0)
+          elif opcode == "mull.u":
+            value = (src[0] & 0xffff) * (src[1] & 0xffff)
+            source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
+            _require(multiply_sequence is not None and instruction.index == multiply_sequence[0].index and
+                     frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
+                     "u32 multiplication sequence does not consume both global loads")
+            origin = ("u32-mul-low", 0)
+          elif opcode == "madsh.m16":
+            value = ((src[0] & 0xffff) * (src[1] >> 16) << 16) + src[2]
+            _require(multiply_sequence is not None, "u32 multiplication sequence does not consume both global loads")
+            assert multiply_sequence is not None
+            first = instruction.index == multiply_sequence[1].index
+            _require(first or instruction.index == multiply_sequence[2].index,
+                     "u32 multiplication sequence does not consume both global loads")
+            source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
+            expected_accumulator = ("u32-mul-low", 0) if first else ("u32-mul-cross", 0)
+            _require(frozenset(source_origins[:2]) == frozenset((("load", 0), ("load", 1))) and
+                     source_origins[2] == expected_accumulator,
+                     "u32 multiplication sequence does not consume both global loads")
+            origin = ("u32-mul-cross" if first else "u32-multiply", 0)
           elif opcode == "shl.b": value = src[0] << (src[1] & 31)
           elif opcode == "ashr.b":
             signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
@@ -857,7 +917,8 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
             elif integer_instruction is not None:
               if integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
-              else: expected_origin,store_source = ("u32-subtract", 0),"u32 subtraction"
+              elif integer_instruction.opcode == "sub.u": expected_origin,store_source = ("u32-subtract", 0),"u32 subtraction"
+              else: expected_origin,store_source = ("u32-multiply", 0),"u32 multiplication"
             else: expected_origin,store_source = ("load", 0),"global load"
             _require(origins[lane].get(instruction.srcs[1].value) == expected_origin,
                      f"global store does not consume the {store_source}")
