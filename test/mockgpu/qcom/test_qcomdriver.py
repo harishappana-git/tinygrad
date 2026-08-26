@@ -601,11 +601,22 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertTrue({("SY", 1), ("SS", 1), ("NOP", 3)} <= set(scheduled_sub.fields))
     signed_compare = decode_one(0x52b8480000070002)
     unsigned_compare = decode_one(0x5298480000070002)
+    equality_compare = decode_one(0x52bc480000070002)
     for compare,opcode in ((signed_compare, "cmps.s.lt"), (unsigned_compare, "cmps.u.lt")):
       self.assertEqual((compare.opcode, compare.dst, compare.srcs),
                        (opcode, A630IR3Operand("half", 0),
                         (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
       self.assertTrue({("SY", 1), ("NOP", 3), ("COND", 0), ("DST_HALF", 1)} <= set(compare.fields))
+    self.assertEqual((equality_compare.opcode, equality_compare.dst, equality_compare.srcs),
+                     ("cmps.s.eq", A630IR3Operand("half", 0),
+                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
+    self.assertTrue({("SY", 1), ("NOP", 3), ("COND", 4), ("DST_HALF", 1)} <= set(equality_compare.fields))
+    for unsupported_word,name,condition in ((0x529c480000070002, "cmps.u", 4),
+                                            (0x52bd480000070002, "cmps.s", 5),
+                                            (0x529d480000070002, "cmps.u", 5)):
+      unsupported_compare = decode_one(unsupported_word)
+      self.assertIsNone(unsupported_compare.opcode)
+      self.assertTrue({("NAME", name), ("COND", condition)} <= set(unsupported_compare.fields))
     byte_store = decode_one(0xc0cc0b0001800000)
     self.assertEqual((byte_store.opcode, byte_store.dst, byte_store.srcs),
                      ("stg.u8", None, (A630IR3Operand("gpr", 5), A630IR3Operand("half", 0))))
@@ -691,7 +702,7 @@ class TestQCOMDriver(unittest.TestCase):
     }
     for modifier,word in rejected_subtract.items():
       with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for compare in (signed_compare, unsigned_compare):
+    for compare in (signed_compare, unsigned_compare, equality_compare):
       rejected_compare = {
         "condition": compare.raw | 1 << 48,
         "saturate": compare.raw | 1 << 42,
@@ -1665,6 +1676,7 @@ class TestQCOMDriver(unittest.TestCase):
     finally:
       shader[comparison.index*8:(comparison.index+1)*8] = original
       self.device._gpu_free(request_buffer)
+    self.assertEqual(bytes(shader[comparison.index*8:(comparison.index+1)*8]), original)
 
     def reject_mapped_mutation(instruction, raw, expected_srcs, message):
       original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
@@ -1698,6 +1710,134 @@ class TestQCOMDriver(unittest.TestCase):
                            (store.srcs[0], A630IR3Operand("half", 1)), "global store does not consume the u32 comparison")
     self.assertEqual((Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT) <
                       Tensor([0], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [True])
+
+  def test_production_integer_equality_uses_mapped_comparison_bytes(self):
+    import struct
+    from dataclasses import replace
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom import qcomdriver
+    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+
+    submissions,command_images = [],[]
+    real_execute = qcomdriver.execute_a630
+    real_plan = self.driver._plan_a630_retirement
+    def capture_execution(submission, resolver):
+      submissions.append(submission)
+      return real_execute(submission, resolver)
+    def capture_plan(fd, submission, command_address, command_size):
+      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
+      return real_plan(fd, submission, command_address, command_size)
+
+    cases = ((dtypes.int, 0, 0, True),
+             (dtypes.int, 0, 1, False),
+             (dtypes.int, -1, -1, True),
+             (dtypes.int, dtypes.int.min, dtypes.int.min, True),
+             (dtypes.int, dtypes.int.min, dtypes.int.max, False),
+             (dtypes.uint, 0, 0, True),
+             (dtypes.uint, dtypes.uint.max, 0, False),
+             (dtypes.uint, 0x80000000, 0x80000000, True),
+             (dtypes.uint, 0x7fffffff, 0x80000000, False),
+             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, True))
+    actual,live_tensors = [],[]
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
+         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+      for dtype,left,right,_ in cases:
+        lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
+        result = (lhs == rhs).realize()
+        live_tensors.append((lhs, rhs, result))
+        actual.append(result.tolist())
+    reference = [(Tensor([left], dtype=dtype, device="PYTHON") == Tensor([right], dtype=dtype, device="PYTHON")).tolist()
+                 for dtype,left,right,_ in cases]
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(actual, reference)
+    self.assertEqual(actual, [[expected] for *_,expected in cases])
+    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
+    decoded_dispatches = []
+    for submission in submissions:
+      dispatch = submission.dispatches[0]
+      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
+      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u8")
+      comparisons = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "cmps.s.eq")
+      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
+                            instruction.srcs[0].kind == "const")
+      self.assertEqual((len(loads), len(stores), len(comparisons), len(pointer_moves)), (2, 1, 1, 6))
+      self.assertEqual((comparisons[0].opcode, comparisons[0].dst, comparisons[0].srcs),
+                       ("cmps.s.eq", A630IR3Operand("half", 0), (loads[0].dst, loads[1].dst)))
+      self.assertEqual(stores[0].srcs[1], comparisons[0].dst)
+      self.assertTrue({("COND", 4), ("DST_HALF", 1), ("SY", 1), ("NOP", 3)} <= set(comparisons[0].fields))
+      self.assertTrue({("TYPE", 6), ("TYPE_HALF", 1), ("OFF", 0), ("SIZE", 1)} <= set(stores[0].fields))
+      destinations = {}
+      for instruction in pointer_moves:
+        assert instruction.dst is not None
+        destinations[instruction.srcs[0].value] = instruction.dst.value
+      bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
+      self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
+                       tuple((base, base+1) for base in bases))
+      decoded_dispatches.append((dispatch, comparisons[0], stores[0]))
+
+    # Equality of the mapped 32-bit words is signedness-independent. Changing only COND from EQ to LT changes 0xffffffff == itself.
+    case_index = len(cases) - 1
+    submission = submissions[case_index]
+    dispatch,comparison,store = decoded_dispatches[case_index]
+    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    original = bytes(shader[comparison.index*8:(comparison.index+1)*8])
+    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+    output = self.driver.resolve_owned(self.device.fd.fd, output_base, 1)
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    timestamp_before = self.driver.context_timestamps[self.device.ctx]
+    try:
+      struct.pack_into("<Q", shader, comparison.index * 8, comparison.raw & ~(0x7 << 48))
+      mutated = decode_a630_ir3(bytes(shader))[comparison.index]
+      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), ("cmps.s.lt", comparison.dst, comparison.srcs))
+      output[:] = b"\xff"
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual(bytes(output), b"\x00")
+      self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
+    finally:
+      shader[comparison.index*8:(comparison.index+1)*8] = original
+      self.device._gpu_free(request_buffer)
+    self.assertEqual(bytes(shader[comparison.index*8:(comparison.index+1)*8]), original)
+
+    def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message):
+      original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
+      request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+      request.timestamp = marker = 0x14142135 + instruction.index
+      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+      state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                      self.driver.always_on_counter, self.device.last_cmd)
+      try:
+        struct.pack_into("<Q", shader, instruction.index * 8, raw)
+        image = bytes(shader)
+        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+        mutated = mutated_dispatch.instructions[instruction.index]
+        self.assertEqual((mutated.opcode, mutated.srcs), (expected_opcode, expected_srcs))
+        with self.assertRaisesRegex(ValueError, message):
+          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
+                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+        with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+        self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                          self.driver.always_on_counter, self.device.last_cmd), (marker, *state_before))
+      finally:
+        shader[instruction.index*8:(instruction.index+1)*8] = original_instruction
+        self.device._gpu_free(request_buffer)
+      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
+
+    reject_mapped_mutation(comparison, comparison.raw | 1 << 48, None, (),
+                           f"unsupported A630 semantic at instruction {comparison.index}")
+    src1 = comparison.raw & 0xffff
+    reject_mapped_mutation(comparison, comparison.raw & ~(0xffff << 16) | src1 << 16, "cmps.s.eq",
+                           (comparison.srcs[0], comparison.srcs[0]), "u32 comparison does not consume both global loads")
+    nop = next(instruction for instruction in dispatch.instructions if instruction.opcode == "nop")
+    reject_mapped_mutation(nop, comparison.raw, "cmps.s.eq", comparison.srcs,
+                           "u32 comparison does not consume both global loads")
+    reject_mapped_mutation(store, store.raw & ~(0xff << 1) | 1 << 1, "stg.u8",
+                           (store.srcs[0], A630IR3Operand("half", 1)), "global store does not consume the u32 comparison")
+    self.assertEqual((Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT) ==
+                      Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [True])
 
   def test_production_symbolic_workgroups_execute_mapped_system_values(self):
     import struct

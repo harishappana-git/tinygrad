@@ -188,8 +188,9 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), full),
             _multisrc_operand(_same_int_field(fields, "SRC2"), full))
     if dst is not None and all(src is not None for src in srcs):
-      opcode = f"{name}.lt" if cat2_compare and _same_int_field(fields, "COND") == 0 else name
-      if not cat2_compare or opcode in {"cmps.u.lt", "cmps.s.lt"}:
+      opcode = {("cmps.s", 0):"cmps.s.lt", ("cmps.u", 0):"cmps.u.lt", ("cmps.s", 4):"cmps.s.eq"}.get(
+        (name, _same_int_field(fields, "COND"))) if cat2_compare else name
+      if opcode is not None:
         assert srcs[0] is not None and srcs[1] is not None
         return opcode, dst, (srcs[0], srcs[1])
   if category == 3 and name == "madsh.m16" and _has_no_repeat(fields) and \
@@ -643,10 +644,10 @@ def _u32_binary_instruction(instructions:Sequence[A630IR3Instruction], opcode:st
   return matches[0] if len(matches) == 1 else None
 
 def _u32_comparison_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3Instruction|None:
-  signed = _u32_binary_instruction(instructions, "cmps.s.lt")
-  unsigned = _u32_binary_instruction(instructions, "cmps.u.lt")
-  if (signed is None) == (unsigned is None): return None
-  return signed or unsigned
+  matches:list[A630IR3Instruction] = []
+  for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"):
+    if (instruction:=_u32_binary_instruction(instructions, opcode)) is not None: matches.append(instruction)
+  return matches[0] if len(matches) == 1 else None
 
 def _u32_multiply_sequence(instructions:Sequence[A630IR3Instruction]) \
     -> tuple[A630IR3Instruction, A630IR3Instruction, A630IR3Instruction]|None:
@@ -707,7 +708,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   integer_kind:str|None = None
   comparison_instruction = _u32_comparison_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
-  comparison_count = opcodes.count("cmps.s.lt") + opcodes.count("cmps.u.lt")
+  comparison_count = sum(opcodes.count(opcode) for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"))
   if opcodes.count("stg.u8"):
     _require((input_count, float_add_count, comparison_count, opcodes.count("stg.u8")) == (2, 0, 1, 1) and
              comparison_instruction is not None, "u32 comparison does not consume both global loads")
@@ -774,7 +775,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "cmps.u.lt":
       valid = dst_kind == "half" and (src_kinds == ("gpr", "const") or
               comparison_instruction is not None and instruction.index == comparison_instruction.index and src_kinds == ("gpr", "gpr"))
-    elif instruction.opcode == "cmps.s.lt":
+    elif instruction.opcode in {"cmps.s.lt", "cmps.s.eq"}:
       valid = dst_kind == "half" and comparison_instruction is not None and instruction.index == comparison_instruction.index and \
               src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
@@ -918,17 +919,18 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
             value = signed >> (src[1] & 31)
           elif opcode == "shrg": value = (src[1] >> (src[0] & 31)) | src[2]
-          elif opcode in {"cmps.s.lt", "cmps.u.lt"}:
+          elif opcode in {"cmps.s.lt", "cmps.u.lt", "cmps.s.eq"}:
             left,right = src
             if opcode == "cmps.s.lt":
               left = left - (1 << 32) if left & 0x80000000 else left
               right = right - (1 << 32) if right & 0x80000000 else right
-            value = int(left < right)
+            value = int(left == right) if opcode == "cmps.s.eq" else int(left < right)
             if comparison_instruction is not None and instruction.index == comparison_instruction.index:
               source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
                        "u32 comparison does not consume both global loads")
-              origin = ("s32-less-than" if opcode == "cmps.s.lt" else "u32-less-than", 0)
+              origin = (("u32-equal", 0) if opcode == "cmps.s.eq" else
+                        ("s32-less-than" if opcode == "cmps.s.lt" else "u32-less-than", 0))
           elif opcode == "cov.u16s32": value = src[0] & 0xffff
           elif opcode == "add.f":
             source_origins = tuple(("flut", operand.value) if operand.kind == "flut" else origins[lane].get(operand.value)
@@ -982,7 +984,8 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             base = instruction.srcs[0].value
             address = full[lane][base] | full[lane][base + 1] << 32
             _require(address == output_base + global_lane, "global store does not address the scalar bool output")
-            expected_origin = ("s32-less-than" if comparison_instruction.opcode == "cmps.s.lt" else "u32-less-than", 0)
+            if comparison_instruction.opcode == "cmps.s.eq": expected_origin = ("u32-equal", 0)
+            else: expected_origin = ("s32-less-than" if comparison_instruction.opcode == "cmps.s.lt" else "u32-less-than", 0)
             _require(half_origins[lane].get(instruction.srcs[1].value) == expected_origin,
                      "global store does not consume the u32 comparison")
             _require(src[1] in (0, 1), "u32 comparison result is not boolean")
