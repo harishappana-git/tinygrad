@@ -72,12 +72,22 @@ class QCOMDriver(VirtDriver):
       ioctl_code(kgsl.IOCTL_KGSL_DEVICE_GETPROPERTY): (kgsl.struct_kgsl_device_getproperty, self._getproperty),
       ioctl_code(kgsl.IOCTL_KGSL_MAP_USER_MEM): (kgsl.struct_kgsl_map_user_mem, self._map_user_mem),
       ioctl_code(kgsl.IOCTL_KGSL_SHAREDMEM_FREE): (kgsl.struct_kgsl_sharedmem_free, self._sharedmem_free),
+      ioctl_code(kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID):
+        (kgsl.struct_kgsl_device_waittimestamp_ctxtid, self._waittimestamp_ctxtid),
       ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND): (kgsl.struct_kgsl_gpu_command, self._gpu_command),
     }
 
   @staticmethod
   def _require(condition:bool, message:str):
     if not condition: raise RuntimeError(f"invalid KGSL request: {message}")
+
+  @staticmethod
+  def _timestamp_cmp(left:int, right:int) -> int:
+    # KGSL orders wrapping uint32 timestamps within a half-range window; preserve its exact half-window tie break.
+    if left == right: return 0
+    if left > right and left - right < 0x80000000: return 1
+    left, right = (left + 0x80000000) & 0xffffffff, (right + 0x80000000) & 0xffffffff
+    return 1 if left > right and left - right <= 0x80000000 else -1
 
   def _alloc_fd(self) -> int:
     fd, self.next_fd = self.next_fd, self.next_fd + 1
@@ -246,6 +256,16 @@ class QCOMDriver(VirtDriver):
     self.user_mappings.pop(req.gpuaddr)
     return 0
 
+  def _waittimestamp_ctxtid(self, fd:int, req:kgsl.struct_kgsl_device_waittimestamp_ctxtid) -> int:
+    self._require((context:=self.contexts.get(req.context_id)) is not None, f"unknown context {req.context_id}")
+    assert context is not None
+    self._require(context[0] == fd, f"context {req.context_id} belongs to another descriptor")
+    retired = self.context_timestamps[req.context_id]
+    if self._timestamp_cmp(retired, req.timestamp) >= 0: return 0
+    # Submissions retire synchronously in this virtual driver, so an unretired timestamp cannot progress inside this ioctl.
+    raise RuntimeError(f"invalid KGSL request: future timestamp {req.timestamp:#x} cannot progress synchronously "
+                       f"(retired {retired:#x}, timeout {req.timeout} ms)")
+
   @staticmethod
   def _overlaps(left_address:int, left_size:int, right_address:int, right_size:int) -> bool:
     return left_address + left_size > right_address and right_address + right_size > left_address
@@ -348,9 +368,8 @@ class QCOMDriver(VirtDriver):
       journal,planned_counter = self._plan_a630_retirement(fd, submission, command.gpuaddr, command.size)
     except ValueError as error: raise RuntimeError(f"invalid KGSL request: {error}") from error
     timestamp = self.context_timestamps[req.context_id]
-    self._require(timestamp < 0xffffffff, f"context {req.context_id} timestamp overflow")
     self._commit_a630_journal(fd, journal)
     self.always_on_counter = planned_counter
     # KGSL assigns a separate per-context command sequence after accepting the complete submission.
-    self.context_timestamps[req.context_id] = req.timestamp = timestamp + 1
+    self.context_timestamps[req.context_id] = req.timestamp = (timestamp + 1) & 0xffffffff
     return 0

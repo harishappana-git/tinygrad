@@ -126,6 +126,75 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "unknown context"):
       kgsl.IOCTL_KGSL_DRAWCTXT_DESTROY(self.device.fd, drawctxt_id=context.drawctxt_id)
 
+  def test_waittimestamp_context_and_wrap_contract(self):
+    import struct
+    from tinygrad.runtime.autogen import kgsl, mesa
+    from tinygrad.runtime.ops_qcom import pkt7_hdr
+    from test.mockgpu.qcom.qcomdriver import ioctl_code
+    wait_code = ioctl_code(kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID)
+    self.assertEqual((ctypes.sizeof(kgsl.struct_kgsl_device_waittimestamp_ctxtid), wait_code), (12, 0x400c0907))
+    layout = kgsl.struct_kgsl_device_waittimestamp_ctxtid(context_id=0x11223344, timestamp=0x55667788, timeout=0x99aabbcc)
+    self.assertEqual(ctypes.string_at(ctypes.addressof(layout), ctypes.sizeof(layout)), struct.pack("<III", 0x11223344, 0x55667788, 0x99aabbcc))
+    state = (dict(self.driver.contexts), dict(self.driver.context_timestamps), dict(self.driver.allocations),
+             dict(self.driver.user_mappings), dict(self.driver.power_levels), self.driver.always_on_counter, self.device.last_cmd)
+    for malformed in (wait_code ^ (1 << 30), wait_code ^ (1 << 16), wait_code ^ (1 << 8), wait_code ^ 1):
+      with self.assertRaisesRegex(RuntimeError, "unsupported KGSL ioctl"): self.device.fd.ioctl(malformed, layout)
+    self.assertEqual((ctypes.string_at(ctypes.addressof(layout), ctypes.sizeof(layout)),
+                      self.driver.contexts, self.driver.context_timestamps, self.driver.allocations,
+                      self.driver.user_mappings, self.driver.power_levels, self.driver.always_on_counter, self.device.last_cmd),
+                     (struct.pack("<III", 0x11223344, 0x55667788, 0x99aabbcc), *state))
+
+    comparisons = ((0, 0, 0), (7, 6, 1), (7, 8, -1), (0, 0xffffffff, 1),
+                   (0xffffffff, 0, -1), (0, 0x80000000, 1), (0x80000000, 0, -1))
+    self.assertEqual([self.driver._timestamp_cmp(a, b) for a,b,_ in comparisons], [result for _,_,result in comparisons])
+
+    context = kgsl.IOCTL_KGSL_DRAWCTXT_CREATE(self.device.fd, flags=self.driver.contexts[self.device.ctx][1])
+    other_fd = self.driver.open('/dev/kgsl-3d0', os.O_RDWR, 0, self.driver.tracked_files[0])
+    try:
+      for retired,requested,comparison in comparisons:
+        self.driver.context_timestamps[context.drawctxt_id] = retired
+        for timeout in (0, 1, 0xffffffff):
+          wait = kgsl.struct_kgsl_device_waittimestamp_ctxtid(context_id=context.drawctxt_id, timestamp=requested, timeout=timeout)
+          before = (ctypes.string_at(ctypes.addressof(wait), ctypes.sizeof(wait)), dict(self.driver.contexts),
+                    dict(self.driver.context_timestamps), self.driver.always_on_counter, self.device.last_cmd)
+          if comparison >= 0: self.assertEqual(self.device.fd.ioctl(wait_code, wait), 0)
+          else:
+            with self.assertRaisesRegex(RuntimeError, f"future timestamp {requested:#x} cannot progress synchronously"):
+              self.device.fd.ioctl(wait_code, wait)
+          self.assertEqual((ctypes.string_at(ctypes.addressof(wait), ctypes.sizeof(wait)), self.driver.contexts,
+                            self.driver.context_timestamps, self.driver.always_on_counter, self.device.last_cmd), before)
+
+      foreign = kgsl.struct_kgsl_device_waittimestamp_ctxtid(context_id=context.drawctxt_id, timestamp=0, timeout=0)
+      foreign_before = ctypes.string_at(ctypes.addressof(foreign), ctypes.sizeof(foreign))
+      with self.assertRaisesRegex(RuntimeError, "belongs to another descriptor"):
+        other_fd.ioctl(other_fd.fd, wait_code, ctypes.addressof(foreign))
+      self.assertEqual(ctypes.string_at(ctypes.addressof(foreign), ctypes.sizeof(foreign)), foreign_before)
+
+      self.driver.context_timestamps[context.drawctxt_id] = 0xfffffffe
+      buffer, _, request = self.gpu_command([pkt7_hdr(mesa.CP_WAIT_FOR_IDLE, 0)])
+      request.context_id = context.drawctxt_id
+      try:
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+        self.assertEqual((request.timestamp, self.driver.context_timestamps[context.drawctxt_id]), (0xffffffff, 0xffffffff))
+        kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=context.drawctxt_id,
+                                                    timestamp=0xffffffff, timeout=0xffffffff)
+        with self.assertRaisesRegex(RuntimeError, "future timestamp 0x0 cannot progress synchronously"):
+          kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=context.drawctxt_id, timestamp=0, timeout=1)
+
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+        self.assertEqual((request.timestamp, self.driver.context_timestamps[context.drawctxt_id]), (0, 0))
+        for timestamp in (0xffffffff, 0):
+          kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=context.drawctxt_id,
+                                                      timestamp=timestamp, timeout=0xffffffff)
+      finally:
+        self.device._gpu_free(buffer)
+    finally:
+      other_fd.close(other_fd.fd)
+      kgsl.IOCTL_KGSL_DRAWCTXT_DESTROY(self.device.fd, drawctxt_id=context.drawctxt_id)
+
+    with self.assertRaisesRegex(RuntimeError, "unknown context"):
+      kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=context.drawctxt_id, timestamp=0, timeout=0)
+
   def test_descriptor_binding_and_close_cleanup(self):
     from tinygrad.runtime.autogen import kgsl
     from test.mockgpu.qcom.qcomdriver import ioctl_code
@@ -231,6 +300,9 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(signal.value, 7)
     self.assertEqual((self.device.last_cmd, self.driver.context_timestamps[self.device.ctx]),
                      (control_timestamp + 1, control_timestamp + 1))
+    wait_before = (dict(self.driver.context_timestamps), self.driver.always_on_counter, self.device.last_cmd)
+    self.device.timeline_signal._sleep(0)
+    self.assertEqual((self.driver.context_timestamps, self.driver.always_on_counter, self.device.last_cmd), wait_before)
 
     writable, readonly = memoryview(bytearray(b"left")), memoryview(b"right")
     preflight_journal = (KGSLJournalWrite(0, 0, 1, b"LEFT", "first test", False),
@@ -335,6 +407,13 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((malformed_request.timestamp, bytes(malformed_buffer.cpu_view().mv[:8])), (77, malformed_before))
     self.device._gpu_free(malformed_buffer)
     self.device._gpu_free(buffer)
+
+    recovered_timestamp = self.driver.context_timestamps[self.device.ctx]
+    self.device.hw_compute_queue_t().wait(signal, 7).signal(signal, 8).submit(self.device)
+    self.assertEqual((signal.value, self.device.last_cmd, self.driver.context_timestamps[self.device.ctx]),
+                     (8, recovered_timestamp + 1, recovered_timestamp + 1))
+    self.device.timeline_signal._sleep(0)
+    self.device.synchronize()
 
   def test_ir3_decoder_rejects_invalid_and_private_encodings(self):
     from test.mockgpu.qcom.a630 import decode_a630_ir3
@@ -1035,8 +1114,6 @@ class TestQCOMDriver(unittest.TestCase):
     kgsl.IOCTL_KGSL_GPUOBJ_FREE(self.device.fd, id=owned.id)
     with self.assertRaisesRegex(RuntimeError, "unsupported open flags"):
       self.driver.open('/dev/kgsl-3d0', os.O_RDONLY, 0, self.driver.tracked_files[0])
-    with self.assertRaisesRegex(RuntimeError, "unsupported KGSL ioctl"):
-      kgsl.IOCTL_KGSL_DEVICE_WAITTIMESTAMP_CTXTID(self.device.fd, context_id=self.device.ctx, timestamp=0, timeout=0)
     with self.assertRaisesRegex(RuntimeError, "invalid command-list pointer"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, context_id=self.device.ctx)
 
