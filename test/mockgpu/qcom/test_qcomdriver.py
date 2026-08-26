@@ -710,6 +710,65 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(self.device.last_cmd, retired_command)
     self.device._gpu_free(invalid_buffer)
 
+  def test_production_two_input_add_machine_execution_and_retirement(self):
+    import struct
+    from tinygrad import Device, Tensor
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.runtime.autogen import kgsl, mesa
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import parse_pm4
+
+    left_values, right_values = [1.0, -2.5, 1024.0], [4.0, 0.5, -24.0]
+    left, right = Tensor(left_values, device=Device.DEFAULT).realize(), Tensor(right_values, device=Device.DEFAULT).realize()
+    result = left + right
+    program_spec = to_program(result.schedule_linear().src[-1].src[0], self.device.renderer)
+    runtime = get_runtime(self.device.device, program_spec)
+    result_buffer, left_buffer, right_buffer = (cast(Any, tensor.uop.buffer) for tensor in (result, left, right))
+    result_buffer.allocate()
+    args = runtime.fill_kernargs([result_buffer._buf, left_buffer._buf, right_buffer._buf])
+    queue = self.device.hw_compute_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1).memory_barrier()
+    queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
+    queue.signal(self.device.timeline_signal, self.device.next_timeline())
+    words = tuple(queue._q)
+    submission = stage_a630(parse_pm4(words), lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
+    dispatch = submission.dispatches[0]
+
+    self.assertEqual(Device.DEFAULT, "QCOM")
+    self.assertEqual((runtime.image_size, dispatch.local_size, dispatch.groups), (256, (3, 1, 1), (1, 1, 1)))
+    self.assertEqual(dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CNTL_0], 0x282)
+    self.assertEqual(tuple(instruction.raw for instruction in dispatch.instructions[18:27]),
+                     (0xc006000b01810001, 0x2009400c00000001, 0xc006001001834001, 0x20000000000,
+                      0x421000070009000c, 0x5018080b0010000b, 0x20000000000, 0xc0c60d0001800016, 0x300000000000000))
+    self.assertEqual(tuple(instruction.opcode for instruction in dispatch.instructions[18:27]),
+                     ("ldg.u32", "cov.u16s32", "ldg.u32", "nop", "add.u", "add.f", "nop", "stg.u32", "end"))
+    self.assertEqual(struct.unpack_from("<3Q", dispatch.constants_image),
+                     (int(result_buffer._buf.va_addr), int(left_buffer._buf.va_addr), int(right_buffer._buf.va_addr)))
+
+    result_size = len(left_values) * 4
+    result_view = self.driver.resolve_owned(self.device.fd.fd, int(result_buffer._buf.va_addr), result_size)
+    result_view[:] = bytes(result_size)
+    last_command = self.device.last_cmd
+    queue.submit(self.device)
+    reference = cast(list[float], (Tensor(left_values, device="PYTHON") + Tensor(right_values, device="PYTHON")).tolist())
+    self.assertGreater(self.device.last_cmd, last_command)
+    self.assertEqual(list(struct.unpack(f"<{len(left_values)}f", result_view)), reference)
+
+    constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
+    original_output_pointer = bytes(constants_view[:8])
+    right_view = self.driver.resolve_owned(self.device.fd.fd, int(right_buffer._buf.va_addr), result_size)
+    try:
+      constants_view[:8] = constants_view[16:24]
+      alias_buffer, _, alias_request = self.gpu_command(words)
+      alias_request.timestamp = 0x23456789
+      before = (bytes(result_view), bytes(right_view), self.driver.context_timestamps[self.device.ctx], self.device.last_cmd)
+      with self.assertRaisesRegex(RuntimeError, "global store aliases snapshotted A630 global input 1"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
+      self.assertEqual(alias_request.timestamp, 0x23456789)
+      self.assertEqual((bytes(result_view), bytes(right_view), self.driver.context_timestamps[self.device.ctx], self.device.last_cmd), before)
+      self.device._gpu_free(alias_buffer)
+    finally: constants_view[:8] = original_output_pointer
+
   def test_production_image_descriptor_path_preflights_nested_ranges(self):
     import struct
     from tinygrad import Tensor, dtypes

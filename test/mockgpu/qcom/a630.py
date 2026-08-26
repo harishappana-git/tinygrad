@@ -549,30 +549,47 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(dispatch.groups == (1, 1, 1) and dispatch.local_size[1:] == (1, 1) and 1 <= dispatch.local_size[0] <= 64,
            "A630 execution currently requires one partial Thread64 workgroup")
   registers = dict(dispatch.registers)
-  _require(registers.get(mesa.REG_A6XX_SP_CS_CNTL_0) == 0x202, "unsupported merged-register or thread mode")
   _require(registers.get(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0) == 0xfcfcfc and
            registers.get(mesa.REG_A6XX_SP_CS_WGE_CNTL) == 0xfc, "unsupported A630 system-value register mapping")
   _require(len(dispatch.constants_image) == 4096, "unsupported A630 constant image size")
 
-  # This first execution slice accepts only the exact pinned-compiler scalar add image. Slot 17 may select FLUT 1.0 or 2.0;
-  # the latter is the valid machine-image mutation control, not a second compiler path.
-  exact = (0x47180803201f0000, 0x46d8080320020003, 0x650004030003301e, 0x46d8000020020000,
-           0x4210000800031003, 0x4210000400001002, 0x4210000600001000, 0x4210080900031001,
-           0x4290400010020004, 0x4298400110000006, 0x2009400a00000000, 0x2009400c00000001,
-           0x10000000000, 0x421000050008000a, 0x421808070009000c, 0x10000000000,
-           0xc006000b01810001, 0x5018080b2802000b, 0x20000000000, 0xc0c60d0001800016, 0x300000000000000)
-  opcodes = ("ashr.b", "shl.b", "shrg", "shl.b", "add.u", "add.u", "add.u", "add.u", "cmps.u.lt", "cmps.u.lt",
-             "cov.u16s32", "cov.u16s32", "nop", "add.u", "add.u", "nop", "ldg.u32", "add.f", "nop", "stg.u32", "end")
+  # Accept only the two observed pinned-compiler f32 add images and their exact register footprints.
+  control = registers.get(mesa.REG_A6XX_SP_CS_CNTL_0)
+  exact:tuple[int, ...]
+  opcodes:tuple[str, ...]
+  mutable_flut_slot:int|None
+  if control == 0x202:
+    exact = (0x47180803201f0000, 0x46d8080320020003, 0x650004030003301e, 0x46d8000020020000,
+             0x4210000800031003, 0x4210000400001002, 0x4210000600001000, 0x4210080900031001,
+             0x4290400010020004, 0x4298400110000006, 0x2009400a00000000, 0x2009400c00000001,
+             0x10000000000, 0x421000050008000a, 0x421808070009000c, 0x10000000000,
+             0xc006000b01810001, 0x5018080b2802000b, 0x20000000000, 0xc0c60d0001800016, 0x300000000000000)
+    opcodes = ("ashr.b", "shl.b", "shrg", "shl.b", "add.u", "add.u", "add.u", "add.u", "cmps.u.lt", "cmps.u.lt",
+               "cov.u16s32", "cov.u16s32", "nop", "add.u", "add.u", "nop", "ldg.u32", "add.f", "nop", "stg.u32", "end")
+    mutable_flut_slot = 17
+  elif control == 0x282:
+    exact = (0x47180803201f0000, 0x46d8080320020003, 0x650004030003301e, 0x46d8000020020000,
+             0x4210000800031003, 0x4210000400001002, 0x4210000d00001004, 0x4210000900031001,
+             0x4210000300031005, 0x4290400010020004, 0x429840021004000d, 0x2009400a00000000,
+             0x2009400f00000002, 0x0, 0x4210000600001000, 0x421000050008000a,
+             0x4210080e0003000f, 0x4298480110000006, 0xc006000b01810001, 0x2009400c00000001,
+             0xc006001001834001, 0x20000000000, 0x421000070009000c, 0x5018080b0010000b,
+             0x20000000000, 0xc0c60d0001800016, 0x300000000000000)
+    opcodes = ("ashr.b", "shl.b", "shrg", "shl.b", "add.u", "add.u", "add.u", "add.u", "add.u", "cmps.u.lt", "cmps.u.lt",
+               "cov.u16s32", "cov.u16s32", "nop", "add.u", "add.u", "add.u", "cmps.u.lt", "ldg.u32", "cov.u16s32",
+               "ldg.u32", "nop", "add.u", "add.f", "nop", "stg.u32", "end")
+    mutable_flut_slot = None
+  else: raise ValueError(f"unsupported A630 register footprint or thread control {control!r}")
   _require(len(dispatch.instructions) >= len(exact), "truncated A630 add image")
   for index,(instruction,raw,opcode) in enumerate(zip(dispatch.instructions, exact, opcodes)):
-    if index == 17:
+    if index == mutable_flut_slot:
       _require(instruction.raw in (raw, raw | 1 << 16), "unsupported A630 add immediate")
     else: _require(instruction.raw == raw, f"unsupported A630 add encoding at instruction {index}")
     _require(instruction.opcode == opcode, f"missing typed A630 semantic at instruction {index}")
   return dispatch
 
 def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630ExecutionWrite, ...]:
-  """Execute the narrow A630 add image into an immutable write journal; this does not retire the KGSL submission."""
+  """Execute the narrow A630 f32 add images into an immutable write journal; this does not retire the KGSL submission."""
   dispatch = _execution_dispatch(submission)
   constants = struct.unpack("<1024I", dispatch.constants_image)
   lane_count = dispatch.local_size[0]
