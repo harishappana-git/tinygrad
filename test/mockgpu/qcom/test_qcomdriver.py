@@ -1423,114 +1423,17 @@ class TestQCOMDriver(unittest.TestCase):
                       Tensor([-4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
 
   def test_production_integer_subtract_wraps_from_mapped_machine_bytes(self):
-    import struct
-    from dataclasses import replace
+    import operator
     from tinygrad import Device, Tensor, dtypes
-    from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
-    from test.mockgpu.qcom.a630 import decode_a630_ir3
-
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
-
     cases = ((dtypes.int, dtypes.int.min, 1, dtypes.int.max),
              (dtypes.int, dtypes.int.max, -1, dtypes.int.min),
              (dtypes.uint, 0, 1, dtypes.uint.max),
              (dtypes.uint, 0x80000000, 0xffffffff, 0x80000001),
              (dtypes.int, 9, 4, 5))
-    actual,live_tensors = [],[]
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
-      for dtype,left,right,_ in cases:
-        lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
-        result = (lhs - rhs).realize()
-        live_tensors.append((lhs, rhs, result))
-        actual.append(result.tolist())
-    reference = [(Tensor([left], dtype=dtype, device="PYTHON") - Tensor([right], dtype=dtype, device="PYTHON")).tolist()
-                 for dtype,left,right,_ in cases]
-
-    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
-                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
-    self.assertEqual(actual, reference)
-    self.assertEqual(actual, [[expected] for *_,expected in cases])
-    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
-    decoded_dispatches = []
-    for submission in submissions:
-      dispatch = submission.dispatches[0]
-      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
-      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
-      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
-      subtracts = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "sub.u")
-      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
-                            instruction.srcs[0].kind == "const")
-      self.assertEqual((len(loads), len(stores), len(subtracts), len(pointer_moves)), (2, 1, 1, 6))
-      self.assertEqual(subtracts[0].srcs, (loads[0].dst, loads[1].dst))
-      self.assertEqual(stores[0].srcs[1], subtracts[0].dst)
-      self.assertIn(("SY", 1), subtracts[0].fields)
-      self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
-      destinations = {}
-      for instruction in pointer_moves:
-        self.assertIsNotNone(instruction.dst)
-        destinations[instruction.srcs[0].value] = instruction.dst.value
-      bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
-      self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
-                       tuple((base, base+1) for base in bases))
-      decoded_dispatches.append((dispatch, subtracts[0]))
-
-    # Swapping the two encoded sources is still valid SUB.U, but it must reverse the numerical result.
-    case_index = len(cases) - 1
-    submission = submissions[case_index]
-    dispatch,subtract = decoded_dispatches[case_index]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[subtract.index*8:(subtract.index+1)*8])
-    src1,src2 = subtract.raw & 0xffff, subtract.raw >> 16 & 0xffff
-    swapped_raw = subtract.raw & ~0xffffffff | src2 | src1 << 16
-    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
-    output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    timestamp_before = self.driver.context_timestamps[self.device.ctx]
-    try:
-      struct.pack_into("<Q", shader, subtract.index * 8, swapped_raw)
-      mutated = decode_a630_ir3(bytes(shader))[subtract.index]
-      self.assertEqual((mutated.opcode, mutated.srcs), ("sub.u", (subtract.srcs[1], subtract.srcs[0])))
-      output[:] = bytes(4)
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual(struct.unpack("<I", output)[0], (-5) & 0xffffffff)
-      self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
-    finally:
-      shader[subtract.index*8:(subtract.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-
-    # A duplicate source no longer consumes both input loads and must reject without partial retirement.
-    duplicate_raw = subtract.raw & ~(0xffff << 16) | src1 << 16
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    request.timestamp = 0x31415926
-    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-    state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                    self.driver.always_on_counter, self.device.last_cmd)
-    try:
-      struct.pack_into("<Q", shader, subtract.index * 8, duplicate_raw)
-      image = bytes(shader)
-      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
-      self.assertEqual(mutated_dispatch.instructions[subtract.index].srcs, (subtract.srcs[0], subtract.srcs[0]))
-      with self.assertRaisesRegex(ValueError, "u32 subtraction does not consume both global loads"):
-        real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      with self.assertRaisesRegex(RuntimeError, "u32 subtraction does not consume both global loads"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                        self.driver.always_on_counter, self.device.last_cmd), (0x31415926, *state_before))
-    finally:
-      shader[subtract.index*8:(subtract.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[subtract.index*8:(subtract.index+1)*8]), original)
+    # Reversing only the mapped sources changes 9 - 4 to 4 - 9 while preserving the valid SUB.U encoding.
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
+      tensor_operator=operator.sub, opcode="sub.u", opcode_bits=0x12, operation="subtraction", cases=cases,
+      mutation_opcode="sub.u", mutation_opcode_bits=0x12, mutation_expected=(-5) & 0xffffffff, swap_mutation_sources=True)
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) -
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
 
