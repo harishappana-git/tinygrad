@@ -610,6 +610,11 @@ class TestQCOMDriver(unittest.TestCase):
                      ("or.b", A630IR3Operand("gpr", 2),
                       (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
     self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_or.fields))
+    logical_shift = decode_one(0x56f8080200070002)
+    self.assertEqual((logical_shift.opcode, logical_shift.dst, logical_shift.srcs),
+                     ("shr.b", A630IR3Operand("gpr", 2),
+                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
+    self.assertTrue({("NAME", "shr.b"), ("SY", 1), ("NOP", 3)} <= set(logical_shift.fields))
     for nop_count in range(4):
       scheduled_or = decode_one(integer_or.raw & ~((1 << 43) | (1 << 51)) |
                                 (nop_count & 1) << 43 | (nop_count >> 1) << 51)
@@ -735,7 +740,7 @@ class TestQCOMDriver(unittest.TestCase):
     }
     for modifier,word in rejected_subtract.items():
       with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for binary in (integer_xor, integer_and, integer_or, signed_maximum, unsigned_maximum):
+    for binary in (integer_xor, integer_and, integer_or, logical_shift, signed_maximum, unsigned_maximum):
       rejected_binary = {
         "saturate": binary.raw | 1 << 42,
         "repeat": binary.raw | 1 << 40,
@@ -1531,7 +1536,8 @@ class TestQCOMDriver(unittest.TestCase):
 
   def _assert_production_integer_binary_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, operation,
                                                                   cases, mutation_opcode, mutation_opcode_bits, mutation_expected,
-                                                                  unsupported_opcode_bits=None, unsupported_name=None, value_type="u32"):
+                                                                  unsupported_opcode_bits=None, unsupported_name=None, value_type="u32",
+                                                                  swap_mutation_sources=False, unsupported_shift_counts=()):
     import struct
     from dataclasses import replace
     from tinygrad import Device, Tensor
@@ -1606,12 +1612,19 @@ class TestQCOMDriver(unittest.TestCase):
     request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
     try:
-      mutation_raw = binary.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
-      self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
-                       (mutation_opcode_bits, binary.raw & ~(0x3f << 53)))
+      if swap_mutation_sources:
+        src1,src2 = binary.raw & 0xffff, binary.raw >> 16 & 0xffff
+        mutation_raw = binary.raw & ~0xffffffff | src2 | src1 << 16
+        mutation_srcs = (binary.srcs[1], binary.srcs[0])
+        self.assertEqual(mutation_raw & ~0xffffffff, binary.raw & ~0xffffffff)
+      else:
+        mutation_raw = binary.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
+        mutation_srcs = binary.srcs
+        self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
+                         (mutation_opcode_bits, binary.raw & ~(0x3f << 53)))
       struct.pack_into("<Q", shader, binary.index * 8, mutation_raw)
       mutated = decode_a630_ir3(bytes(shader))[binary.index]
-      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, binary.dst, binary.srcs))
+      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, binary.dst, mutation_srcs))
       output[:] = struct.pack("<I", mutation_expected ^ 0xffffffff)
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
       self.assertEqual(struct.unpack("<I", output)[0], mutation_expected)
@@ -1662,6 +1675,37 @@ class TestQCOMDriver(unittest.TestCase):
       unsupported_raw = binary.raw & ~(0x3f << 53) | unsupported_opcode_bits << 53
       reject_mapped_mutation(binary, unsupported_raw, None, (),
                              f"unsupported A630 semantic at instruction {binary.index}", expected_name=unsupported_name)
+
+    if unsupported_shift_counts:
+      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
+                            instruction.srcs[0].kind == "const")
+      rhs_load = next(instruction for instruction in loads if instruction.dst == binary.srcs[1])
+      constants_by_register = {instruction.dst.value:instruction.srcs[0].value for instruction in pointer_moves if instruction.dst is not None}
+      rhs_constant = constants_by_register[rhs_load.srcs[0].value]
+      self.assertEqual(rhs_constant & 1, 0)
+      rhs_base = struct.unpack_from("<Q", dispatch.constants_image, rhs_constant * 4)[0]
+      rhs = self.driver.resolve_owned(self.device.fd.fd, rhs_base, 4)
+      original_rhs = bytes(rhs)
+      try:
+        for index,count in enumerate(unsupported_shift_counts):
+          with self.subTest(unsupported_shift_count=count):
+            rhs[:] = struct.pack("<I", count)
+            request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+            request.timestamp = marker = 0x16180339 + index
+            signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+            output[:] = struct.pack("<I", count ^ 0xffffffff)
+            state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                            self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+            try:
+              with self.assertRaisesRegex(ValueError, "shift count is outside the supported 0..31 range"):
+                real_execute(submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+              with self.assertRaisesRegex(RuntimeError, "shift count is outside the supported 0..31 range"):
+                kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+              self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                                self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
+            finally: self.device._gpu_free(request_buffer)
+      finally: rhs[:] = original_rhs
 
   def test_production_integer_xor_uses_mapped_machine_bytes(self):
     import operator
@@ -1722,6 +1766,28 @@ class TestQCOMDriver(unittest.TestCase):
       mutation_opcode="and.b", mutation_opcode_bits=0x1c, mutation_expected=0x80000001)
     self.assertEqual(operator.or_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                   Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xafafafaf])
+
+  def test_production_unsigned_right_shift_uses_mapped_machine_bytes(self):
+    import operator
+    from tinygrad import Device, Tensor, dtypes
+    cases = ((dtypes.uint, 0, 0, 0),
+             (dtypes.uint, dtypes.uint.max, 0, dtypes.uint.max),
+             (dtypes.uint, 0x80000001, 1, 0x40000000),
+             (dtypes.uint, 0x12345678, 4, 0x01234567),
+             (dtypes.uint, dtypes.uint.max, 16, 0x0000ffff),
+             (dtypes.uint, 0x80000000, 31, 1),
+             (dtypes.uint, 16, 2, 4))
+    unsupported_counts = (32, 33, dtypes.uint.max)
+    self.assertEqual([operator.rshift(Tensor([0x80000001], dtype=dtypes.uint, device="PYTHON"),
+                                      Tensor([count], dtype=dtypes.uint, device="PYTHON")).tolist() for count in unsupported_counts],
+                     [[0], [0], [0]])
+    # Swapping only the mapped SHR.B sources changes 16 >> 2 to 2 >> 16, while keeping both counts in the supported range.
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
+      tensor_operator=operator.rshift, opcode="shr.b", opcode_bits=0x37, operation="logical right shift", cases=cases,
+      mutation_opcode="shr.b", mutation_opcode_bits=0x37, mutation_expected=0, swap_mutation_sources=True,
+      unsupported_shift_counts=unsupported_counts)
+    self.assertEqual(operator.rshift(Tensor([0x80000001], dtype=dtypes.uint, device=Device.DEFAULT),
+                                     Tensor([1], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x40000000])
 
   def test_production_signed_maximum_uses_mapped_machine_bytes(self):
     from tinygrad import Device, Tensor, dtypes
