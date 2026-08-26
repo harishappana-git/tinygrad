@@ -1,4 +1,4 @@
-import ctypes, functools, mmap, os, unittest
+import contextlib, ctypes, functools, mmap, os, unittest
 from typing import Any, cast
 from unittest import mock
 from tinygrad.helpers import DEV, mv_address
@@ -30,6 +30,22 @@ class TestQCOMDriver(unittest.TestCase):
     request = kgsl.struct_kgsl_gpu_command(cmdlist=ctypes.addressof(command), cmdsize=ctypes.sizeof(command), numcmds=1,
                                            context_id=self.device.ctx)
     return buffer, command, request
+
+  @contextlib.contextmanager
+  def _capture_a630_execution(self):
+    from test.mockgpu.qcom import qcomdriver
+    submissions,command_images = [],[]
+    real_execute = qcomdriver.execute_a630
+    real_plan = self.driver._plan_a630_retirement
+    def capture_execution(submission, resolver):
+      submissions.append(submission)
+      return real_execute(submission, resolver)
+    def capture_plan(fd, submission, command_address, command_size):
+      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
+      return real_plan(fd, submission, command_address, command_size)
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
+         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+      yield submissions,command_images,real_execute
 
   def test_production_backend_identity_and_initialization(self):
     from tinygrad.device import Device
@@ -1326,26 +1342,14 @@ class TestQCOMDriver(unittest.TestCase):
     from dataclasses import replace
     from tinygrad import Device, Tensor, dtypes
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
-
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
 
     cases = ((dtypes.int, [dtypes.int.max, dtypes.int.min, -7], [1, -1, 3], [dtypes.int.min, dtypes.int.max, -4]),
              (dtypes.uint, [dtypes.uint.max, 0x80000000, 7], [1, 0x80000000, 5], [0, 0, 12]),
              (dtypes.int, [dtypes.int.max], [1], [dtypes.int.min]),
              (dtypes.uint, [dtypes.uint.max], [1], [0]))
     actual = []
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
       for dtype,left,right,_ in cases:
         actual.append((Tensor(left, dtype=dtype, device=Device.DEFAULT) + Tensor(right, dtype=dtype, device=Device.DEFAULT)).tolist())
     reference = [(Tensor(left, dtype=dtype, device="PYTHON") + Tensor(right, dtype=dtype, device="PYTHON")).tolist()
@@ -1445,22 +1449,10 @@ class TestQCOMDriver(unittest.TestCase):
     from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import decode_a630_ir3
 
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
-
     actual,live_tensors = [],[]
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
       for dtype,left,right,_ in cases:
         lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
         result = tensor_operator(lhs, rhs).realize()
@@ -1731,18 +1723,7 @@ class TestQCOMDriver(unittest.TestCase):
     from dataclasses import replace
     from tinygrad import Device, Tensor, dtypes
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import decode_a630_ir3
-
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
 
     cases = ((dtypes.int, dtypes.int.min, -1, dtypes.int.min),
              (dtypes.int, dtypes.int.max, 2, -2),
@@ -1750,8 +1731,7 @@ class TestQCOMDriver(unittest.TestCase):
              (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 1),
              (dtypes.uint, 0x00010002, 0x00030004, 0x000a0008))
     actual,live_tensors = [],[]
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
       for dtype,left,right,_ in cases:
         lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
         result = (lhs * rhs).realize()
@@ -1854,22 +1834,10 @@ class TestQCOMDriver(unittest.TestCase):
     from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
 
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
-
     actual,live_tensors = [],[]
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
       for dtype,left,right,_ in cases:
         lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
         result = tensor_operator(lhs, rhs).realize()
@@ -2022,24 +1990,12 @@ class TestQCOMDriver(unittest.TestCase):
     from dataclasses import replace
     from tinygrad import Device, Tensor, Variable
     from tinygrad.runtime.autogen import kgsl, mesa
-    from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import decode_a630_ir3
-
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
 
     size = Variable("qcom_symbolic_size", 1, 10)
     ones = Tensor.ones(10, device=Device.DEFAULT).contiguous()
     actual = []
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
       for value in (2, 5): actual.append((ones[:size.bind(value)] + 1).contiguous()[:value].tolist())
     reference = [(Tensor.ones(value, device="PYTHON") + 1).tolist() for value in (2, 5)]
 
