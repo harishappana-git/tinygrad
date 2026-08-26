@@ -178,7 +178,7 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
       return "cov.u16s32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("half", _same_int_field(fields, "SRC")),)
   cat2_compare = name in {"cmps.u", "cmps.s"}
-  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "xor.b", "mull.u", "cmps.u", "cmps.s", "add.f"} and \
+  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "xor.b", "and.b", "mull.u", "cmps.u", "cmps.s", "add.f"} and \
      _has_no_repeat(fields) and all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG", "SRC_R")) and \
      (raw >> 52 & 1, raw >> 46 & 1) == (1, int(cat2_compare)):
     dst_half = bool(_same_int_field(fields, "DST_HALF"))
@@ -188,8 +188,8 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), full),
             _multisrc_operand(_same_int_field(fields, "SRC2"), full))
     if dst is not None and all(src is not None for src in srcs):
-      if name == "xor.b" and (dst.kind != "gpr" or not 0 <= dst.value < 0xc0 or
-                              any(src.kind != "gpr" for src in srcs if src is not None)):
+      if name in {"xor.b", "and.b"} and (dst.kind != "gpr" or not 0 <= dst.value < 0xc0 or
+                                         any(src.kind != "gpr" for src in srcs if src is not None)):
         return None, None, ()
       opcode = {("cmps.s", 0):"cmps.s.lt", ("cmps.u", 0):"cmps.u.lt", ("cmps.s", 4):"cmps.s.eq"}.get(
         (name, _same_int_field(fields, "COND"))) if cat2_compare else name
@@ -730,6 +730,11 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     _require((input_count, float_add_count, opcodes.count("xor.b")) == (2, 0, 1) and integer_instruction is not None,
              "u32 bitwise XOR does not consume both global loads")
     integer_kind = "bitwise XOR"
+  elif opcodes.count("and.b"):
+    integer_instruction = _u32_binary_instruction(active, "and.b")
+    _require((input_count, float_add_count, opcodes.count("and.b")) == (2, 0, 1) and integer_instruction is not None,
+             "u32 bitwise AND does not consume both global loads")
+    integer_kind = "bitwise AND"
   elif (input_count, float_add_count) == (2, 0):
     integer_instruction = _u32_binary_instruction(active, "add.u")
     _require(integer_instruction is not None, "u32 add does not consume both global loads")
@@ -756,7 +761,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   else:
     _require(comparison_instruction is None, "u32 comparison requires the scalar constant-pointer ABI")
     _require(integer_kind in (None, "add"),
-             "u32 subtraction, multiplication, and bitwise XOR currently require the scalar constant-pointer ABI")
+             "u32 subtraction, multiplication, and bitwise operations currently require the scalar constant-pointer ABI")
     uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
                        "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3 + int(uses_workgroup_id),
@@ -780,6 +785,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "add.u": valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
     elif instruction.opcode == "sub.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "xor.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "and.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "mull.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "madsh.m16": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr", "gpr")
     elif instruction.opcode == "cmps.u.lt":
@@ -867,7 +873,8 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   comparison_instruction = _u32_comparison_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   integer_instruction = multiply_sequence[-1] if multiply_sequence is not None else \
-    _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "xor.b") or _u32_binary_instruction(active, "add.u")
+    _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "xor.b") or \
+    _u32_binary_instruction(active, "and.b") or _u32_binary_instruction(active, "add.u")
   load_ordinals = {instruction.index:index for index,instruction in enumerate(loads)}
   output_base = constants[0] | constants[1] << 32
   input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
@@ -897,16 +904,17 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
           if opcode == "mov.u32":
             value = src[0]
             if instruction.srcs[0].kind == "uim": origin = ("fill", value)
-          elif opcode in {"add.u", "sub.u", "xor.b"}:
+          elif opcode in {"add.u", "sub.u", "xor.b", "and.b"}:
             if opcode == "add.u": value = src[0] + src[1]
             elif opcode == "sub.u": value = src[0] - src[1]
-            else: value = src[0] ^ src[1]
+            elif opcode == "xor.b": value = src[0] ^ src[1]
+            else: value = src[0] & src[1]
             if integer_instruction is not None and instruction.index == integer_instruction.index:
               source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
-              operation = {"add.u":"add", "sub.u":"subtraction", "xor.b":"bitwise XOR"}[opcode]
+              operation = {"add.u":"add", "sub.u":"subtraction", "xor.b":"bitwise XOR", "and.b":"bitwise AND"}[opcode]
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
                        f"u32 {operation} does not consume both global loads")
-              origin = ({"add.u":"u32-add", "sub.u":"u32-subtract", "xor.b":"u32-xor"}[opcode], 0)
+              origin = ({"add.u":"u32-add", "sub.u":"u32-subtract", "xor.b":"u32-xor", "and.b":"u32-and"}[opcode], 0)
           elif opcode == "mull.u":
             value = (src[0] & 0xffff) * (src[1] & 0xffff)
             source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
@@ -982,6 +990,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
               if integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
               elif integer_instruction.opcode == "sub.u": expected_origin,store_source = ("u32-subtract", 0),"u32 subtraction"
               elif integer_instruction.opcode == "xor.b": expected_origin,store_source = ("u32-xor", 0),"u32 bitwise XOR"
+              elif integer_instruction.opcode == "and.b": expected_origin,store_source = ("u32-and", 0),"u32 bitwise AND"
               else: expected_origin,store_source = ("u32-multiply", 0),"u32 multiplication"
             else: expected_origin,store_source = ("load", 0),"global load"
             _require(origins[lane].get(instruction.srcs[1].value) == expected_origin,
