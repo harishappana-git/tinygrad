@@ -177,16 +177,19 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R")):
       return "cov.u16s32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("half", _same_int_field(fields, "SRC")),)
-  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "mull.u", "cmps.u", "add.f"} and _has_no_repeat(fields) and \
-     all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "ABSNEG", "SRC_R")) and \
-     (raw >> 52 & 1, raw >> 46 & 1) == (1, int(name == "cmps.u")):
-    dst = A630IR3Operand("half" if _same_int_field(fields, "DST_HALF") else "gpr", _same_int_field(fields, "DST"))
+  cat2_compare = name in {"cmps.u", "cmps.s"}
+  if category == 2 and name in {"ashr.b", "shl.b", "add.u", "sub.u", "mull.u", "cmps.u", "cmps.s", "add.f"} and \
+     _has_no_repeat(fields) and all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG", "SRC_R")) and \
+     (raw >> 52 & 1, raw >> 46 & 1) == (1, int(cat2_compare)):
+    dst_half = bool(_same_int_field(fields, "DST_HALF"))
+    dst = _register_operand(_same_int_field(fields, "DST"), not dst_half) if cat2_compare else \
+      A630IR3Operand("half" if dst_half else "gpr", _same_int_field(fields, "DST"))
     full = bool(raw >> 52 & 1)
     srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), full),
             _multisrc_operand(_same_int_field(fields, "SRC2"), full))
-    if all(src is not None for src in srcs):
-      opcode = "cmps.u.lt" if name == "cmps.u" and _same_int_field(fields, "COND") == 0 else name
-      if name != "cmps.u" or opcode == "cmps.u.lt":
+    if dst is not None and all(src is not None for src in srcs):
+      opcode = f"{name}.lt" if cat2_compare and _same_int_field(fields, "COND") == 0 else name
+      if not cat2_compare or opcode in {"cmps.u.lt", "cmps.s.lt"}:
         assert srcs[0] is not None and srcs[1] is not None
         return opcode, dst, (srcs[0], srcs[1])
   if category == 3 and name == "madsh.m16" and _has_no_repeat(fields) and \
@@ -225,6 +228,12 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
      _int_field_is(fields, "JP", 0) and raw & ~stg_variable == 0xc0c6010001800000:
     return "stg.u32", None, (A630IR3Operand("gpr", _same_int_field(fields, "SRC1")),
                               A630IR3Operand("gpr", _same_int_field(fields, "SRC3")))
+  if category == 6 and name == "stg" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "TYPE_HALF"),
+                                           _same_int_field(fields, "OFF"), _same_int_field(fields, "SIZE")) == (6, 1, 0, 1) and \
+     _int_field_is(fields, "JP", 0) and raw & ~stg_variable == 0xc0cc010001800000:
+    address,data = _register_operand(_same_int_field(fields, "SRC1"), True), _register_operand(_same_int_field(fields, "SRC3"), False)
+    if address is not None and address.kind == "gpr" and address.value + 1 < 0xc0 and data is not None and data.kind == "half":
+      return "stg.u8", None, (address, data)
   return None, None, ()
 
 def decode_a630_ir3(image:bytes) -> tuple[A630IR3Instruction, ...]:
@@ -633,6 +642,12 @@ def _u32_binary_instruction(instructions:Sequence[A630IR3Instruction], opcode:st
                   len(instruction.srcs) == 2 and frozenset(instruction.srcs) == load_destinations)
   return matches[0] if len(matches) == 1 else None
 
+def _u32_comparison_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3Instruction|None:
+  signed = _u32_binary_instruction(instructions, "cmps.s.lt")
+  unsigned = _u32_binary_instruction(instructions, "cmps.u.lt")
+  if (signed is None) == (unsigned is None): return None
+  return signed or unsigned
+
 def _u32_multiply_sequence(instructions:Sequence[A630IR3Instruction]) \
     -> tuple[A630IR3Instruction, A630IR3Instruction, A630IR3Instruction]|None:
   # Pinned ir3_nir_imul.py lowers imul32 to a low-16 product followed by both low/high cross terms in two MADSH.M16s.
@@ -652,7 +667,7 @@ def _validate_constant_pointer_moves(instructions:Sequence[A630IR3Instruction]) 
                 instruction.srcs[0].kind == "const")
   if not moves: return False
   loads = tuple(instruction for instruction in instructions if instruction.opcode == "ldg.u32")
-  stores = tuple(instruction for instruction in instructions if instruction.opcode == "stg.u32")
+  stores = tuple(instruction for instruction in instructions if instruction.opcode in {"stg.u32", "stg.u8"})
   _require(len(stores) == 1 and len(moves) == 2 * (len(loads) + 1), "unsupported A630 constant-pointer move inventory")
   destinations:dict[int, int] = {}
   for instruction in moves:
@@ -690,8 +705,13 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require((input_count, float_add_count) in ((0, 0), (1, 0), (1, 1), (2, 0), (2, 1)), "unsupported A630 scalar kernel shape")
   integer_instruction:A630IR3Instruction|None = None
   integer_kind:str|None = None
+  comparison_instruction = _u32_comparison_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
-  if opcodes.count("mull.u") or opcodes.count("madsh.m16"):
+  comparison_count = opcodes.count("cmps.s.lt") + opcodes.count("cmps.u.lt")
+  if opcodes.count("stg.u8"):
+    _require((input_count, float_add_count, comparison_count, opcodes.count("stg.u8")) == (2, 0, 1, 1) and
+             comparison_instruction is not None, "u32 comparison does not consume both global loads")
+  elif opcodes.count("mull.u") or opcodes.count("madsh.m16"):
     _require((input_count, float_add_count, opcodes.count("mull.u"), opcodes.count("madsh.m16")) == (2, 0, 1, 2) and
              multiply_sequence is not None, "u32 multiplication sequence does not consume both global loads")
     assert multiply_sequence is not None
@@ -712,16 +732,20 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
   elif uses_constant_pointers:
-    _require(integer_instruction is not None and not shared_uses,
-             "constant-pointer A630 execution supports only scalar u32 addition, subtraction, or multiplication")
-    assert integer_instruction is not None
-    assert integer_instruction.opcode is not None
+    _require((integer_instruction is not None or comparison_instruction is not None) and not shared_uses,
+             "constant-pointer A630 execution supports only scalar u32 arithmetic or comparison")
     _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
              "constant-pointer A630 execution requires one scalar invocation")
-    expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, "stg.u32":1, "end":1}
-    if integer_kind == "multiply": expected_counts.update({"mull.u":1, "madsh.m16":2})
-    else: expected_counts[integer_instruction.opcode] = 1
+    if comparison_instruction is not None:
+      assert comparison_instruction.opcode is not None
+      expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, comparison_instruction.opcode:1, "stg.u8":1, "end":1}
+    else:
+      assert integer_instruction is not None and integer_instruction.opcode is not None
+      expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, "stg.u32":1, "end":1}
+      if integer_kind == "multiply": expected_counts.update({"mull.u":1, "madsh.m16":2})
+      else: expected_counts[integer_instruction.opcode] = 1
   else:
+    _require(comparison_instruction is None, "u32 comparison requires the scalar constant-pointer ABI")
     _require(integer_kind in (None, "add"), "u32 subtraction and multiplication currently require the scalar constant-pointer ABI")
     uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
@@ -747,13 +771,19 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "sub.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "mull.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "madsh.m16": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr", "gpr")
-    elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
+    elif instruction.opcode == "cmps.u.lt":
+      valid = dst_kind == "half" and (src_kinds == ("gpr", "const") or
+              comparison_instruction is not None and instruction.index == comparison_instruction.index and src_kinds == ("gpr", "gpr"))
+    elif instruction.opcode == "cmps.s.lt":
+      valid = dst_kind == "half" and comparison_instruction is not None and instruction.index == comparison_instruction.index and \
+              src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
     elif instruction.opcode == "ldg.u32": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
     elif instruction.opcode == "add.f":
       valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or
               (set(src_kinds) == {"gpr", "flut"} and next(x.value for x in instruction.srcs if x.kind == "flut") in (2, 3)))
     elif instruction.opcode == "stg.u32": valid = dst_kind is None and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "stg.u8": valid = dst_kind is None and src_kinds == ("gpr", "half")
     _require(valid, f"unsupported A630 operand contract at instruction {instruction.index}")
 
   if integer_instruction is not None:
@@ -761,6 +791,10 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
     assert integer_kind is not None
     _require(store.srcs[1] == integer_instruction.dst, f"global store does not consume the u32 {integer_kind}")
+  if comparison_instruction is not None:
+    assert comparison_instruction.dst is not None
+    store = next(instruction for instruction in active if instruction.opcode == "stg.u8")
+    _require(store.srcs[1] == comparison_instruction.dst, "global store does not consume the u32 comparison")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
   expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
@@ -785,12 +819,12 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     for operand in operands:
       if operand.kind == "gpr": full_registers.append(operand.value)
       elif operand.kind == "half": half_registers.append(operand.value)
-    if instruction.opcode in {"ldg.u32", "stg.u32"}: full_registers.append(instruction.srcs[0].value + 1)
+    if instruction.opcode in {"ldg.u32", "stg.u32", "stg.u8"}: full_registers.append(instruction.srcs[0].value + 1)
   _require(all(0 <= register < 0xc0 for register in full_registers + half_registers), "unsupported shared or special IR3 register")
 
   pending_carries:set[int] = set()
   for instruction in active:
-    if instruction.opcode == "cmps.u.lt":
+    if instruction.opcode == "cmps.u.lt" and (comparison_instruction is None or instruction.index != comparison_instruction.index):
       assert instruction.dst is not None
       _require(instruction.dst.value not in pending_carries, "overwritten A630 carry comparison")
       pending_carries.add(instruction.dst.value)
@@ -819,13 +853,16 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
   loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
+  comparison_instruction = _u32_comparison_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   integer_instruction = multiply_sequence[-1] if multiply_sequence is not None else \
     _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "add.u")
   load_ordinals = {instruction.index:index for index,instruction in enumerate(loads)}
   output_base = constants[0] | constants[1] << 32
   input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
-  _require(all(base != 0 and base % 4 == 0 and base + invocation_count * 4 <= 1 << 64 for base in (output_base, *input_bases)),
+  output_itemsize = 1 if comparison_instruction is not None else 4
+  _require(output_base != 0 and output_base + invocation_count * output_itemsize <= 1 << 64 and
+           all(base != 0 and base % 4 == 0 and base + invocation_count * 4 <= 1 << 64 for base in input_bases),
            "invalid A630 scalar argument range")
   writes:list[A630ExecutionWrite] = []
 
@@ -833,11 +870,12 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
     full = [({lid:lane, lid+1:0, lid+2:0} if lid != 0xfc else {}) for lane in range(lane_count)]
     half:list[dict[int, int]] = [{} for _ in range(lane_count)]
     origins:list[dict[int, tuple[str, int]]] = [{} for _ in range(lane_count)]
+    half_origins:list[dict[int, tuple[str, int]]] = [{} for _ in range(lane_count)]
     shared = {} if wgid == 0xfc else {wgid:group, wgid+1:0, wgid+2:0}
     for instruction in dispatch.instructions:
       if instruction.opcode == "end": break
       if instruction.opcode == "nop": continue
-      _require((instruction.opcode is not None and instruction.dst is not None) or instruction.opcode == "stg.u32",
+      _require((instruction.opcode is not None and instruction.dst is not None) or instruction.opcode in {"stg.u32", "stg.u8"},
                f"unsupported A630 semantic at instruction {instruction.index}")
       for lane in range(lane_count):
         global_lane = group * lane_count + lane
@@ -880,7 +918,17 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
             value = signed >> (src[1] & 31)
           elif opcode == "shrg": value = (src[1] >> (src[0] & 31)) | src[2]
-          elif opcode == "cmps.u.lt": value = int(src[0] < src[1])
+          elif opcode in {"cmps.s.lt", "cmps.u.lt"}:
+            left,right = src
+            if opcode == "cmps.s.lt":
+              left = left - (1 << 32) if left & 0x80000000 else left
+              right = right - (1 << 32) if right & 0x80000000 else right
+            value = int(left < right)
+            if comparison_instruction is not None and instruction.index == comparison_instruction.index:
+              source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
+              _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
+                       "u32 comparison does not consume both global loads")
+              origin = ("s32-less-than" if opcode == "cmps.s.lt" else "u32-less-than", 0)
           elif opcode == "cov.u16s32": value = src[0] & 0xffff
           elif opcode == "add.f":
             source_origins = tuple(("flut", operand.value) if operand.kind == "flut" else origins[lane].get(operand.value)
@@ -927,12 +975,30 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             _require(len(view) == 4, "short A630 global-store range")
             writes.append(A630ExecutionWrite(address, struct.pack("<I", src[1])))
             continue
+          elif opcode == "stg.u8":
+            _require(comparison_instruction is not None and comparison_instruction.opcode is not None,
+                     "u32 comparison store lacks a comparison")
+            assert comparison_instruction is not None
+            base = instruction.srcs[0].value
+            address = full[lane][base] | full[lane][base + 1] << 32
+            _require(address == output_base + global_lane, "global store does not address the scalar bool output")
+            expected_origin = ("s32-less-than" if comparison_instruction.opcode == "cmps.s.lt" else "u32-less-than", 0)
+            _require(half_origins[lane].get(instruction.srcs[1].value) == expected_origin,
+                     "global store does not consume the u32 comparison")
+            _require(src[1] in (0, 1), "u32 comparison result is not boolean")
+            view = resolver(address, 1)
+            _require(len(view) == 1, "short A630 global-store range")
+            writes.append(A630ExecutionWrite(address, bytes((src[1],))))
+            continue
           else: raise ValueError(f"unsupported A630 opcode {opcode}")
           assert instruction.dst is not None
           _write_ir3_operand(instruction.dst, value, full[lane], half[lane])
           if instruction.dst.kind == "gpr":
             if origin is None: origins[lane].pop(instruction.dst.value, None)
             else: origins[lane][instruction.dst.value] = origin
+          elif instruction.dst.kind == "half":
+            if origin is None: half_origins[lane].pop(instruction.dst.value, None)
+            else: half_origins[lane][instruction.dst.value] = origin
         except (KeyError, ValueError, RuntimeError) as error:
           raise ValueError(f"A630 instruction {instruction.index} lane {lane} group {group}: {error}") from error
 
