@@ -1509,10 +1509,12 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) -
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
 
-  def test_production_integer_xor_uses_mapped_machine_bytes(self):
+  def _assert_production_integer_bitwise_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, operation,
+                                                                   cases, mutation_opcode, mutation_opcode_bits,
+                                                                   mutation_expected):
     import struct
     from dataclasses import replace
-    from tinygrad import Device, Tensor, dtypes
+    from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
     from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import decode_a630_ir3
@@ -1527,25 +1529,15 @@ class TestQCOMDriver(unittest.TestCase):
       command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
       return real_plan(fd, submission, command_address, command_size)
 
-    cases = ((dtypes.int, 0, 0, 0),
-             (dtypes.int, -1, 0, -1),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, -1),
-             (dtypes.int, dtypes.int.min, -1, dtypes.int.max),
-             (dtypes.int, -1431655766, 252645135, -1515870811),
-             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
-             (dtypes.uint, 0x80000000, 0x7fffffff, dtypes.uint.max),
-             (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xa5a5a5a5),
-             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 0),
-             (dtypes.uint, dtypes.uint.max, 1, 0xfffffffe))
     actual,live_tensors = [],[]
     with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
          mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
       for dtype,left,right,_ in cases:
         lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
-        result = (lhs ^ rhs).realize()
+        result = tensor_operator(lhs, rhs).realize()
         live_tensors.append((lhs, rhs, result))
         actual.append(result.tolist())
-    reference = [(Tensor([left], dtype=dtype, device="PYTHON") ^ Tensor([right], dtype=dtype, device="PYTHON")).tolist()
+    reference = [tensor_operator(Tensor([left], dtype=dtype, device="PYTHON"), Tensor([right], dtype=dtype, device="PYTHON")).tolist()
                  for dtype,left,right,_ in cases]
 
     self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
@@ -1559,18 +1551,19 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
       loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
       stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
-      xors = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "xor.b")
+      bitwise_instructions = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == opcode)
       pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
                             instruction.srcs[0].kind == "const")
-      self.assertEqual((len(loads), len(stores), len(xors), len(pointer_moves)), (2, 1, 1, 6))
-      self.assertEqual((xors[0].raw >> 61, xors[0].raw >> 53 & 0x3f, xors[0].srcs),
-                       (2, 0x1f, (loads[0].dst, loads[1].dst)))
-      self.assertIsNotNone(xors[0].dst)
-      assert xors[0].dst is not None
-      self.assertEqual(xors[0].dst.kind, "gpr")
-      self.assertEqual(stores[0].srcs[1], xors[0].dst)
-      self.assertTrue({("NAME", "xor.b"), ("SY", 1), ("SS", 0), ("NOP", 3), ("DST_HALF", 0),
-                       ("JP", 0), ("SAT", 0), ("UL", 0), ("EI", 0)} <= set(xors[0].fields))
+      self.assertEqual((len(loads), len(stores), len(bitwise_instructions), len(pointer_moves)), (2, 1, 1, 6))
+      bitwise = bitwise_instructions[0]
+      self.assertEqual((bitwise.raw >> 61, bitwise.raw >> 53 & 0x3f, bitwise.srcs),
+                       (2, opcode_bits, (loads[0].dst, loads[1].dst)))
+      self.assertIsNotNone(bitwise.dst)
+      assert bitwise.dst is not None
+      self.assertEqual(bitwise.dst.kind, "gpr")
+      self.assertEqual(stores[0].srcs[1], bitwise.dst)
+      self.assertTrue({("NAME", opcode), ("SY", 1), ("SS", 0), ("NOP", 3), ("DST_HALF", 0),
+                       ("JP", 0), ("SAT", 0), ("UL", 0), ("EI", 0)} <= set(bitwise.fields))
       self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
       destinations = {}
       for instruction in pointer_moves:
@@ -1579,34 +1572,36 @@ class TestQCOMDriver(unittest.TestCase):
       bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
       self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
                        tuple((base, base+1) for base in bases))
-      decoded_dispatches.append((dispatch, xors[0], stores[0]))
+      decoded_dispatches.append((dispatch, bitwise, stores[0]))
 
-    # Changing only the Cat2 opcode to the already-supported ADD.U leaf changes uint.max XOR 1 from 0xfffffffe to wrapped zero.
+    # The newest command avoids replaying a stale historical EVENT_WRITE after the numerical matrix.
     case_index = len(cases) - 1
+    self.assertNotEqual(mutation_expected, cases[case_index][3] & 0xffffffff)
     submission = submissions[case_index]
-    dispatch,xor,store = decoded_dispatches[case_index]
+    dispatch,bitwise,store = decoded_dispatches[case_index]
     shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[xor.index*8:(xor.index+1)*8])
+    original = bytes(shader[bitwise.index*8:(bitwise.index+1)*8])
     output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
     request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
     try:
-      add_raw = xor.raw & ~(0x3f << 53) | 0x10 << 53
-      self.assertEqual((add_raw >> 53 & 0x3f, add_raw & ~(0x3f << 53)), (0x10, xor.raw & ~(0x3f << 53)))
-      struct.pack_into("<Q", shader, xor.index * 8, add_raw)
-      mutated = decode_a630_ir3(bytes(shader))[xor.index]
-      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), ("add.u", xor.dst, xor.srcs))
-      output[:] = b"\xff" * 4
+      mutation_raw = bitwise.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
+      self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
+                       (mutation_opcode_bits, bitwise.raw & ~(0x3f << 53)))
+      struct.pack_into("<Q", shader, bitwise.index * 8, mutation_raw)
+      mutated = decode_a630_ir3(bytes(shader))[bitwise.index]
+      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, bitwise.dst, bitwise.srcs))
+      output[:] = struct.pack("<I", mutation_expected ^ 0xffffffff)
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual(struct.unpack("<I", output)[0], 0)
+      self.assertEqual(struct.unpack("<I", output)[0], mutation_expected)
       self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
     finally:
-      shader[xor.index*8:(xor.index+1)*8] = original
+      shader[bitwise.index*8:(bitwise.index+1)*8] = original
       self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[xor.index*8:(xor.index+1)*8]), original)
+    self.assertEqual(bytes(shader[bitwise.index*8:(bitwise.index+1)*8]), original)
 
-    def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message):
+    def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message, *, expected_name=None):
       original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
       request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
       request.timestamp = marker = 0x27182818 + instruction.index
@@ -1619,7 +1614,7 @@ class TestQCOMDriver(unittest.TestCase):
         mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
         mutated = mutated_dispatch.instructions[instruction.index]
         self.assertEqual((mutated.opcode, mutated.srcs), (expected_opcode, expected_srcs))
-        if expected_opcode is None: self.assertEqual(mutated.name, "or.b")
+        if expected_name is not None: self.assertEqual(mutated.name, expected_name)
         with self.assertRaisesRegex(ValueError, message):
           real_execute(replace(submission, dispatches=(mutated_dispatch,)),
                        lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
@@ -1631,37 +1626,41 @@ class TestQCOMDriver(unittest.TestCase):
         self.device._gpu_free(request_buffer)
       self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
 
-    src1 = xor.raw & 0xffff
-    reject_mapped_mutation(xor, xor.raw & ~(0xffff << 16) | src1 << 16, "xor.b", (xor.srcs[0], xor.srcs[0]),
-                           "u32 bitwise XOR does not consume both global loads")
+    dataflow_message = f"u32 {operation} does not consume both global loads"
+    src1 = bitwise.raw & 0xffff
+    reject_mapped_mutation(bitwise, bitwise.raw & ~(0xffff << 16) | src1 << 16,
+                           opcode, (bitwise.srcs[0], bitwise.srcs[0]), dataflow_message)
     nop = next(instruction for instruction in dispatch.instructions if instruction.opcode == "nop")
-    reject_mapped_mutation(nop, xor.raw, "xor.b", xor.srcs, "u32 bitwise XOR does not consume both global loads")
-    redirected = next(operand for operand in xor.srcs if operand != xor.dst)
+    reject_mapped_mutation(nop, bitwise.raw, opcode, bitwise.srcs, dataflow_message)
+    redirected = next(operand for operand in bitwise.srcs if operand != bitwise.dst)
     reject_mapped_mutation(store, store.raw & ~(0xff << 1) | redirected.value << 1, "stg.u32",
-                           (store.srcs[0], redirected), "global store does not consume the u32 bitwise XOR")
-    reject_mapped_mutation(xor, xor.raw & ~(0x3f << 53) | 0x1d << 53, None, (),
-                           f"unsupported A630 semantic at instruction {xor.index}")
-    self.assertEqual((Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT) ^
-                      Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xa5a5a5a5])
+                           (store.srcs[0], redirected), f"global store does not consume the u32 {operation}")
+    reject_mapped_mutation(bitwise, bitwise.raw & ~(0x3f << 53) | 0x1d << 53, None, (),
+                           f"unsupported A630 semantic at instruction {bitwise.index}", expected_name="or.b")
+
+  def test_production_integer_xor_uses_mapped_machine_bytes(self):
+    import operator
+    from tinygrad import Device, Tensor, dtypes
+    cases = ((dtypes.int, 0, 0, 0),
+             (dtypes.int, -1, 0, -1),
+             (dtypes.int, dtypes.int.min, dtypes.int.max, -1),
+             (dtypes.int, dtypes.int.min, -1, dtypes.int.max),
+             (dtypes.int, -1431655766, 252645135, -1515870811),
+             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
+             (dtypes.uint, 0x80000000, 0x7fffffff, dtypes.uint.max),
+             (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xa5a5a5a5),
+             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 0),
+             (dtypes.uint, dtypes.uint.max, 1, 0xfffffffe))
+    # The opcode-only ADD.U mutation changes uint.max XOR 1 from 0xfffffffe to wrapped zero.
+    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+      tensor_operator=operator.xor, opcode="xor.b", opcode_bits=0x1f, operation="bitwise XOR", cases=cases,
+      mutation_opcode="add.u", mutation_opcode_bits=0x10, mutation_expected=0)
+    self.assertEqual(operator.xor(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
+                                  Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xa5a5a5a5])
 
   def test_production_integer_and_uses_mapped_machine_bytes(self):
-    import struct
-    from dataclasses import replace
+    import operator
     from tinygrad import Device, Tensor, dtypes
-    from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom import qcomdriver
-    from test.mockgpu.qcom.a630 import decode_a630_ir3
-
-    submissions,command_images = [],[]
-    real_execute = qcomdriver.execute_a630
-    real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver):
-      submissions.append(submission)
-      return real_execute(submission, resolver)
-    def capture_plan(fd, submission, command_address, command_size):
-      command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
-      return real_plan(fd, submission, command_address, command_size)
-
     cases = ((dtypes.int, 0, 0, 0),
              (dtypes.int, -1, 0, 0),
              (dtypes.int, -1, 1, 1),
@@ -1672,114 +1671,12 @@ class TestQCOMDriver(unittest.TestCase):
              (dtypes.uint, 0x80000000, 0x7fffffff, 0),
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0x0a0a0a0a),
              (dtypes.uint, dtypes.uint.max, 0x80000001, 0x80000001))
-    actual,live_tensors = [],[]
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
-         mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
-      for dtype,left,right,_ in cases:
-        lhs,rhs = Tensor([left], dtype=dtype, device=Device.DEFAULT).realize(), Tensor([right], dtype=dtype, device=Device.DEFAULT).realize()
-        result = (lhs & rhs).realize()
-        live_tensors.append((lhs, rhs, result))
-        actual.append(result.tolist())
-    reference = [(Tensor([left], dtype=dtype, device="PYTHON") & Tensor([right], dtype=dtype, device="PYTHON")).tolist()
-                 for dtype,left,right,_ in cases]
-
-    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
-                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
-    self.assertEqual(actual, reference)
-    self.assertEqual(actual, [[expected] for *_,expected in cases])
-    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
-    decoded_dispatches = []
-    for submission in submissions:
-      dispatch = submission.dispatches[0]
-      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
-      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
-      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
-      ands = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "and.b")
-      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
-                            instruction.srcs[0].kind == "const")
-      self.assertEqual((len(loads), len(stores), len(ands), len(pointer_moves)), (2, 1, 1, 6))
-      self.assertEqual((ands[0].raw >> 61, ands[0].raw >> 53 & 0x3f, ands[0].srcs),
-                       (2, 0x1c, (loads[0].dst, loads[1].dst)))
-      self.assertIsNotNone(ands[0].dst)
-      assert ands[0].dst is not None
-      self.assertEqual(ands[0].dst.kind, "gpr")
-      self.assertEqual(stores[0].srcs[1], ands[0].dst)
-      self.assertTrue({("NAME", "and.b"), ("SY", 1), ("SS", 0), ("NOP", 3), ("DST_HALF", 0),
-                       ("JP", 0), ("SAT", 0), ("UL", 0), ("EI", 0)} <= set(ands[0].fields))
-      self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
-      destinations = {}
-      for instruction in pointer_moves:
-        assert instruction.dst is not None
-        destinations[instruction.srcs[0].value] = instruction.dst.value
-      bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
-      self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
-                       tuple((base, base+1) for base in bases))
-      decoded_dispatches.append((dispatch, ands[0], stores[0]))
-
-    # Changing only the Cat2 opcode to the supported XOR.B leaf changes uint.max AND 0x80000001 to 0x7ffffffe.
-    case_index = len(cases) - 1
-    submission = submissions[case_index]
-    dispatch,bitwise_and,store = decoded_dispatches[case_index]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[bitwise_and.index*8:(bitwise_and.index+1)*8])
-    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
-    output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    timestamp_before = self.driver.context_timestamps[self.device.ctx]
-    try:
-      xor_raw = bitwise_and.raw & ~(0x3f << 53) | 0x1f << 53
-      self.assertEqual((xor_raw >> 53 & 0x3f, xor_raw & ~(0x3f << 53)), (0x1f, bitwise_and.raw & ~(0x3f << 53)))
-      struct.pack_into("<Q", shader, bitwise_and.index * 8, xor_raw)
-      mutated = decode_a630_ir3(bytes(shader))[bitwise_and.index]
-      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), ("xor.b", bitwise_and.dst, bitwise_and.srcs))
-      output[:] = bytes(4)
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual(struct.unpack("<I", output)[0], 0x7ffffffe)
-      self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
-    finally:
-      shader[bitwise_and.index*8:(bitwise_and.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[bitwise_and.index*8:(bitwise_and.index+1)*8]), original)
-
-    def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message):
-      original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
-      request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-      request.timestamp = marker = 0x31415926 + instruction.index
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                      self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
-        mutated = mutated_dispatch.instructions[instruction.index]
-        self.assertEqual((mutated.opcode, mutated.srcs), (expected_opcode, expected_srcs))
-        if expected_opcode is None: self.assertEqual(mutated.name, "or.b")
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                          self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original_instruction
-        self.device._gpu_free(request_buffer)
-      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
-
-    src1 = bitwise_and.raw & 0xffff
-    reject_mapped_mutation(bitwise_and, bitwise_and.raw & ~(0xffff << 16) | src1 << 16,
-                           "and.b", (bitwise_and.srcs[0], bitwise_and.srcs[0]),
-                           "u32 bitwise AND does not consume both global loads")
-    nop = next(instruction for instruction in dispatch.instructions if instruction.opcode == "nop")
-    reject_mapped_mutation(nop, bitwise_and.raw, "and.b", bitwise_and.srcs,
-                           "u32 bitwise AND does not consume both global loads")
-    redirected = next(operand for operand in bitwise_and.srcs if operand != bitwise_and.dst)
-    reject_mapped_mutation(store, store.raw & ~(0xff << 1) | redirected.value << 1, "stg.u32",
-                           (store.srcs[0], redirected), "global store does not consume the u32 bitwise AND")
-    reject_mapped_mutation(bitwise_and, bitwise_and.raw & ~(0x3f << 53) | 0x1d << 53, None, (),
-                           f"unsupported A630 semantic at instruction {bitwise_and.index}")
-    self.assertEqual((Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT) &
-                      Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x0a0a0a0a])
+    # The opcode-only XOR.B mutation changes uint.max AND 0x80000001 from 0x80000001 to 0x7ffffffe.
+    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+      tensor_operator=operator.and_, opcode="and.b", opcode_bits=0x1c, operation="bitwise AND", cases=cases,
+      mutation_opcode="xor.b", mutation_opcode_bits=0x1f, mutation_expected=0x7ffffffe)
+    self.assertEqual(operator.and_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
+                                   Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x0a0a0a0a])
 
   def test_production_integer_multiply_wraps_from_mapped_machine_bytes(self):
     import struct
