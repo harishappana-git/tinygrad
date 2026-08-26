@@ -106,6 +106,15 @@ class A630Submission:
 Resolver = Callable[[int, int], memoryview]
 _MAX_INVOCATIONS = 0x10000
 
+# These labels bind scalar admission, producer provenance, and store validation; arithmetic remains explicit in execute_a630.
+_SIMPLE_CAT2_INTEGER:dict[str, tuple[str, str]] = {
+  "shr.b": ("logical right shift", "u32-logical-right-shift"),
+  "sub.u": ("subtraction", "u32-subtract"),
+  "xor.b": ("bitwise XOR", "u32-xor"),
+  "and.b": ("bitwise AND", "u32-and"),
+  "or.b": ("bitwise OR", "u32-or"),
+}
+
 def _require(condition:bool, message:str):
   if not condition: raise ValueError(message)
 
@@ -714,6 +723,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   comparison_instruction = _u32_comparison_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   comparison_count = sum(opcodes.count(opcode) for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"))
+  simple_opcode = next((opcode for opcode in _SIMPLE_CAT2_INTEGER if opcodes.count(opcode)), None)
   if opcodes.count("stg.u8"):
     _require((input_count, float_add_count, comparison_count, opcodes.count("stg.u8")) == (2, 0, 1, 1) and
              comparison_instruction is not None, "u32 comparison does not consume both global loads")
@@ -722,31 +732,11 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
              multiply_sequence is not None, "u32 multiplication sequence does not consume both global loads")
     assert multiply_sequence is not None
     integer_instruction,integer_kind = multiply_sequence[-1],"multiply"
-  elif opcodes.count("shr.b"):
-    integer_instruction = _u32_binary_instruction(active, "shr.b")
-    _require((input_count, float_add_count, opcodes.count("shr.b")) == (2, 0, 1) and integer_instruction is not None,
-             "u32 logical right shift does not consume both global loads")
-    integer_kind = "logical right shift"
-  elif opcodes.count("sub.u"):
-    integer_instruction = _u32_binary_instruction(active, "sub.u")
-    _require((input_count, float_add_count, opcodes.count("sub.u")) == (2, 0, 1) and integer_instruction is not None,
-             "u32 subtraction does not consume both global loads")
-    integer_kind = "subtraction"
-  elif opcodes.count("xor.b"):
-    integer_instruction = _u32_binary_instruction(active, "xor.b")
-    _require((input_count, float_add_count, opcodes.count("xor.b")) == (2, 0, 1) and integer_instruction is not None,
-             "u32 bitwise XOR does not consume both global loads")
-    integer_kind = "bitwise XOR"
-  elif opcodes.count("and.b"):
-    integer_instruction = _u32_binary_instruction(active, "and.b")
-    _require((input_count, float_add_count, opcodes.count("and.b")) == (2, 0, 1) and integer_instruction is not None,
-             "u32 bitwise AND does not consume both global loads")
-    integer_kind = "bitwise AND"
-  elif opcodes.count("or.b"):
-    integer_instruction = _u32_binary_instruction(active, "or.b")
-    _require((input_count, float_add_count, opcodes.count("or.b")) == (2, 0, 1) and integer_instruction is not None,
-             "u32 bitwise OR does not consume both global loads")
-    integer_kind = "bitwise OR"
+  elif simple_opcode is not None:
+    integer_kind,_ = _SIMPLE_CAT2_INTEGER[simple_opcode]
+    integer_instruction = _u32_binary_instruction(active, simple_opcode)
+    _require((input_count, float_add_count, opcodes.count(simple_opcode)) == (2, 0, 1) and integer_instruction is not None,
+             f"u32 {integer_kind} does not consume both global loads")
   elif opcodes.count("max.s") or opcodes.count("max.u"):
     integer_instruction = _u32_binary_instruction(active, "max.s") or _u32_binary_instruction(active, "max.u")
     maximum_count = opcodes.count("max.s") + opcodes.count("max.u")
@@ -804,11 +794,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     elif instruction.opcode == "shrg": valid = dst_kind == "gpr" and src_kinds == ("iim", "gpr", "gpr") and instruction.srcs[0].value == 30
     elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("shared",), ("const",), ("uim",))
     elif instruction.opcode == "add.u": valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
-    elif instruction.opcode == "sub.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
-    elif instruction.opcode == "shr.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
-    elif instruction.opcode == "xor.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
-    elif instruction.opcode == "and.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
-    elif instruction.opcode == "or.b": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode in _SIMPLE_CAT2_INTEGER: valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode in {"max.s", "max.u"}: valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "mull.u": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "madsh.m16": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr", "gpr")
@@ -930,7 +916,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
           if opcode == "mov.u32":
             value = src[0]
             if instruction.srcs[0].kind == "uim": origin = ("fill", value)
-          elif opcode in {"add.u", "sub.u", "shr.b", "max.s", "max.u", "xor.b", "and.b", "or.b"}:
+          elif opcode in _SIMPLE_CAT2_INTEGER or opcode in {"add.u", "max.s", "max.u"}:
             if opcode == "add.u": value = src[0] + src[1]
             elif opcode == "sub.u": value = src[0] - src[1]
             elif opcode == "shr.b":
@@ -943,17 +929,19 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
               value = src[0] if signed_sources[0] >= signed_sources[1] else src[1]
             elif opcode == "xor.b": value = src[0] ^ src[1]
             elif opcode == "and.b": value = src[0] & src[1]
-            else: value = src[0] | src[1]
+            elif opcode == "or.b": value = src[0] | src[1]
+            else: raise ValueError(f"unsupported simple Cat2 integer opcode {opcode}")
             if integer_instruction is not None and instruction.index == integer_instruction.index:
               source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
-              operation = {"add.u":"u32 add", "sub.u":"u32 subtraction", "shr.b":"u32 logical right shift",
-                           "max.s":"s32 maximum", "max.u":"u32 maximum",
-                           "xor.b":"u32 bitwise XOR", "and.b":"u32 bitwise AND", "or.b":"u32 bitwise OR"}[opcode]
+              if opcode in _SIMPLE_CAT2_INTEGER:
+                integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[opcode]
+                operation = f"u32 {integer_kind}"
+              else:
+                operation = {"add.u":"u32 add", "max.s":"s32 maximum", "max.u":"u32 maximum"}[opcode]
+                origin_tag = {"add.u":"u32-add", "max.s":"s32-maximum", "max.u":"u32-maximum"}[opcode]
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
                        f"{operation} does not consume both global loads")
-              origin = ({"add.u":"u32-add", "sub.u":"u32-subtract", "shr.b":"u32-logical-right-shift",
-                         "max.s":"s32-maximum", "max.u":"u32-maximum",
-                         "xor.b":"u32-xor", "and.b":"u32-and", "or.b":"u32-or"}[opcode], 0)
+              origin = (origin_tag, 0)
           elif opcode == "mull.u":
             value = (src[0] & 0xffff) * (src[1] & 0xffff)
             source_origins = tuple(origins[lane].get(operand.value) for operand in instruction.srcs)
@@ -1026,13 +1014,10 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
             elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
             elif integer_instruction is not None:
-              if integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
-              elif integer_instruction.opcode == "sub.u": expected_origin,store_source = ("u32-subtract", 0),"u32 subtraction"
-              elif integer_instruction.opcode == "shr.b":
-                expected_origin,store_source = ("u32-logical-right-shift", 0),"u32 logical right shift"
-              elif integer_instruction.opcode == "xor.b": expected_origin,store_source = ("u32-xor", 0),"u32 bitwise XOR"
-              elif integer_instruction.opcode == "and.b": expected_origin,store_source = ("u32-and", 0),"u32 bitwise AND"
-              elif integer_instruction.opcode == "or.b": expected_origin,store_source = ("u32-or", 0),"u32 bitwise OR"
+              if integer_instruction.opcode in _SIMPLE_CAT2_INTEGER:
+                integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[integer_instruction.opcode]
+                expected_origin,store_source = (origin_tag, 0),f"u32 {integer_kind}"
+              elif integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
               elif integer_instruction.opcode == "max.s": expected_origin,store_source = ("s32-maximum", 0),"s32 maximum"
               elif integer_instruction.opcode == "max.u": expected_origin,store_source = ("u32-maximum", 0),"u32 maximum"
               else: expected_origin,store_source = ("u32-multiply", 0),"u32 multiplication"
