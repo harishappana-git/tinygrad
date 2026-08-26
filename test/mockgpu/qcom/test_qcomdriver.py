@@ -22,6 +22,9 @@ class TestQCOMDriver(unittest.TestCase):
     return next((allocation for allocation in self.driver.allocations.values()
                  if allocation.addr is not None and allocation.addr <= addr and addr + size <= allocation.addr + allocation.size), None)
 
+  def _resolve_owned(self, address, size):
+    return self.driver.resolve_owned(self.device.fd.fd, address, size)
+
   def gpu_command(self, words):
     from tinygrad.runtime.autogen import kgsl
     buffer = self.device._gpu_alloc(len(words) * 4, fill_zeroes=True)
@@ -46,6 +49,46 @@ class TestQCOMDriver(unittest.TestCase):
     with mock.patch.object(qcomdriver, "execute_a630", side_effect=capture_execution), \
          mock.patch.object(self.driver, "_plan_a630_retirement", side_effect=capture_plan):
       yield submissions,command_images,real_execute
+
+  @contextlib.contextmanager
+  def _mutate_a630_replay(self, submission, command_words, edits, *, timestamp=None):
+    import struct
+    from dataclasses import replace
+    from test.mockgpu.qcom.a630 import decode_a630_ir3
+    edits = tuple(edits)
+    self.assertEqual(len(submission.dispatches), 1)
+    self.assertTrue(edits)
+    dispatch = submission.dispatches[0]
+    shader = self._resolve_owned(dispatch.shader_address, dispatch.shader_size)
+    self.assertEqual(bytes(shader), dispatch.shader_image)
+    self.assertEqual(len({instruction.index for instruction,_ in edits}), len(edits))
+    for instruction,raw in edits:
+      self.assertTrue(0 <= instruction.index < len(dispatch.instructions))
+      self.assertLessEqual((instruction.index + 1) * 8, len(shader))
+      self.assertEqual(dispatch.instructions[instruction.index], instruction)
+      self.assertNotEqual(raw, instruction.raw)
+      self.assertTrue(0 <= raw < 1 << 64)
+    originals = tuple(bytes(shader[instruction.index*8:(instruction.index+1)*8]) for instruction,_ in edits)
+    request_buffer,_,request = self.gpu_command(command_words)
+    if timestamp is not None: request.timestamp = timestamp
+    try:
+      for instruction,raw in edits: struct.pack_into("<Q", shader, instruction.index * 8, raw)
+      image = bytes(shader)
+      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      yield replace(submission, dispatches=(mutated_dispatch,)),mutated_dispatch,request
+    finally:
+      for (instruction,_),original in zip(edits, originals):
+        shader[instruction.index*8:(instruction.index+1)*8] = original
+      self.device._gpu_free(request_buffer)
+      self.assertEqual((tuple(bytes(shader[instruction.index*8:(instruction.index+1)*8]) for instruction,_ in edits), bytes(shader)),
+                       (originals, dispatch.shader_image))
+
+  def _assert_a630_transactional_rejection(self, *, execute, submission, request, message, marker, state):
+    from tinygrad.runtime.autogen import kgsl
+    before = state()
+    with self.assertRaisesRegex(ValueError, message): execute(submission, self._resolve_owned)
+    with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+    self.assertEqual((request.timestamp, state()), (marker, before))
 
   def test_production_backend_identity_and_initialization(self):
     from tinygrad.device import Device
@@ -1455,7 +1498,6 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_production_vector_fill_and_add_use_mapped_machine_bytes(self):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
@@ -1571,7 +1613,6 @@ class TestQCOMDriver(unittest.TestCase):
     control_index = next(index for index,(size,*_) in enumerate(prepared) if size == 128)
     control_size = prepared[control_index][0]
     submission,dispatch = submissions[control_index],submissions[control_index].dispatches[0]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
     output_base,input0_base,input1_base = struct.unpack_from("<3Q", dispatch.constants_image)
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, control_size * 4)
     inputs = (self.driver.resolve_owned(self.device.fd.fd, input0_base, control_size * 4),
@@ -1593,12 +1634,10 @@ class TestQCOMDriver(unittest.TestCase):
     command_words = struct.unpack(f"<{len(command_images[control_index]) // 4}I", command_images[control_index])
 
     # A dependency-scheduling bit changes the mapped image but not the typed operands or architectural result.
-    scheduled_original = bytes(shader[load.index*8:(load.index+1)*8])
-    scheduled_buffer,_,scheduled_request = self.gpu_command(command_words)
     scheduled_timestamp = self.driver.context_timestamps[self.device.ctx]
-    try:
-      struct.pack_into("<Q", shader, load.index * 8, load.raw ^ 1 << 60)
-      scheduled_load = decode_a630_ir3(bytes(shader))[load.index]
+    with self._mutate_a630_replay(submission, command_words, ((load, load.raw ^ 1 << 60),)) as \
+         (_,scheduled_dispatch,scheduled_request):
+      scheduled_load = scheduled_dispatch.instructions[load.index]
       self.assertEqual((scheduled_load.opcode, scheduled_load.dst, scheduled_load.srcs),
                        (load.opcode, load.dst, load.srcs))
       self.assertEqual((dict(load.fields)["SY"], dict(scheduled_load.fields)["SY"]), (0, 1))
@@ -1607,32 +1646,15 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual(list(struct.unpack(f"<{control_size}f", output)), actual[control_index])
       self.assertEqual((scheduled_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
                        (((scheduled_timestamp + 1) & 0xffffffff),) * 2)
-    finally:
-      shader[load.index*8:(load.index+1)*8] = scheduled_original
-      self.device._gpu_free(scheduled_buffer)
-    self.assertEqual(bytes(shader[load.index*8:(load.index+1)*8]), scheduled_original)
 
     for case,(instruction,mutated_raw,expected_opcode,message) in enumerate(mutations):
-      original = bytes(shader[instruction.index*8:(instruction.index+1)*8])
-      request_buffer,_,request = self.gpu_command(command_words)
-      request.timestamp = marker = 0x24680000 + case
       output[:] = bytes([0x80 + case]) * len(output)
-      state_before = retirement_state()
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, mutated_raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      marker = 0x24680000 + case
+      with self._mutate_a630_replay(submission, command_words, ((instruction, mutated_raw),), timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
         self.assertEqual(mutated_dispatch.instructions[instruction.index].opcode, expected_opcode)
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message):
-          kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, retirement_state()), (marker, state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original
-        self.device._gpu_free(request_buffer)
-      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original)
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=retirement_state)
 
     # The shader does not request FP32 denormal preservation or flushing, so an otherwise normal-input add that
     # cancels to a subnormal must fail before retirement until A630 result handling has authoritative provenance.
@@ -1723,11 +1745,10 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_production_vector_add_two_workgroups_use_mapped_system_values(self):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl, mesa
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
-    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3, stage_a630
+    from test.mockgpu.qcom.a630 import A630IR3Operand, stage_a630
     from test.mockgpu.qcom.pm4 import parse_pm4
 
     size = 256
@@ -1792,7 +1813,6 @@ class TestQCOMDriver(unittest.TestCase):
                        struct.pack(f"<{size}f", *cast(list[float], python_reference)))
     finally: output[:] = output_original
 
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
     constants = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
     command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
     def retirement_state():
@@ -1830,55 +1850,27 @@ class TestQCOMDriver(unittest.TestCase):
       (global_add, global_add.raw & ~0xffff | local_shift.dst.value, "global-id add"),
     )
     for case,(instruction,mutated_raw,message) in enumerate(mutations):
-      original = bytes(shader[instruction.index*8:(instruction.index+1)*8])
-      request_buffer,_,request = self.gpu_command(command_words)
-      request.timestamp = marker = 0x31415920 + case
       output[:] = bytes([0xb0 + case]) * byte_count
-      state_before = retirement_state()
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, mutated_raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      marker = 0x31415920 + case
+      with self._mutate_a630_replay(submission, command_words, ((instruction, mutated_raw),), timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
         self.assertEqual(mutated_dispatch.instructions[instruction.index].opcode, instruction.opcode)
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message):
-          kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, retirement_state()), (marker, state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original
-        self.device._gpu_free(request_buffer)
-      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original)
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=retirement_state)
 
     # Coupled edits must not collapse the distinct workgroup and local-id producers into one aliased register.
-    alias_original = (bytes(shader[group_shift.index*8:(group_shift.index+1)*8]),
-                      bytes(shader[global_add.index*8:(global_add.index+1)*8]))
-    alias_buffer,_,alias_request = self.gpu_command(command_words)
-    alias_request.timestamp = alias_marker = 0x31415923
     output[:] = bytes([0xb3]) * byte_count
-    alias_before = retirement_state()
-    try:
-      alias_group_raw = group_shift.raw & ~(0xff << 32) | local_shift.dst.value << 32
-      alias_add_raw = global_add.raw & ~(0xff | 0xff << 16) | local_shift.dst.value | local_shift.dst.value << 16
-      struct.pack_into("<Q", shader, group_shift.index * 8, alias_group_raw)
-      struct.pack_into("<Q", shader, global_add.index * 8, alias_add_raw)
-      alias_image = bytes(shader)
-      alias_dispatch = replace(dispatch, shader_image=alias_image, instructions=decode_a630_ir3(alias_image))
+    alias_marker = 0x31415923
+    alias_group_raw = group_shift.raw & ~(0xff << 32) | local_shift.dst.value << 32
+    alias_add_raw = global_add.raw & ~(0xff | 0xff << 16) | local_shift.dst.value | local_shift.dst.value << 16
+    alias_edits = ((group_shift, alias_group_raw), (global_add, alias_add_raw))
+    with self._mutate_a630_replay(submission, command_words, alias_edits, timestamp=alias_marker) as \
+         (alias_submission,alias_dispatch,alias_request):
       self.assertEqual(alias_dispatch.instructions[group_shift.index].dst, local_shift.dst)
       self.assertEqual(alias_dispatch.instructions[global_add.index].srcs, (local_shift.dst, local_shift.dst))
-      with self.assertRaisesRegex(ValueError, "workgroup and local-id terms alias"):
-        real_execute(replace(submission, dispatches=(alias_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      with self.assertRaisesRegex(RuntimeError, "workgroup and local-id terms alias"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-      self.assertEqual((alias_request.timestamp, retirement_state()), (alias_marker, alias_before))
-    finally:
-      shader[group_shift.index*8:(group_shift.index+1)*8] = alias_original[0]
-      shader[global_add.index*8:(global_add.index+1)*8] = alias_original[1]
-      self.device._gpu_free(alias_buffer)
-    self.assertEqual((bytes(shader[group_shift.index*8:(group_shift.index+1)*8]),
-                      bytes(shader[global_add.index*8:(global_add.index+1)*8])), alias_original)
+      self._assert_a630_transactional_rejection(execute=real_execute, submission=alias_submission, request=alias_request,
+                                                 message="workgroup and local-id terms alias", marker=alias_marker,
+                                                 state=retirement_state)
 
     # All of group zero can journal successfully before group one lane zero faults; no prefix may commit.
     output_allocation = self.allocation_for(output_base, byte_count)
@@ -1999,8 +1991,6 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "integer-to-f32 conversion requires one global load and no other data operation"):
       real_execute(replace(submission, dispatches=(replace(dispatch, instructions=mixed_instructions),)),
                    lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[conversion.index*8:(conversion.index+1)*8])
     output_base,input_base = struct.unpack_from("<Q", dispatch.constants_image)[0],struct.unpack_from("<Q", dispatch.constants_image, 8)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
     source = self.driver.resolve_owned(self.device.fd.fd, input_base, 4)
@@ -2008,15 +1998,12 @@ class TestQCOMDriver(unittest.TestCase):
 
     mutation_raw = conversion.raw & ~(0x7 << 50) | 3 << 50
     self.assertEqual(mutation_raw ^ conversion.raw, (5 ^ 3) << 50)
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    try:
-      struct.pack_into("<Q", shader, conversion.index * 8, mutation_raw)
-      image = bytes(shader)
-      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+    command_words = struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index])
+    with self._mutate_a630_replay(submission, command_words, ((conversion, mutation_raw),)) as \
+         (mutated_submission,mutated_dispatch,request):
       mutated = mutated_dispatch.instructions[conversion.index]
       self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), ("cov.u32f32", conversion.dst, conversion.srcs))
-      journal = real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                             lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      journal = real_execute(mutated_submission, self._resolve_owned)
       self.assertEqual(tuple((write.address, write.data) for write in journal), ((output_base, struct.pack("<I", 0x4f000000)),))
       self.assertEqual(bytes(output), struct.pack("<I", 0xcf000000))
       output[:] = struct.pack("<I", 0xdeadbeef)
@@ -2025,10 +2012,6 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((bytes(source), bytes(output), request.timestamp, self.driver.context_timestamps[self.device.ctx]),
                        (struct.pack("<I", 0x80000000), struct.pack("<I", 0x4f000000),
                         (timestamp_before + 1) & 0xffffffff, (timestamp_before + 1) & 0xffffffff))
-    finally:
-      shader[conversion.index*8:(conversion.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[conversion.index*8:(conversion.index+1)*8]), original)
 
     batched_cases = (
       (dtypes.int, [-33554435, 16777219, -16777217], ((3, 1, 1), (1, 1, 1), (3, 1, 1))),
@@ -2058,28 +2041,18 @@ class TestQCOMDriver(unittest.TestCase):
                         for operand in instruction.srcs))
 
     # ROUND_ZERO is a valid Cat1 encoding but remains outside this RNE-only executor contract and must reject transactionally.
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    request.timestamp = marker = 0x31415926
-    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-    state_before = (bytes(source), bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                    self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
-    try:
-      struct.pack_into("<Q", shader, conversion.index * 8, conversion.raw & ~(0x3 << 55))
-      image = bytes(shader)
-      rejected_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+    marker = 0x31415926
+    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+    def rejected_state():
+      return (bytes(source), bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+              self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+    with self._mutate_a630_replay(submission, command_words, ((conversion, conversion.raw & ~(0x3 << 55)),),
+                                  timestamp=marker) as (rejected_submission,rejected_dispatch,request):
       rejected = rejected_dispatch.instructions[conversion.index]
       self.assertEqual((rejected.opcode, dict(rejected.fields)["ROUND"]), (None, 0))
       message = f"unsupported A630 semantic at instruction {conversion.index}"
-      with self.assertRaisesRegex(ValueError, message):
-        real_execute(replace(submission, dispatches=(rejected_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual((request.timestamp, bytes(source), bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                        self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
-    finally:
-      shader[conversion.index*8:(conversion.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[conversion.index*8:(conversion.index+1)*8]), original)
+      self._assert_a630_transactional_rejection(execute=real_execute, submission=rejected_submission, request=request,
+                                                 message=message, marker=marker, state=rejected_state)
 
     restored_source = Tensor([dtypes.int.min], dtype=dtypes.int, device=Device.DEFAULT).realize()
     restored = scalar_float(restored_source.cast(dtypes.float))
@@ -2089,10 +2062,8 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_production_integer_add_wraps_from_mapped_machine_bytes(self):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor, dtypes
-    from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+    from test.mockgpu.qcom.a630 import A630IR3Operand
 
     cases = ((dtypes.int, [dtypes.int.max, dtypes.int.min, -7], [1, -1, 3], [dtypes.int.min, dtypes.int.max, -4]),
              (dtypes.uint, [dtypes.uint.max, 0x80000000, 7], [1, 0x80000000, 5], [0, 0, 12]),
@@ -2139,31 +2110,22 @@ class TestQCOMDriver(unittest.TestCase):
     def reject_mapped_mutation(case_index, instruction, mutated_raw, message, expected_srcs):
       submission = submissions[case_index]
       dispatch = submission.dispatches[0]
-      shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-      original = bytes(shader[instruction.index*8:(instruction.index+1)*8])
       output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
-      output = self.driver.resolve_owned(self.device.fd.fd, output_base, len(cases[case_index][1]) * 4)
+      output = self._resolve_owned(output_base, len(cases[case_index][1]) * 4)
       output_before = bytes(output)
-      request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-      request.timestamp = 0x10293847 + case_index
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                      self.driver.always_on_counter, self.device.last_cmd)
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, mutated_raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
-        self.assertEqual(mutated_dispatch.instructions[instruction.index].srcs, expected_srcs)
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                          self.driver.always_on_counter, self.device.last_cmd), (0x10293847 + case_index, *state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original
-        self.device._gpu_free(request_buffer)
-      self.assertEqual((bytes(shader[instruction.index*8:(instruction.index+1)*8]), bytes(output)), (original, output_before))
+      signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+      def state():
+        return (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+      marker = 0x10293847 + case_index
+      words = struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index])
+      with self._mutate_a630_replay(submission, words, ((instruction, mutated_raw),), timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
+        mutated = mutated_dispatch.instructions[instruction.index]
+        self.assertEqual((mutated.opcode, mutated.srcs), (instruction.opcode, expected_srcs))
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=state)
+      self.assertEqual(bytes(output), output_before)
 
     _,data_add = decoded_dispatches[0]
     reject_mapped_mutation(0, data_add, data_add.raw & ~(0xffff << 16) | data_add.srcs[0].value << 16,
@@ -2196,10 +2158,8 @@ class TestQCOMDriver(unittest.TestCase):
                                                                   unsupported_opcode_bits=None, unsupported_name=None, value_type="u32",
                                                                   swap_mutation_sources=False, unsupported_shift_counts=()):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import decode_a630_ir3
 
     actual,live_tensors = [],[]
     with self._capture_a630_execution() as (submissions,command_images,real_execute):
@@ -2250,59 +2210,41 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertNotEqual(mutation_expected, cases[case_index][3] & 0xffffffff)
     submission = submissions[case_index]
     dispatch,binary,store = decoded_dispatches[case_index]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[binary.index*8:(binary.index+1)*8])
     output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    if swap_mutation_sources:
+      src1,src2 = binary.raw & 0xffff, binary.raw >> 16 & 0xffff
+      mutation_raw = binary.raw & ~0xffffffff | src2 | src1 << 16
+      mutation_srcs = (binary.srcs[1], binary.srcs[0])
+      self.assertEqual(mutation_raw & ~0xffffffff, binary.raw & ~0xffffffff)
+    else:
+      mutation_raw = binary.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
+      mutation_srcs = binary.srcs
+      self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
+                       (mutation_opcode_bits, binary.raw & ~(0x3f << 53)))
+    command_words = struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index])
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
-    try:
-      if swap_mutation_sources:
-        src1,src2 = binary.raw & 0xffff, binary.raw >> 16 & 0xffff
-        mutation_raw = binary.raw & ~0xffffffff | src2 | src1 << 16
-        mutation_srcs = (binary.srcs[1], binary.srcs[0])
-        self.assertEqual(mutation_raw & ~0xffffffff, binary.raw & ~0xffffffff)
-      else:
-        mutation_raw = binary.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
-        mutation_srcs = binary.srcs
-        self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
-                         (mutation_opcode_bits, binary.raw & ~(0x3f << 53)))
-      struct.pack_into("<Q", shader, binary.index * 8, mutation_raw)
-      mutated = decode_a630_ir3(bytes(shader))[binary.index]
+    with self._mutate_a630_replay(submission, command_words, ((binary, mutation_raw),)) as (_,mutated_dispatch,request):
+      mutated = mutated_dispatch.instructions[binary.index]
       self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, binary.dst, mutation_srcs))
       output[:] = struct.pack("<I", mutation_expected ^ 0xffffffff)
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
       self.assertEqual(struct.unpack("<I", output)[0], mutation_expected)
       self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
-    finally:
-      shader[binary.index*8:(binary.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[binary.index*8:(binary.index+1)*8]), original)
 
     def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message, *, expected_name=None):
-      original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
-      request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-      request.timestamp = marker = 0x27182818 + instruction.index
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                      self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      marker = 0x27182818 + instruction.index
+      signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+      def state():
+        return (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+      with self._mutate_a630_replay(submission, command_words, ((instruction, raw),), timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
         mutated = mutated_dispatch.instructions[instruction.index]
         self.assertEqual((mutated.opcode, mutated.srcs), (expected_opcode, expected_srcs))
         if expected_name is not None: self.assertEqual(mutated.name, expected_name)
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                          self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original_instruction
-        self.device._gpu_free(request_buffer)
-      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=state)
 
     dataflow_message = f"{value_type} {operation} does not consume both global loads"
     src1 = binary.raw & 0xffff
@@ -2470,10 +2412,8 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_production_integer_multiply_wraps_from_mapped_machine_bytes(self):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor, dtypes
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import decode_a630_ir3
 
     cases = ((dtypes.int, dtypes.int.min, -1, dtypes.int.min),
              (dtypes.int, dtypes.int.max, 2, -2),
@@ -2526,54 +2466,38 @@ class TestQCOMDriver(unittest.TestCase):
     case_index = len(cases) - 1
     submission = submissions[case_index]
     dispatch,_,_,accumulates = decoded_dispatches[case_index]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
     output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
 
     # Swapping the first MADSH inputs preserves the legal dataflow but changes which high-half cross term is accumulated.
     first = accumulates[0]
-    first_original = bytes(shader[first.index*8:(first.index+1)*8])
     src1,src2 = first.raw & 0x1fff, first.raw >> 47 & 0xff
     swapped_raw = first.raw & ~(0x1fff | (0xff << 47)) | src2 | src1 << 47
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    command_words = struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index])
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
-    try:
-      struct.pack_into("<Q", shader, first.index * 8, swapped_raw)
-      mutated = decode_a630_ir3(bytes(shader))[first.index]
+    with self._mutate_a630_replay(submission, command_words, ((first, swapped_raw),)) as (_,mutated_dispatch,request):
+      mutated = mutated_dispatch.instructions[first.index]
       self.assertEqual((mutated.opcode, mutated.srcs), ("madsh.m16", (first.srcs[1], first.srcs[0], first.srcs[2])))
       output[:] = bytes(4)
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
       self.assertEqual(struct.unpack("<I", output)[0], 0x00080008)
       self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
-    finally:
-      shader[first.index*8:(first.index+1)*8] = first_original
-      self.device._gpu_free(request_buffer)
 
     # Duplicating a final MADSH source breaks the two-load chain and must not publish any retirement state.
     second = accumulates[1]
-    second_original = bytes(shader[second.index*8:(second.index+1)*8])
     duplicate_raw = second.raw & ~(0xff << 47) | second.srcs[0].value << 47
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-    request.timestamp = 0x27182818
-    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-    state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                    self.driver.always_on_counter, self.device.last_cmd)
-    try:
-      struct.pack_into("<Q", shader, second.index * 8, duplicate_raw)
-      image = bytes(shader)
-      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+    marker = 0x27182818
+    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+    def rejected_state():
+      return (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+              self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+    with self._mutate_a630_replay(submission, command_words, ((second, duplicate_raw),), timestamp=marker) as \
+         (mutated_submission,mutated_dispatch,rejected_request):
       self.assertEqual(mutated_dispatch.instructions[second.index].srcs, (second.srcs[0], second.srcs[0], second.srcs[2]))
-      with self.assertRaisesRegex(ValueError, "u32 multiplication sequence does not consume both global loads"):
-        real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      with self.assertRaisesRegex(RuntimeError, "u32 multiplication sequence does not consume both global loads"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                        self.driver.always_on_counter, self.device.last_cmd), (0x27182818, *state_before))
-    finally:
-      shader[second.index*8:(second.index+1)*8] = second_original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[second.index*8:(second.index+1)*8]), second_original)
+      message = "u32 multiplication sequence does not consume both global loads"
+      self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission,
+                                                 request=rejected_request, message=message, marker=marker,
+                                                 state=rejected_state)
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) *
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [36])
 
@@ -2581,10 +2505,9 @@ class TestQCOMDriver(unittest.TestCase):
                                                                       mutation_mask, mutation_value, mutation_opcode, mutation_expected,
                                                                       unsupported_condition=None, check_duplicate_inventory=False):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+    from test.mockgpu.qcom.a630 import A630IR3Operand
 
     actual,live_tensors = [],[]
     with self._capture_a630_execution() as (submissions,command_images,real_execute):
@@ -2634,52 +2557,34 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertNotEqual(bool(mutation_expected), cases[case_index][3])
     submission = submissions[case_index]
     dispatch,comparison,store = decoded_dispatches[case_index]
-    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[comparison.index*8:(comparison.index+1)*8])
     output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 1)
-    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    self.assertEqual(mutation_value & ~mutation_mask, 0)
+    mutation_raw = comparison.raw & ~mutation_mask | mutation_value
+    self.assertEqual(mutation_raw & ~mutation_mask, comparison.raw & ~mutation_mask)
+    self.assertNotEqual(mutation_raw, comparison.raw)
+    command_words = struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index])
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
-    try:
-      self.assertEqual(mutation_value & ~mutation_mask, 0)
-      mutation_raw = comparison.raw & ~mutation_mask | mutation_value
-      self.assertEqual(mutation_raw & ~mutation_mask, comparison.raw & ~mutation_mask)
-      self.assertNotEqual(mutation_raw, comparison.raw)
-      struct.pack_into("<Q", shader, comparison.index * 8, mutation_raw)
-      mutated = decode_a630_ir3(bytes(shader))[comparison.index]
+    with self._mutate_a630_replay(submission, command_words, ((comparison, mutation_raw),)) as (_,mutated_dispatch,request):
+      mutated = mutated_dispatch.instructions[comparison.index]
       self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, comparison.dst, comparison.srcs))
       output[:] = bytes([mutation_expected ^ 0xff])
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
       self.assertEqual(bytes(output), bytes([mutation_expected]))
       self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
-    finally:
-      shader[comparison.index*8:(comparison.index+1)*8] = original
-      self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[comparison.index*8:(comparison.index+1)*8]), original)
 
     def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message):
-      original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
-      request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
-      request.timestamp = marker = 0x14142135 + instruction.index
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      state_before = (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                      self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
-      try:
-        struct.pack_into("<Q", shader, instruction.index * 8, raw)
-        image = bytes(shader)
-        mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      marker = 0x14142135 + instruction.index
+      signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+      def state():
+        return (bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+      with self._mutate_a630_replay(submission, command_words, ((instruction, raw),), timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
         mutated = mutated_dispatch.instructions[instruction.index]
         self.assertEqual((mutated.opcode, mutated.srcs), (expected_opcode, expected_srcs))
-        with self.assertRaisesRegex(ValueError, message):
-          real_execute(replace(submission, dispatches=(mutated_dispatch,)),
-                       lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-        self.assertEqual((request.timestamp, bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
-                          self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
-      finally:
-        shader[instruction.index*8:(instruction.index+1)*8] = original_instruction
-        self.device._gpu_free(request_buffer)
-      self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=state)
 
     if unsupported_condition is not None:
       unsupported_raw = comparison.raw & ~(0x7 << 48) | unsupported_condition << 48
