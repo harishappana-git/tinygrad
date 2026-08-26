@@ -7,8 +7,9 @@ from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
 # adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, ir3_shader.h,
-# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3_a6xx.c, ir3_compiler_nir.c, ir3_nir_imul.py,
-# nir_opcodes.py, isaspec.h, and isaspec_decode_impl.c.
+# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3.c, ir3_a6xx.c, ir3_compiler_nir.c,
+# ir3_nir_imul.py, ir3_nir_lower_64b.c, ir3_rpt.c, nir_lower_int64.c, nir_opcodes.py, isaspec.h,
+# and isaspec_decode_impl.c.
 
 @dataclass(frozen=True)
 class A630MemoryRange:
@@ -196,6 +197,20 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "ROUND", "SRC_R")):
       return "cov.u16s32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("half", _same_int_field(fields, "SRC")),)
+  # ir3_rpt.c merges four scalar ALU leaves only when the destination registers are consecutive; each source marked (r)
+  # advances with the destination. Keep this vector form separate from scalar ADD.F and require the exact repeat contract.
+  repeated_add_variable = (0xff << 32) | (0xff << 16) | 0xff | (1 << 44) | (1 << 60)
+  if category == 2 and name == "add.f" and raw & ~repeated_add_variable == 0x40180b0000000000 and \
+     (_same_int_field(fields, "REPEAT"), _same_int_field(fields, "DST_HALF")) == (3, 0) and \
+     all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG")) and \
+     _int_field_is(fields, "SRC_R", 1) and (raw >> 52 & 1, raw >> 46 & 1) == (1, 0):
+    dst = _register_operand(_same_int_field(fields, "DST"), True)
+    srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), True),
+            _multisrc_operand(_same_int_field(fields, "SRC2"), True))
+    if dst is not None and dst.kind == "gpr" and dst.value + 3 < 0xc0 and \
+       all(src is not None and src.kind == "gpr" and src.value + 3 < 0xc0 for src in srcs):
+      assert srcs[0] is not None and srcs[1] is not None
+      return "add.f.rpt4", dst, (srcs[0], srcs[1])
   cat2_compare = name in {"cmps.u", "cmps.s"}
   if category == 2 and name in {"ashr.b", "shl.b", "shr.b", "add.u", "sub.u", "max.s", "max.u", "xor.b", "and.b", "or.b",
                                 "mull.u", "cmps.u", "cmps.s", "add.f"} and \
@@ -240,21 +255,28 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
       return "shrg", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
              (A630IR3Operand("iim", immediate), A630IR3Operand("gpr", src2), A630IR3Operand("gpr", src3))
   cat6_schedule = 1 << 60
-  ldg_variable = (0xff << 14) | (0xff << 32) | cat6_schedule
+  ldg_variable = (0xff << 14) | (0xff << 32) | (0x7 << 24) | cat6_schedule
+  ldg_size = _same_int_field(fields, "SIZE") if category == 6 and name == "ldg" else 0
   if category == 6 and name == "ldg" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "TYPE_HALF"),
-                                           _same_int_field(fields, "OFF"), _same_int_field(fields, "SIZE")) == (3, 0, 0, 1) and \
-     _int_field_is(fields, "JP", 0) and raw & ~ldg_variable == 0xc006000001800001:
-    return "ldg.u32", A630IR3Operand("gpr", _same_int_field(fields, "DST")), \
-           (A630IR3Operand("gpr", _same_int_field(fields, "SRC1")),)
-  stg_variable = (0xff << 1) | (0xff << 41) | cat6_schedule
+                                           _same_int_field(fields, "OFF")) == (3, 0, 0) and ldg_size in (1, 4) and \
+     _int_field_is(fields, "JP", 0) and raw & ~ldg_variable == 0xc006000000800001:
+    dst,address = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC1"), True)
+    if dst is not None and dst.kind == "gpr" and dst.value + ldg_size - 1 < 0xc0 and \
+       address is not None and address.kind == "gpr" and address.value + 1 < 0xc0:
+      return ("ldg.u32" if ldg_size == 1 else "ldg.u32x4"), dst, (address,)
+  stg_variable = (0xff << 1) | (0xff << 41) | (0x7 << 24) | cat6_schedule
+  stg_size = _same_int_field(fields, "SIZE") if category == 6 and name == "stg" else 0
   if category == 6 and name == "stg" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "TYPE_HALF"),
-                                           _same_int_field(fields, "OFF"), _same_int_field(fields, "SIZE")) == (3, 0, 0, 1) and \
-     _int_field_is(fields, "JP", 0) and raw & ~stg_variable == 0xc0c6010001800000:
-    return "stg.u32", None, (A630IR3Operand("gpr", _same_int_field(fields, "SRC1")),
-                              A630IR3Operand("gpr", _same_int_field(fields, "SRC3")))
+                                           _same_int_field(fields, "OFF")) == (3, 0, 0) and stg_size in (1, 4) and \
+     _int_field_is(fields, "JP", 0) and raw & ~stg_variable == 0xc0c6010000800000:
+    address,data = _register_operand(_same_int_field(fields, "SRC1"), True), _register_operand(_same_int_field(fields, "SRC3"), True)
+    if address is not None and address.kind == "gpr" and address.value + 1 < 0xc0 and \
+       data is not None and data.kind == "gpr" and data.value + stg_size - 1 < 0xc0:
+      return ("stg.u32" if stg_size == 1 else "stg.u32x4"), None, (address, data)
+  stg_u8_variable = (0xff << 1) | (0xff << 41) | cat6_schedule
   if category == 6 and name == "stg" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "TYPE_HALF"),
                                            _same_int_field(fields, "OFF"), _same_int_field(fields, "SIZE")) == (6, 1, 0, 1) and \
-     _int_field_is(fields, "JP", 0) and raw & ~stg_variable == 0xc0cc010001800000:
+     _int_field_is(fields, "JP", 0) and raw & ~stg_u8_variable == 0xc0cc010001800000:
     address,data = _register_operand(_same_int_field(fields, "SRC1"), True), _register_operand(_same_int_field(fields, "SRC3"), False)
     if address is not None and address.kind == "gpr" and address.value + 1 < 0xc0 and data is not None and data.kind == "half":
       return "stg.u8", None, (address, data)
@@ -729,6 +751,166 @@ def _validate_constant_pointer_moves(instructions:Sequence[A630IR3Instruction]) 
            "A630 constant-pointer moves do not match the scalar buffer argument ABI")
   return True
 
+def _validate_carry_conversions(instructions:Sequence[A630IR3Instruction], excluded_comparison:int|None=None) -> None:
+  pending:set[int] = set()
+  for instruction in instructions:
+    if instruction.opcode == "cmps.u.lt" and instruction.index != excluded_comparison:
+      assert instruction.dst is not None
+      _require(instruction.dst.value not in pending, "overwritten A630 carry comparison")
+      pending.add(instruction.dst.value)
+    elif instruction.opcode == "cov.u16s32":
+      source = instruction.srcs[0].value
+      _require(source in pending, "A630 carry conversion lacks a comparison")
+      pending.remove(source)
+  _require(not pending, "A630 carry comparison lacks a conversion")
+
+def _validate_register_footprint(registers:dict[int, int], full:Sequence[int], half:Sequence[int], message:str) -> None:
+  _require(all(0 <= register < 0xc0 for register in (*full, *half)), "unsupported shared or special IR3 register")
+  control = registers[mesa.REG_A6XX_SP_CS_CNTL_0]
+  half_footprint,full_footprint = control >> 1 & 0x3f, control >> 7 & 0x3f
+  _require(control == half_footprint << 1 | full_footprint << 7, "unsupported A630 thread or register control flags")
+  expected_half = max(half) // 4 + 1 if half else 0
+  expected_full = max(full) // 4 + 1
+  _require((half_footprint, full_footprint) == (expected_half, expected_full), message)
+
+def _gpr_address(full:dict[int, int], operand:A630IR3Operand) -> int:
+  return full[operand.value] | full[operand.value + 1] << 32
+
+def _finish_writes(writes:Sequence[A630ExecutionWrite]) -> tuple[A630ExecutionWrite, ...]:
+  ordered = sorted(writes, key=lambda write: write.address)
+  _require(all(left.address + len(left.data) <= right.address for left,right in zip(ordered, ordered[1:])),
+           "overlapping A630 global stores")
+  return tuple(writes)
+
+def _f32_add_bits(left:int, right:int) -> int:
+  # The emitted shader requests RTE but neither preserves nor flushes FP32 denorms, so only zero/normal finite words are grounded.
+  _require(all((bits >> 23 & 0xff) != 0xff and ((bits >> 23 & 0xff) != 0 or bits & 0x7fffff == 0) for bits in (left, right)),
+           "unsupported special or subnormal float input")
+  result = ctypes.c_float(struct.unpack("<f", struct.pack("<I", left))[0] +
+                          struct.unpack("<f", struct.pack("<I", right))[0]).value
+  value = struct.unpack("<I", struct.pack("<f", result))[0]
+  exponent = value >> 23 & 0xff
+  _require(exponent != 0xff and (exponent != 0 or value & 0x7fffff == 0), "unsupported special or subnormal float result")
+  return value
+
+def _validate_vector_u32_dispatch(dispatch:A630Dispatch, active:Sequence[A630IR3Instruction], registers:dict[int, int],
+                                  wgid:int, lid:int) -> None:
+  # Pinned ir3_a6xx.c emits Cat6 SIZE from the collected component count, while ir3_rpt.c merges four consecutive
+  # ADD.F leaves into REPEAT=3 with both sources advancing. This admits only that compiler-observed four-U32 slice.
+  opcodes = tuple(instruction.opcode for instruction in active)
+  fill = opcodes.count("stg.u32x4") == 1 and not any(opcode in {"ldg.u32x4", "add.f.rpt4"} for opcode in opcodes)
+  add = (opcodes.count("ldg.u32x4"), opcodes.count("add.f.rpt4"), opcodes.count("stg.u32x4")) == (2, 1, 1)
+  _require(fill or add, "unsupported A630 four-component kernel shape")
+  _require(dispatch.groups == (1, 1, 1) and dispatch.global_size == dispatch.local_size and
+           dispatch.local_size[1:] == (1, 1) and 2 <= dispatch.local_size[0] <= 32,
+           "A630 four-component execution requires one bounded workgroup")
+  _require(wgid == 0xfc and lid != 0xfc, "unsupported A630 four-component system-value mapping")
+  expected_counts = ({"shl.b":3, "mov.u32":4, "ashr.b":1, "add.u":3, "cmps.u.lt":1, "shrg":1,
+                      "cov.u16s32":1, "nop":2, "stg.u32x4":1, "end":1} if fill else
+                     {"shl.b":3, "ashr.b":1, "add.u":9, "cmps.u.lt":3, "shrg":1, "cov.u16s32":3,
+                      "nop":3, "ldg.u32x4":2, "add.f.rpt4":1, "stg.u32x4":1, "end":1})
+  _require(len(opcodes) == sum(expected_counts.values()) and
+           all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
+           "unsupported A630 four-component instruction inventory")
+
+  for instruction in active:
+    dst_kind = instruction.dst.kind if instruction.dst is not None else None
+    src_kinds = tuple(operand.kind for operand in instruction.srcs)
+    valid = instruction.opcode in {"nop", "end"} and dst_kind is None and not src_kinds
+    if instruction.opcode == "ashr.b":
+      valid = dst_kind == "gpr" and src_kinds == ("gpr", "iim") and instruction.srcs[1].value == 31
+    elif instruction.opcode == "shl.b":
+      valid = dst_kind == "gpr" and src_kinds == ("gpr", "iim") and instruction.srcs[1].value in (2, 4)
+    elif instruction.opcode == "shrg":
+      valid = dst_kind == "gpr" and src_kinds == ("iim", "gpr", "gpr") and instruction.srcs[0].value == 30
+    elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds == ("uim",)
+    elif instruction.opcode == "add.u":
+      valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or set(src_kinds) == {"const", "gpr"})
+    elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
+    elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
+    elif instruction.opcode == "ldg.u32x4": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
+    elif instruction.opcode == "add.f.rpt4": valid = dst_kind == "gpr" and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "stg.u32x4": valid = dst_kind is None and src_kinds == ("gpr", "gpr")
+    _require(valid, f"unsupported A630 four-component operand contract at instruction {instruction.index}")
+
+  store = next(instruction for instruction in active if instruction.opcode == "stg.u32x4")
+  moves = tuple(instruction for instruction in active if instruction.opcode == "mov.u32")
+  loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32x4")
+  if fill:
+    _require(len(moves) == 4 and all(move.dst is not None for move in moves), "unsupported A630 four-component fill moves")
+    assert all(move.dst is not None for move in moves)
+    _require(tuple(sorted(move.dst.value for move in moves if move.dst is not None)) ==
+             tuple(range(store.srcs[1].value, store.srcs[1].value + 4)),
+             "four-component store does not consume the consecutive fill literals")
+  else:
+    repeated = next(instruction for instruction in active if instruction.opcode == "add.f.rpt4")
+    assert repeated.dst is not None and all(load.dst is not None for load in loads)
+    _require(frozenset(repeated.srcs) == frozenset(load.dst for load in loads) and store.srcs[1] == repeated.dst,
+             "four-component add does not connect both loads to the store")
+
+  constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
+  _require(constant_uses == ([0, 0, 1] if fill else [0, 0, 1, 2, 2, 3, 4, 4, 5]),
+           "A630 pointer constants do not match the four-component buffer argument ABI")
+  local_id = A630IR3Operand("gpr", lid)
+  element_shifts = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                         instruction.srcs == (local_id, A630IR3Operand("iim", 2)))
+  byte_shifts = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                      instruction.srcs == (local_id, A630IR3Operand("iim", 4)))
+  _require(len(element_shifts) == len(byte_shifts) == 1 and element_shifts[0].dst is not None and byte_shifts[0].dst is not None,
+           "A630 four-component local-id scaling is not the compiler address chain")
+  element_shift,byte_shift = element_shifts[0],byte_shifts[0]
+  sign_extends = tuple(instruction for instruction in active if instruction.opcode == "ashr.b" and
+                       instruction.srcs == (element_shift.dst, A630IR3Operand("iim", 31)))
+  _require(len(sign_extends) == 1 and sign_extends[0].dst is not None,
+           "A630 four-component sign extension is not the compiler address chain")
+  high_shifts = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                      instruction.srcs == (sign_extends[0].dst, A630IR3Operand("iim", 2)))
+  _require(len(high_shifts) == 1 and high_shifts[0].dst is not None,
+           "A630 four-component high offset is not the compiler address chain")
+  high_offsets = tuple(instruction for instruction in active if instruction.opcode == "shrg" and
+                       instruction.srcs == (A630IR3Operand("iim", 30), element_shift.dst, high_shifts[0].dst))
+  _require(len(high_offsets) == 1 and high_offsets[0].dst is not None,
+           "A630 four-component packed offset is not the compiler address chain")
+  address_bases = (store.srcs[0], *(load.srcs[0] for load in loads))
+  for pointer,address_base in enumerate(address_bases):
+    low_constant,high_constant = (A630IR3Operand("const", 2*pointer), A630IR3Operand("const", 2*pointer+1))
+    low_adds = tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                     instruction.dst == address_base and frozenset(instruction.srcs) == frozenset((low_constant, byte_shift.dst)))
+    carries = tuple(instruction for instruction in active if instruction.opcode == "cmps.u.lt" and
+                    instruction.srcs == (address_base, low_constant))
+    _require(len(low_adds) == len(carries) == 1 and carries[0].dst is not None,
+             "A630 four-component low address is not the compiler pointer chain")
+    carry_conversions = tuple(instruction for instruction in active if instruction.opcode == "cov.u16s32" and
+                              instruction.srcs == (carries[0].dst,))
+    high_adds = tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                      frozenset(instruction.srcs) == frozenset((high_constant, high_offsets[0].dst)))
+    _require(len(carry_conversions) == len(high_adds) == 1 and carry_conversions[0].dst is not None and high_adds[0].dst is not None,
+             "A630 four-component high address is not the compiler pointer chain")
+    final_high = A630IR3Operand("gpr", address_base.value + 1)
+    final_adds = tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                       instruction.dst == final_high and
+                       frozenset(instruction.srcs) == frozenset((carry_conversions[0].dst, high_adds[0].dst)))
+    _require(len(final_adds) == 1, "A630 four-component carry is not the compiler pointer chain")
+  _validate_carry_conversions(active)
+
+  full_registers = [lid, lid + 1, lid + 2]
+  half_registers:list[int] = []
+  for instruction in active:
+    operands = ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs
+    for operand in operands:
+      if operand.kind == "gpr": full_registers.append(operand.value)
+      elif operand.kind == "half": half_registers.append(operand.value)
+    if instruction.opcode in {"ldg.u32x4", "stg.u32x4"}: full_registers.append(instruction.srcs[0].value + 1)
+    if instruction.opcode == "ldg.u32x4" and instruction.dst is not None:
+      full_registers.extend(range(instruction.dst.value + 1, instruction.dst.value + 4))
+    if instruction.opcode in {"stg.u32x4", "add.f.rpt4"}:
+      for operand in instruction.srcs[1:] if instruction.opcode == "stg.u32x4" else instruction.srcs:
+        full_registers.extend(range(operand.value + 1, operand.value + 4))
+    if instruction.opcode == "add.f.rpt4" and instruction.dst is not None:
+      full_registers.extend(range(instruction.dst.value + 1, instruction.dst.value + 4))
+  _validate_register_footprint(registers, full_registers, half_registers,
+                               "A630 register footprints do not match decoded four-component operands")
+
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
@@ -746,6 +928,9 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   unsupported = next((instruction for instruction in active if instruction.opcode is None), None)
   _require(unsupported is None, f"unsupported A630 semantic at instruction {unsupported.index if unsupported else -1}")
   opcodes = tuple(instruction.opcode for instruction in active)
+  if any(opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for opcode in opcodes):
+    _validate_vector_u32_dispatch(dispatch, active, registers, wgid, lid)
+    return dispatch
   input_count = opcodes.count("ldg.u32")
   float_add_count = opcodes.count("add.f")
   _require(input_count in (0, 1, 2), "A630 execution supports at most two global loads")
@@ -898,37 +1083,113 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
       if operand.kind == "gpr": full_registers.append(operand.value)
       elif operand.kind == "half": half_registers.append(operand.value)
     if instruction.opcode in {"ldg.u32", "stg.u32", "stg.u8"}: full_registers.append(instruction.srcs[0].value + 1)
-  _require(all(0 <= register < 0xc0 for register in full_registers + half_registers), "unsupported shared or special IR3 register")
-
-  pending_carries:set[int] = set()
-  for instruction in active:
-    if instruction.opcode == "cmps.u.lt" and (comparison_instruction is None or instruction.index != comparison_instruction.index):
-      assert instruction.dst is not None
-      _require(instruction.dst.value not in pending_carries, "overwritten A630 carry comparison")
-      pending_carries.add(instruction.dst.value)
-    elif instruction.opcode == "cov.u16s32":
-      source = instruction.srcs[0].value
-      _require(source in pending_carries, "A630 carry conversion lacks a comparison")
-      pending_carries.remove(source)
-  _require(not pending_carries, "A630 carry comparison lacks a conversion")
-
-  control = registers[mesa.REG_A6XX_SP_CS_CNTL_0]
-  half_footprint,full_footprint = control >> 1 & 0x3f, control >> 7 & 0x3f
-  _require(control == half_footprint << 1 | full_footprint << 7, "unsupported A630 thread or register control flags")
-  expected_half = max(half_registers) // 4 + 1 if half_registers else 0
-  expected_full = max(full_registers) // 4 + 1
-  _require((half_footprint, full_footprint) == (expected_half, expected_full),
-           "A630 register footprints do not match decoded operands")
+  _validate_carry_conversions(active, comparison_instruction.index if comparison_instruction is not None else None)
+  _validate_register_footprint(registers, full_registers, half_registers, "A630 register footprints do not match decoded operands")
   return dispatch
 
+def _execute_vector_u32(dispatch:A630Dispatch, resolver:Resolver,
+                        active:Sequence[A630IR3Instruction]) -> tuple[A630ExecutionWrite, ...]:
+  constants = struct.unpack("<1024I", dispatch.constants_image)
+  lane_count = dispatch.local_size[0]
+  _,lid = _system_registers(dispatch)
+  loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32x4")
+  load_ordinals = {instruction.index:index for index,instruction in enumerate(loads)}
+  output_base = constants[0] | constants[1] << 32
+  input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
+  byte_count = lane_count * 16
+  _require(output_base != 0 and output_base % 4 == 0 and output_base + byte_count <= 1 << 64 and
+           all(base != 0 and base % 4 == 0 and base + byte_count <= 1 << 64 for base in input_bases),
+           "invalid A630 four-component argument range")
+  fill = not loads
+  writes:list[A630ExecutionWrite] = []
+  full = [{lid:lane, lid+1:0, lid+2:0} for lane in range(lane_count)]
+  half:list[dict[int, int]] = [{} for _ in range(lane_count)]
+  origins:list[dict[int, tuple[str, int]]] = [{} for _ in range(lane_count)]
+
+  for instruction in active:
+    if instruction.opcode == "end": break
+    if instruction.opcode == "nop": continue
+    _require((instruction.opcode is not None and instruction.dst is not None) or instruction.opcode == "stg.u32x4",
+             f"unsupported A630 semantic at instruction {instruction.index}")
+    for lane in range(lane_count):
+      try:
+        opcode = instruction.opcode
+        if opcode == "ldg.u32x4":
+          assert instruction.dst is not None
+          address = _gpr_address(full[lane], instruction.srcs[0])
+          ordinal = load_ordinals[instruction.index]
+          _require(address == input_bases[ordinal] + lane * 16,
+                   f"global load {ordinal} does not address its four-component input")
+          _require(address % 4 == 0 and address + 16 <= 1 << 64, "invalid A630 four-component global-load address")
+          view = resolver(address, 16)
+          _require(len(view) == 16, "short A630 four-component global-load range")
+          for component,value in enumerate(struct.unpack("<4I", bytes(view))):
+            full[lane][instruction.dst.value + component] = value
+            origins[lane][instruction.dst.value + component] = ("load", ordinal * 4 + component)
+          continue
+        if opcode == "add.f.rpt4":
+          assert instruction.dst is not None
+          for component in range(4):
+            left_register,right_register = (operand.value + component for operand in instruction.srcs)
+            left,right = full[lane][left_register],full[lane][right_register]
+            _require(frozenset((origins[lane].get(left_register), origins[lane].get(right_register))) ==
+                     frozenset((("load", component), ("load", 4 + component))),
+                     "four-component f32 add does not consume both corresponding global-load components")
+            _require(all((bits >> 23 & 0xff) != 0xff and ((bits >> 23 & 0xff) != 0 or bits & 0x7fffff == 0)
+                         for bits in (left, right)), "unsupported special or subnormal float input")
+            value = _f32_add_bits(left, right)
+            full[lane][instruction.dst.value + component] = value
+            origins[lane][instruction.dst.value + component] = ("f32-add", component)
+          continue
+        if opcode == "stg.u32x4":
+          address_base,data_base = (operand.value for operand in instruction.srcs)
+          address = _gpr_address(full[lane], instruction.srcs[0])
+          _require(address == output_base + lane * 16, "global store does not address the four-component output")
+          expected_origins = tuple(("fill", full[lane][data_base + component]) if fill else ("f32-add", component)
+                                   for component in range(4))
+          _require(tuple(origins[lane].get(data_base + component) for component in range(4)) == expected_origins,
+                   "four-component store does not consume the fill literals" if fill else
+                   "four-component store does not consume the repeated f32 add")
+          _require(address % 4 == 0 and address + 16 <= 1 << 64, "invalid A630 four-component global-store address")
+          view = resolver(address, 16)
+          _require(len(view) == 16, "short A630 four-component global-store range")
+          writes.append(A630ExecutionWrite(address, struct.pack("<4I", *(full[lane][data_base+i] for i in range(4)))))
+          continue
+
+        src = tuple(_read_ir3_operand(operand, full[lane], half[lane], {}, constants) for operand in instruction.srcs)
+        origin:tuple[str, int]|None = None
+        if opcode == "mov.u32":
+          value = src[0]
+          if instruction.srcs[0].kind == "uim": origin = ("fill", value)
+        elif opcode == "add.u": value = src[0] + src[1]
+        elif opcode == "shl.b": value = src[0] << (src[1] & 31)
+        elif opcode == "ashr.b":
+          signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
+          value = signed >> (src[1] & 31)
+        elif opcode == "shrg": value = (src[1] >> (src[0] & 31)) | src[2]
+        elif opcode == "cmps.u.lt": value = int(src[0] < src[1])
+        elif opcode == "cov.u16s32": value = src[0] & 0xffff
+        else: raise ValueError(f"unsupported A630 four-component opcode {opcode}")
+        assert instruction.dst is not None
+        _write_ir3_operand(instruction.dst, value, full[lane], half[lane])
+        if instruction.dst.kind == "gpr":
+          if origin is None: origins[lane].pop(instruction.dst.value, None)
+          else: origins[lane][instruction.dst.value] = origin
+      except (KeyError, ValueError, RuntimeError) as error:
+        raise ValueError(f"A630 instruction {instruction.index} lane {lane} group 0: {error}") from error
+
+  return _finish_writes(writes)
+
 def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630ExecutionWrite, ...]:
-  """Execute the supported A630 scalar images into an immutable write journal; this does not retire the KGSL submission."""
+  """Execute supported A630 images into an immutable write journal; this does not retire the KGSL submission."""
   dispatch = _execution_dispatch(submission)
+  active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
+  if any(instruction.opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for instruction in active):
+    return _execute_vector_u32(dispatch, resolver, active)
   constants = struct.unpack("<1024I", dispatch.constants_image)
   lane_count = dispatch.local_size[0]
   invocation_count = dispatch.global_size[0]
   wgid,lid = _system_registers(dispatch)
-  active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
   loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
   comparison_instruction = _u32_comparison_instruction(active)
@@ -1048,16 +1309,10 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             else:
               _require(frozenset(source_origins) == frozenset((("load", 0), ("load", 1))),
                        "f32 add does not consume both global loads")
-            _require(all((bits >> 23 & 0xff) != 0xff and ((bits >> 23 & 0xff) != 0 or bits & 0x7fffff == 0) for bits in src),
-                     "unsupported special or subnormal float input")
-            result = ctypes.c_float(struct.unpack("<f", struct.pack("<I", src[0]))[0] +
-                                    struct.unpack("<f", struct.pack("<I", src[1]))[0]).value
-            value = struct.unpack("<I", struct.pack("<f", result))[0]
-            _require(value >> 23 & 0xff != 0xff, "unsupported special float result")
+            value = _f32_add_bits(src[0], src[1])
             origin = ("f32-add", 0)
           elif opcode == "ldg.u32":
-            base = instruction.srcs[0].value
-            address = full[lane][base] | full[lane][base + 1] << 32
+            address = _gpr_address(full[lane], instruction.srcs[0])
             ordinal = load_ordinals[instruction.index]
             _require(address == input_bases[ordinal] + global_lane * 4, f"global load {ordinal} does not address its scalar input")
             _require(address % 4 == 0 and address + 4 <= 1 << 64, "invalid A630 global-load address")
@@ -1066,8 +1321,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             value = struct.unpack("<I", bytes(view))[0]
             origin = ("load", ordinal)
           elif opcode == "stg.u32":
-            base = instruction.srcs[0].value
-            address = full[lane][base] | full[lane][base + 1] << 32
+            address = _gpr_address(full[lane], instruction.srcs[0])
             _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
             if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
             elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
@@ -1096,8 +1350,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             _require(comparison_instruction is not None and comparison_instruction.opcode is not None,
                      "u32 comparison store lacks a comparison")
             assert comparison_instruction is not None
-            base = instruction.srcs[0].value
-            address = full[lane][base] | full[lane][base + 1] << 32
+            address = _gpr_address(full[lane], instruction.srcs[0])
             _require(address == output_base + global_lane, "global store does not address the scalar bool output")
             if comparison_instruction.opcode == "cmps.s.eq": expected_origin = ("u32-equal", 0)
             else: expected_origin = ("s32-less-than" if comparison_instruction.opcode == "cmps.s.lt" else "u32-less-than", 0)
@@ -1120,7 +1373,4 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
         except (KeyError, ValueError, RuntimeError) as error:
           raise ValueError(f"A630 instruction {instruction.index} lane {lane} group {group}: {error}") from error
 
-  ordered = sorted(writes, key=lambda write: write.address)
-  _require(all(left.address + len(left.data) <= right.address for left,right in zip(ordered, ordered[1:])),
-           "overlapping A630 global stores")
-  return tuple(writes)
+  return _finish_writes(writes)
