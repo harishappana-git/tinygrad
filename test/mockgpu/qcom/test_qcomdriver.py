@@ -591,7 +591,7 @@ class TestQCOMDriver(unittest.TestCase):
         decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))
 
   def test_ir3_typed_instruction_and_modifier_contracts(self):
-    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+    from test.mockgpu.qcom.a630 import A630IR3Operand, _integer_to_f32_rne_bits, decode_a630_ir3
 
     end = 6 << 55
     words = (
@@ -615,6 +615,45 @@ class TestQCOMDriver(unittest.TestCase):
                       "ldg.u32", "add.f", "stg.u32", "mull.u", "madsh.m16", "madsh.m16", "end"))
 
     def decode_one(word): return decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))[0]
+
+    integer_to_float_words = ((0x3094400200000002, "cov.s32f32", 5), (0x308c400200000002, "cov.u32f32", 3))
+    for word,opcode,src_type in integer_to_float_words:
+      conversion = decode_one(word & ~((0xff << 32) | 0xff) | 9 << 32 | 3)
+      self.assertEqual((conversion.opcode, conversion.dst, conversion.srcs),
+                       (opcode, A630IR3Operand("gpr", 9), (A630IR3Operand("gpr", 3),)))
+      self.assertTrue({("SRC_TYPE", src_type), ("DST_TYPE", 1), ("ROUND", 1), ("DST_HALF", 0), ("HALF", 0),
+                       ("JP", 0), ("UL", 0), ("SRC_R", 0), ("LAST", 0)} <= set(conversion.fields))
+      for sy in range(2):
+        for ss in range(2):
+          scheduled = decode_one(word & ~((1 << 44) | (1 << 60)) | ss << 44 | sy << 60)
+          self.assertEqual((scheduled.opcode, scheduled.dst, scheduled.srcs),
+                           (opcode, A630IR3Operand("gpr", 2), (A630IR3Operand("gpr", 2),)))
+      rejected_conversions = {
+        **{f"round-{rounding}": word & ~(0x3 << 55) | rounding << 55 for rounding in (0, 2, 3)},
+        "repeat":word | 1 << 40, "last-use":word | 1 << 10, "source-r":word | 1 << 43,
+        "unsigned-low":word | 1 << 45, "jump-target":word | 1 << 59,
+        "relative-destination":word ^ 1 << 49, "constant-source":word | 1 << 53,
+        "immediate-source":word | 1 << 54, "shared-source":word & ~0xff | 0xc0,
+        "special-source":word & ~0xff | 0xe0, "shared-destination":word & ~(0xff << 32) | 0xc0 << 32,
+        "special-destination":word & ~(0xff << 32) | 0xe0 << 32,
+      }
+      for modifier,rejected in rejected_conversions.items():
+        with self.subTest(conversion=opcode, modifier=modifier): self.assertIsNone(decode_one(rejected).opcode)
+
+    for raw,signed,expected in (
+      (0, False, 0), (1, False, 0x3f800000), (0xffffff, False, 0x4b7fffff),
+      (0x1000000, False, 0x4b800000), (0x1000001, False, 0x4b800000),
+      (0x1000002, False, 0x4b800001), (0x1000003, False, 0x4b800002),
+      (0x02000003, False, 0x4c000001), (0x7fffffff, False, 0x4f000000),
+      (0x80000000, False, 0x4f000000), (0xffffffff, False, 0x4f800000),
+      (0xffffffff, True, 0xbf800000), (0x7fffffff, True, 0x4f000000),
+      (0x80000000, True, 0xcf000000), (0xfdfffffd, True, 0xcc000001),
+    ):
+      with self.subTest(integer_to_float=(raw, signed)):
+        self.assertEqual(_integer_to_f32_rne_bits(raw, signed), expected)
+    for invalid in (-1, 1 << 32):
+      with self.assertRaisesRegex(ValueError, "integer-to-f32 source is outside 32 bits"):
+        _integer_to_f32_rne_bits(invalid, False)
 
     mov_shared = decode_one(0x200cc001000000c0)
     self.assertEqual((mov_shared.opcode, mov_shared.dst, mov_shared.srcs),
@@ -1370,6 +1409,171 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((bytes(result_view), bytes(right_view), self.driver.context_timestamps[self.device.ctx], self.device.last_cmd), before)
       self.device._gpu_free(alias_buffer)
     finally: constants_view[:8] = original_output_pointer
+
+  def test_production_integer_to_float_uses_mapped_machine_bytes(self):
+    import struct
+    from dataclasses import replace
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+
+    cases = (
+      (dtypes.int, 0, 0x00000000), (dtypes.int, 1, 0x3f800000), (dtypes.int, -1, 0xbf800000),
+      (dtypes.int, 16777215, 0x4b7fffff), (dtypes.int, 16777217, 0x4b800000),
+      (dtypes.int, 16777219, 0x4b800002), (dtypes.int, 33554435, 0x4c000001),
+      (dtypes.int, -16777217, 0xcb800000), (dtypes.int, -16777219, 0xcb800002),
+      (dtypes.int, -33554435, 0xcc000001), (dtypes.int, dtypes.int.max, 0x4f000000),
+      (dtypes.uint, 0, 0x00000000), (dtypes.uint, 1, 0x3f800000),
+      (dtypes.uint, 16777215, 0x4b7fffff), (dtypes.uint, 16777217, 0x4b800000),
+      (dtypes.uint, 16777219, 0x4b800002), (dtypes.uint, 33554435, 0x4c000001),
+      (dtypes.uint, 0x80000000, 0x4f000000), (dtypes.uint, dtypes.uint.max, 0x4f800000),
+      (dtypes.int, dtypes.int.min, 0xcf000000),
+    )
+    def scalar_float(tensor):
+      values = cast(list[float], tensor.tolist())
+      self.assertEqual(len(values), 1)
+      return values[0]
+    actual,live_tensors = [],[]
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
+      for dtype,value,_ in cases:
+        source = Tensor([value], dtype=dtype, device=Device.DEFAULT).realize()
+        result = source.cast(dtypes.float).realize()
+        live_tensors.append((source, result))
+        actual.append(struct.unpack("<I", struct.pack("<f", scalar_float(result)))[0])
+    python_reference = [struct.unpack("<I", struct.pack("<f", scalar_float(
+                          Tensor([value], dtype=dtype, device="PYTHON").cast(dtypes.float))))[0]
+                        for dtype,value,_ in cases]
+    cpu_reference = [struct.unpack("<I", struct.pack("<f", scalar_float(
+                       Tensor([value], dtype=dtype, device="CPU").cast(dtypes.float))))[0]
+                     for dtype,value,_ in cases]
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(actual, python_reference)
+    self.assertEqual(actual, cpu_reference)
+    self.assertEqual(actual, [expected for _,_,expected in cases])
+    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
+    decoded_dispatches = []
+    for (dtype,_,expected),submission in zip(cases, submissions):
+      dispatch = submission.dispatches[0]
+      self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
+      loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+      stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
+      conversions = tuple(instruction for instruction in dispatch.instructions if instruction.opcode in {"cov.s32f32", "cov.u32f32"})
+      pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
+                            instruction.srcs[0].kind == "const")
+      self.assertEqual((len(loads), len(stores), len(conversions), len(pointer_moves)), (1, 1, 1, 4))
+      conversion = conversions[0]
+      src_type,opcode = (5, "cov.s32f32") if dtype == dtypes.int else (3, "cov.u32f32")
+      self.assertEqual((conversion.opcode, conversion.srcs, stores[0].srcs[1]), (opcode, (loads[0].dst,), conversion.dst))
+      self.assertEqual((conversion.dst.kind, conversion.srcs[0].kind), ("gpr", "gpr"))
+      self.assertTrue({("SRC_TYPE", src_type), ("DST_TYPE", 1), ("ROUND", 1), ("DST_HALF", 0), ("HALF", 0),
+                       ("JP", 0), ("UL", 0), ("SRC_R", 0), ("LAST", 0)} <= set(conversion.fields))
+      output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+      self.assertEqual(bytes(self.driver.resolve_owned(self.device.fd.fd, output_base, 4)), struct.pack("<I", expected))
+      decoded_dispatches.append((dispatch, conversion))
+
+    # The final scalar capture uses INT_MIN, so changing only SRC_TYPE has an exactly representable, sign-changing result.
+    case_index = len(cases) - 1
+    submission = submissions[case_index]
+    dispatch,conversion = decoded_dispatches[case_index]
+    mixed_raw = 0x5018080b2802000b & ~((0xff << 32) | 0xffff) | conversion.dst.value << 32 | conversion.srcs[0].value
+    mixed_leaf = decode_a630_ir3(mixed_raw.to_bytes(8, "little") + (6 << 55).to_bytes(8, "little"))[0]
+    self.assertEqual((mixed_leaf.opcode, mixed_leaf.dst, mixed_leaf.srcs),
+                     ("add.f", conversion.dst, (conversion.srcs[0], A630IR3Operand("flut", 2))))
+    nop = next(instruction for instruction in dispatch.instructions if instruction.opcode == "nop")
+    mixed_instructions = tuple(replace(mixed_leaf, index=nop.index) if instruction.index == nop.index else instruction
+                               for instruction in dispatch.instructions)
+    with self.assertRaisesRegex(ValueError, "integer-to-f32 conversion requires one global load and no other data operation"):
+      real_execute(replace(submission, dispatches=(replace(dispatch, instructions=mixed_instructions),)),
+                   lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+    shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
+    original = bytes(shader[conversion.index*8:(conversion.index+1)*8])
+    output_base,input_base = struct.unpack_from("<Q", dispatch.constants_image)[0],struct.unpack_from("<Q", dispatch.constants_image, 8)[0]
+    output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
+    source = self.driver.resolve_owned(self.device.fd.fd, input_base, 4)
+    self.assertEqual((bytes(source), bytes(output)), (struct.pack("<I", 0x80000000), struct.pack("<I", 0xcf000000)))
+
+    mutation_raw = conversion.raw & ~(0x7 << 50) | 3 << 50
+    self.assertEqual(mutation_raw ^ conversion.raw, (5 ^ 3) << 50)
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    try:
+      struct.pack_into("<Q", shader, conversion.index * 8, mutation_raw)
+      image = bytes(shader)
+      mutated_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      mutated = mutated_dispatch.instructions[conversion.index]
+      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), ("cov.u32f32", conversion.dst, conversion.srcs))
+      journal = real_execute(replace(submission, dispatches=(mutated_dispatch,)),
+                             lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      self.assertEqual(tuple((write.address, write.data) for write in journal), ((output_base, struct.pack("<I", 0x4f000000)),))
+      self.assertEqual(bytes(output), struct.pack("<I", 0xcf000000))
+      output[:] = struct.pack("<I", 0xdeadbeef)
+      timestamp_before = self.driver.context_timestamps[self.device.ctx]
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual((bytes(source), bytes(output), request.timestamp, self.driver.context_timestamps[self.device.ctx]),
+                       (struct.pack("<I", 0x80000000), struct.pack("<I", 0x4f000000),
+                        (timestamp_before + 1) & 0xffffffff, (timestamp_before + 1) & 0xffffffff))
+    finally:
+      shader[conversion.index*8:(conversion.index+1)*8] = original
+      self.device._gpu_free(request_buffer)
+    self.assertEqual(bytes(shader[conversion.index*8:(conversion.index+1)*8]), original)
+
+    batched_cases = (
+      (dtypes.int, [-33554435, 16777219, -16777217], ((3, 1, 1), (1, 1, 1), (3, 1, 1))),
+      (dtypes.uint, [(index * 1000003) & 0xffffffff for index in range(65)], ((1, 1, 1), (65, 1, 1), (65, 1, 1))),
+    )
+    batched_actual,batched_live = [],[]
+    with self._capture_a630_execution() as (batched_submissions,_,_):
+      for dtype,values,_ in batched_cases:
+        batched_source = Tensor(values, dtype=dtype, device=Device.DEFAULT).realize()
+        batched_result = batched_source.cast(dtypes.float).realize()
+        batched_live.append((batched_source, batched_result))
+        batched_actual.append(batched_result.tolist())
+    self.assertEqual(batched_actual, [Tensor(values, dtype=dtype, device="PYTHON").cast(dtypes.float).tolist()
+                                      for dtype,values,_ in batched_cases])
+    self.assertEqual(batched_actual, [Tensor(values, dtype=dtype, device="CPU").cast(dtypes.float).tolist()
+                                      for dtype,values,_ in batched_cases])
+    self.assertEqual(len(batched_submissions), len(batched_cases))
+    for (_,_,shape),batched_submission in zip(batched_cases, batched_submissions):
+      batched_dispatch = batched_submission.dispatches[0]
+      self.assertEqual((batched_dispatch.local_size, batched_dispatch.groups, batched_dispatch.global_size), shape)
+      batched_load = next(instruction for instruction in batched_dispatch.instructions if instruction.opcode == "ldg.u32")
+      batched_conversion = next(instruction for instruction in batched_dispatch.instructions
+                                if instruction.opcode in {"cov.s32f32", "cov.u32f32"})
+      batched_store = next(instruction for instruction in batched_dispatch.instructions if instruction.opcode == "stg.u32")
+      self.assertEqual((batched_conversion.srcs, batched_store.srcs[1]), ((batched_load.dst,), batched_conversion.dst))
+    self.assertTrue(any(operand.kind == "shared" for instruction in batched_submissions[1].dispatches[0].instructions
+                        for operand in instruction.srcs))
+
+    # ROUND_ZERO is a valid Cat1 encoding but remains outside this RNE-only executor contract and must reject transactionally.
+    request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
+    request.timestamp = marker = 0x31415926
+    signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
+    state_before = (bytes(source), bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                    self.driver.always_on_counter, self.device.last_cmd, self.device.error_state)
+    try:
+      struct.pack_into("<Q", shader, conversion.index * 8, conversion.raw & ~(0x3 << 55))
+      image = bytes(shader)
+      rejected_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image))
+      rejected = rejected_dispatch.instructions[conversion.index]
+      self.assertEqual((rejected.opcode, dict(rejected.fields)["ROUND"]), (None, 0))
+      message = f"unsupported A630 semantic at instruction {conversion.index}"
+      with self.assertRaisesRegex(ValueError, message):
+        real_execute(replace(submission, dispatches=(rejected_dispatch,)),
+                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
+      with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual((request.timestamp, bytes(source), bytes(output), bytes(signal), self.driver.context_timestamps[self.device.ctx],
+                        self.driver.always_on_counter, self.device.last_cmd, self.device.error_state), (marker, *state_before))
+    finally:
+      shader[conversion.index*8:(conversion.index+1)*8] = original
+      self.device._gpu_free(request_buffer)
+    self.assertEqual(bytes(shader[conversion.index*8:(conversion.index+1)*8]), original)
+
+    restored_source = Tensor([dtypes.int.min], dtype=dtypes.int, device=Device.DEFAULT).realize()
+    restored = scalar_float(restored_source.cast(dtypes.float))
+    self.assertEqual(struct.unpack("<I", struct.pack("<f", restored))[0], 0xcf000000)
+    self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) +
+                      Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [13])
 
   def test_production_integer_add_wraps_from_mapped_machine_bytes(self):
     import struct

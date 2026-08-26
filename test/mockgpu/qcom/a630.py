@@ -180,6 +180,16 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     dst = _register_operand(_same_int_field(fields, "DST"), True)
     if dst is not None and dst.kind == "gpr": return "mov.u32", dst, (A630IR3Operand("uim", _same_int_field(fields, "SRC")),)
   cov_variable = (0xff << 32) | 0xff | (1 << 44) | (1 << 60)
+  typed_cov_variable = cov_variable | (0x7 << 46) | (0x7 << 50) | (0x3 << 55)
+  if category == 1 and name is None and raw & ~typed_cov_variable == 0x2000000000000000:
+    src_type = _same_int_field(fields, "SRC_TYPE")
+    opcode = {5:"cov.s32f32", 3:"cov.u32f32"}.get(src_type)
+    if (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "ROUND"),
+        _same_int_field(fields, "DST_HALF"), _same_int_field(fields, "HALF")) == (src_type, 1, 1, 0, 0) and \
+       opcode is not None and _has_no_repeat(fields) and \
+       all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "SRC_R", "LAST")):
+      dst,src = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC"), True)
+      if dst is not None and dst.kind == "gpr" and src is not None and src.kind == "gpr": return opcode, dst, (src,)
   if category == 1 and raw & ~cov_variable == 0x2009400000000000:
     if (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "DST_HALF"),
         _same_int_field(fields, "HALF")) == (2, 5, 0, 1) and _has_no_repeat(fields) and \
@@ -662,6 +672,29 @@ def _u32_comparison_instruction(instructions:Sequence[A630IR3Instruction]) -> A6
     if (instruction:=_u32_binary_instruction(instructions, opcode)) is not None: matches.append(instruction)
   return matches[0] if len(matches) == 1 else None
 
+def _integer_to_f32_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3Instruction|None:
+  loads = tuple(instruction for instruction in instructions if instruction.opcode == "ldg.u32")
+  if len(loads) != 1 or loads[0].dst is None: return None
+  matches = tuple(instruction for instruction in instructions if instruction.opcode in {"cov.s32f32", "cov.u32f32"} and
+                  instruction.srcs == (loads[0].dst,))
+  return matches[0] if len(matches) == 1 else None
+
+def _integer_to_f32_rne_bits(value:int, signed:bool) -> int:
+  _require(0 <= value <= 0xffffffff, "integer-to-f32 source is outside 32 bits")
+  sign = int(signed and bool(value & 0x80000000))
+  magnitude = (1 << 32) - value if sign else value
+  if magnitude == 0: return 0
+  exponent = magnitude.bit_length() - 1
+  if exponent <= 23: significand = magnitude << (23 - exponent)
+  else:
+    shift = exponent - 23
+    significand = magnitude >> shift
+    remainder,halfway = magnitude & ((1 << shift) - 1),1 << (shift - 1)
+    if remainder > halfway or remainder == halfway and significand & 1:
+      significand += 1
+      if significand == 1 << 24: significand,exponent = significand >> 1,exponent + 1
+  return sign << 31 | (exponent + 127) << 23 | significand & 0x7fffff
+
 def _u32_multiply_sequence(instructions:Sequence[A630IR3Instruction]) \
     -> tuple[A630IR3Instruction, A630IR3Instruction, A630IR3Instruction]|None:
   # Pinned ir3_nir_imul.py lowers imul32 to a low-16 product followed by both low/high cross terms in two MADSH.M16s.
@@ -721,8 +754,14 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   integer_kind:str|None = None
   integer_value_type = "u32"
   comparison_instruction = _u32_comparison_instruction(active)
+  conversion_instruction = _integer_to_f32_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   comparison_count = sum(opcodes.count(opcode) for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"))
+  conversion_count = sum(opcodes.count(opcode) for opcode in ("cov.s32f32", "cov.u32f32"))
+  _require(conversion_count == int(conversion_instruction is not None), "integer-to-f32 conversion does not consume the global load")
+  if conversion_count:
+    _require((input_count, float_add_count, conversion_count) == (1, 0, 1),
+             "integer-to-f32 conversion requires one global load and no other data operation")
   simple_opcode = next((opcode for opcode in _SIMPLE_CAT2_INTEGER if opcodes.count(opcode)), None)
   if opcodes.count("stg.u8"):
     _require((input_count, float_add_count, comparison_count, opcodes.count("stg.u8")) == (2, 0, 1, 1) and
@@ -757,11 +796,14 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
   elif uses_constant_pointers:
-    _require((integer_instruction is not None or comparison_instruction is not None) and not shared_uses,
-             "constant-pointer A630 execution supports only scalar 32-bit integer arithmetic or comparison")
+    _require((integer_instruction is not None or comparison_instruction is not None or conversion_instruction is not None) and not shared_uses,
+             "constant-pointer A630 execution supports only scalar 32-bit integer arithmetic, comparison, or conversion")
     _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
              "constant-pointer A630 execution requires one scalar invocation")
-    if comparison_instruction is not None:
+    if conversion_instruction is not None:
+      assert conversion_instruction.opcode is not None
+      expected_counts = {"mov.u32":4, "nop":2, "ldg.u32":1, conversion_instruction.opcode:1, "stg.u32":1, "end":1}
+    elif comparison_instruction is not None:
       assert comparison_instruction.opcode is not None
       expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, comparison_instruction.opcode:1, "stg.u8":1, "end":1}
     else:
@@ -778,6 +820,9 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
                        "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3 + int(uses_workgroup_id),
                        "ldg.u32":input_count, "stg.u32":1, "end":1}
     if float_add_count: expected_counts["add.f"] = 1
+    if conversion_instruction is not None:
+      assert conversion_instruction.opcode is not None
+      expected_counts[conversion_instruction.opcode] = 1
     if uses_workgroup_id: expected_counts["mov.u32"] = 1
   _require(len(opcodes) == sum(expected_counts.values()) and
            all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
@@ -805,6 +850,7 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
       valid = dst_kind == "half" and comparison_instruction is not None and instruction.index == comparison_instruction.index and \
               src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
+    elif instruction.opcode in {"cov.s32f32", "cov.u32f32"}: valid = dst_kind == "gpr" and src_kinds == ("gpr",)
     elif instruction.opcode == "ldg.u32": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
     elif instruction.opcode == "add.f":
       valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or
@@ -822,6 +868,10 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     assert comparison_instruction.dst is not None
     store = next(instruction for instruction in active if instruction.opcode == "stg.u8")
     _require(store.srcs[1] == comparison_instruction.dst, "global store does not consume the u32 comparison")
+  if conversion_instruction is not None:
+    assert conversion_instruction.dst is not None
+    store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
+    _require(store.srcs[1] == conversion_instruction.dst, "global store does not consume the integer-to-f32 conversion")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
   expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
@@ -832,7 +882,8 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     _require(len(moves) == 1 and moves[0].srcs == (A630IR3Operand("uim", 0x3f800000),),
              "unsupported A630 fill literal")
   elif uses_constant_pointers:
-    _require(len(moves) == 6 and all(move.srcs[0].kind == "const" for move in moves), "unsupported A630 constant-pointer moves")
+    _require(len(moves) == 2 * (input_count + 1) and all(move.srcs[0].kind == "const" for move in moves),
+             "unsupported A630 constant-pointer moves")
   else:
     _require((not shared_uses and not moves) or
              (len(moves) == 1 and moves[0].srcs[0].kind == "shared"), "unsupported A630 scalar move contract")
@@ -881,6 +932,7 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
   comparison_instruction = _u32_comparison_instruction(active)
+  conversion_instruction = _integer_to_f32_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   integer_instruction = multiply_sequence[-1] if multiply_sequence is not None else \
     _u32_binary_instruction(active, "shr.b") or _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "xor.b") or \
@@ -980,6 +1032,12 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
               origin = (("u32-equal", 0) if opcode == "cmps.s.eq" else
                         ("s32-less-than" if opcode == "cmps.s.lt" else "u32-less-than", 0))
           elif opcode == "cov.u16s32": value = src[0] & 0xffff
+          elif opcode in {"cov.s32f32", "cov.u32f32"}:
+            _require(conversion_instruction is not None and instruction.index == conversion_instruction.index and
+                     origins[lane].get(instruction.srcs[0].value) == ("load", 0),
+                     "integer-to-f32 conversion does not consume the global load")
+            value = _integer_to_f32_rne_bits(src[0], opcode == "cov.s32f32")
+            origin = ("s32-to-f32-rne" if opcode == "cov.s32f32" else "u32-to-f32-rne", 0)
           elif opcode == "add.f":
             source_origins = tuple(("flut", operand.value) if operand.kind == "flut" else origins[lane].get(operand.value)
                                    if operand.kind == "gpr" else None for operand in instruction.srcs)
@@ -1013,6 +1071,11 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
             if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
             elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
+            elif conversion_instruction is not None:
+              assert conversion_instruction.opcode is not None
+              signed_conversion = conversion_instruction.opcode == "cov.s32f32"
+              expected_origin = ("s32-to-f32-rne" if signed_conversion else "u32-to-f32-rne", 0)
+              store_source = "s32-to-f32 conversion" if signed_conversion else "u32-to-f32 conversion"
             elif integer_instruction is not None:
               if integer_instruction.opcode in _SIMPLE_CAT2_INTEGER:
                 integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[integer_instruction.opcode]
