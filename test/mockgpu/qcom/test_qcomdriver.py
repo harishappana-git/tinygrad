@@ -621,6 +621,13 @@ class TestQCOMDriver(unittest.TestCase):
       with self.subTest(or_reserved_bit=reserved_bit), \
            self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
         decode_one(integer_or.raw | 1 << reserved_bit)
+    signed_maximum = decode_one(0x5338080200070002)
+    unsigned_maximum = decode_one(0x5318080200070002)
+    for maximum,opcode in ((signed_maximum, "max.s"), (unsigned_maximum, "max.u")):
+      self.assertEqual((maximum.opcode, maximum.dst, maximum.srcs),
+                       (opcode, A630IR3Operand("gpr", 2),
+                        (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
+      self.assertTrue({("NAME", opcode), ("SY", 1), ("NOP", 3)} <= set(maximum.fields))
     scheduled_sub = decode_one(integer_sub.raw | 1 << 44)
     self.assertEqual((scheduled_sub.opcode, scheduled_sub.dst, scheduled_sub.srcs),
                      (integer_sub.opcode, integer_sub.dst, integer_sub.srcs))
@@ -728,38 +735,38 @@ class TestQCOMDriver(unittest.TestCase):
     }
     for modifier,word in rejected_subtract.items():
       with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for bitwise in (integer_xor, integer_and, integer_or):
-      rejected_bitwise = {
-        "saturate": bitwise.raw | 1 << 42,
-        "repeat": bitwise.raw | 1 << 40,
-        "unsigned-low": bitwise.raw | 1 << 45,
-        "converted destination": bitwise.raw | 1 << 46,
-        "early input": bitwise.raw | 1 << 47,
-        "jump-target": bitwise.raw | 1 << 59,
-        "half sources": bitwise.raw ^ 1 << 52,
-        "source 1 last-use": bitwise.raw | 1 << 10,
-        "source 1 bitwise-not": bitwise.raw | 1 << 14,
-        "source 2 last-use": bitwise.raw | 1 << 26,
-        "source 2 bitwise-not": bitwise.raw | 1 << 30,
-        "shared destination": bitwise.raw & ~(0xff << 32) | 0xc0 << 32,
-        "special destination": bitwise.raw & ~(0xff << 32) | 0xe0 << 32,
-        "constant source 1": bitwise.raw & ~0xffff | 0x1000,
-        "immediate source 1": bitwise.raw & ~0xffff | 0x2000,
-        "relative GPR source 1": bitwise.raw & ~0xffff | 0x0800,
-        "relative constant source 1": bitwise.raw & ~0xffff | 0x0c00,
-        "FLUT source 1": bitwise.raw & ~0xffff | 0x2802,
-        "shared source 1": bitwise.raw & ~0xffff | 0xc0,
-        "special source 1": bitwise.raw & ~0xffff | 0xe0,
-        "constant source 2": bitwise.raw & ~(0xffff << 16) | 0x1000 << 16,
-        "immediate source 2": bitwise.raw & ~(0xffff << 16) | 0x2000 << 16,
-        "relative GPR source 2": bitwise.raw & ~(0xffff << 16) | 0x0800 << 16,
-        "relative constant source 2": bitwise.raw & ~(0xffff << 16) | 0x0c00 << 16,
-        "FLUT source 2": bitwise.raw & ~(0xffff << 16) | 0x2802 << 16,
-        "shared source 2": bitwise.raw & ~(0xffff << 16) | 0xc0 << 16,
-        "special source 2": bitwise.raw & ~(0xffff << 16) | 0xe0 << 16,
+    for binary in (integer_xor, integer_and, integer_or, signed_maximum, unsigned_maximum):
+      rejected_binary = {
+        "saturate": binary.raw | 1 << 42,
+        "repeat": binary.raw | 1 << 40,
+        "unsigned-low": binary.raw | 1 << 45,
+        "converted destination": binary.raw | 1 << 46,
+        "early input": binary.raw | 1 << 47,
+        "jump-target": binary.raw | 1 << 59,
+        "half sources": binary.raw ^ 1 << 52,
+        "source 1 last-use": binary.raw | 1 << 10,
+        "source 1 modifier": binary.raw | 1 << 14,
+        "source 2 last-use": binary.raw | 1 << 26,
+        "source 2 modifier": binary.raw | 1 << 30,
+        "shared destination": binary.raw & ~(0xff << 32) | 0xc0 << 32,
+        "special destination": binary.raw & ~(0xff << 32) | 0xe0 << 32,
+        "constant source 1": binary.raw & ~0xffff | 0x1000,
+        "immediate source 1": binary.raw & ~0xffff | 0x2000,
+        "relative GPR source 1": binary.raw & ~0xffff | 0x0800,
+        "relative constant source 1": binary.raw & ~0xffff | 0x0c00,
+        "FLUT source 1": binary.raw & ~0xffff | 0x2802,
+        "shared source 1": binary.raw & ~0xffff | 0xc0,
+        "special source 1": binary.raw & ~0xffff | 0xe0,
+        "constant source 2": binary.raw & ~(0xffff << 16) | 0x1000 << 16,
+        "immediate source 2": binary.raw & ~(0xffff << 16) | 0x2000 << 16,
+        "relative GPR source 2": binary.raw & ~(0xffff << 16) | 0x0800 << 16,
+        "relative constant source 2": binary.raw & ~(0xffff << 16) | 0x0c00 << 16,
+        "FLUT source 2": binary.raw & ~(0xffff << 16) | 0x2802 << 16,
+        "shared source 2": binary.raw & ~(0xffff << 16) | 0xc0 << 16,
+        "special source 2": binary.raw & ~(0xffff << 16) | 0xe0 << 16,
       }
-      for modifier,word in rejected_bitwise.items():
-        with self.subTest(bitwise_opcode=bitwise.name, bitwise_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+      for modifier,word in rejected_binary.items():
+        with self.subTest(binary_opcode=binary.name, binary_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
     for compare in (signed_compare, unsigned_compare, equality_compare):
       rejected_compare = {
         "condition": compare.raw | 1 << 48,
@@ -1522,9 +1529,9 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) -
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
 
-  def _assert_production_integer_bitwise_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, operation,
-                                                                   cases, mutation_opcode, mutation_opcode_bits,
-                                                                   mutation_expected):
+  def _assert_production_integer_binary_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, operation,
+                                                                  cases, mutation_opcode, mutation_opcode_bits, mutation_expected,
+                                                                  unsupported_opcode_bits=None, unsupported_name=None, value_type="u32"):
     import struct
     from dataclasses import replace
     from tinygrad import Device, Tensor
@@ -1564,19 +1571,19 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size), ((1, 1, 1),) * 3)
       loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
       stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
-      bitwise_instructions = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == opcode)
+      binary_instructions = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == opcode)
       pointer_moves = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
                             instruction.srcs[0].kind == "const")
-      self.assertEqual((len(loads), len(stores), len(bitwise_instructions), len(pointer_moves)), (2, 1, 1, 6))
-      bitwise = bitwise_instructions[0]
-      self.assertEqual((bitwise.raw >> 61, bitwise.raw >> 53 & 0x3f, bitwise.srcs),
+      self.assertEqual((len(loads), len(stores), len(binary_instructions), len(pointer_moves)), (2, 1, 1, 6))
+      binary = binary_instructions[0]
+      self.assertEqual((binary.raw >> 61, binary.raw >> 53 & 0x3f, binary.srcs),
                        (2, opcode_bits, (loads[0].dst, loads[1].dst)))
-      self.assertIsNotNone(bitwise.dst)
-      assert bitwise.dst is not None
-      self.assertEqual(bitwise.dst.kind, "gpr")
-      self.assertEqual(stores[0].srcs[1], bitwise.dst)
+      self.assertIsNotNone(binary.dst)
+      assert binary.dst is not None
+      self.assertEqual(binary.dst.kind, "gpr")
+      self.assertEqual(stores[0].srcs[1], binary.dst)
       self.assertTrue({("NAME", opcode), ("SY", 1), ("SS", 0), ("NOP", 3), ("DST_HALF", 0),
-                       ("JP", 0), ("SAT", 0), ("UL", 0), ("EI", 0)} <= set(bitwise.fields))
+                       ("JP", 0), ("SAT", 0), ("UL", 0), ("EI", 0)} <= set(binary.fields))
       self.assertTrue(all(("TYPE", 3) in instruction.fields for instruction in loads + stores))
       destinations = {}
       for instruction in pointer_moves:
@@ -1585,34 +1592,34 @@ class TestQCOMDriver(unittest.TestCase):
       bases = (stores[0].srcs[0].value, *(instruction.srcs[0].value for instruction in loads))
       self.assertEqual(tuple((destinations[2*i], destinations[2*i+1]) for i in range(3)),
                        tuple((base, base+1) for base in bases))
-      decoded_dispatches.append((dispatch, bitwise, stores[0]))
+      decoded_dispatches.append((dispatch, binary, stores[0]))
 
     # The newest command avoids replaying a stale historical EVENT_WRITE after the numerical matrix.
     case_index = len(cases) - 1
     self.assertNotEqual(mutation_expected, cases[case_index][3] & 0xffffffff)
     submission = submissions[case_index]
-    dispatch,bitwise,store = decoded_dispatches[case_index]
+    dispatch,binary,store = decoded_dispatches[case_index]
     shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
-    original = bytes(shader[bitwise.index*8:(bitwise.index+1)*8])
+    original = bytes(shader[binary.index*8:(binary.index+1)*8])
     output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, 4)
     request_buffer,_,request = self.gpu_command(struct.unpack(f"<{len(command_images[case_index]) // 4}I", command_images[case_index]))
     timestamp_before = self.driver.context_timestamps[self.device.ctx]
     try:
-      mutation_raw = bitwise.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
+      mutation_raw = binary.raw & ~(0x3f << 53) | mutation_opcode_bits << 53
       self.assertEqual((mutation_raw >> 53 & 0x3f, mutation_raw & ~(0x3f << 53)),
-                       (mutation_opcode_bits, bitwise.raw & ~(0x3f << 53)))
-      struct.pack_into("<Q", shader, bitwise.index * 8, mutation_raw)
-      mutated = decode_a630_ir3(bytes(shader))[bitwise.index]
-      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, bitwise.dst, bitwise.srcs))
+                       (mutation_opcode_bits, binary.raw & ~(0x3f << 53)))
+      struct.pack_into("<Q", shader, binary.index * 8, mutation_raw)
+      mutated = decode_a630_ir3(bytes(shader))[binary.index]
+      self.assertEqual((mutated.opcode, mutated.dst, mutated.srcs), (mutation_opcode, binary.dst, binary.srcs))
       output[:] = struct.pack("<I", mutation_expected ^ 0xffffffff)
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
       self.assertEqual(struct.unpack("<I", output)[0], mutation_expected)
       self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]), ((timestamp_before + 1) & 0xffffffff,) * 2)
     finally:
-      shader[bitwise.index*8:(bitwise.index+1)*8] = original
+      shader[binary.index*8:(binary.index+1)*8] = original
       self.device._gpu_free(request_buffer)
-    self.assertEqual(bytes(shader[bitwise.index*8:(bitwise.index+1)*8]), original)
+    self.assertEqual(bytes(shader[binary.index*8:(binary.index+1)*8]), original)
 
     def reject_mapped_mutation(instruction, raw, expected_opcode, expected_srcs, message, *, expected_name=None):
       original_instruction = bytes(shader[instruction.index*8:(instruction.index+1)*8])
@@ -1639,17 +1646,22 @@ class TestQCOMDriver(unittest.TestCase):
         self.device._gpu_free(request_buffer)
       self.assertEqual(bytes(shader[instruction.index*8:(instruction.index+1)*8]), original_instruction)
 
-    dataflow_message = f"u32 {operation} does not consume both global loads"
-    src1 = bitwise.raw & 0xffff
-    reject_mapped_mutation(bitwise, bitwise.raw & ~(0xffff << 16) | src1 << 16,
-                           opcode, (bitwise.srcs[0], bitwise.srcs[0]), dataflow_message)
+    dataflow_message = f"{value_type} {operation} does not consume both global loads"
+    src1 = binary.raw & 0xffff
+    reject_mapped_mutation(binary, binary.raw & ~(0xffff << 16) | src1 << 16,
+                           opcode, (binary.srcs[0], binary.srcs[0]), dataflow_message)
     nop = next(instruction for instruction in dispatch.instructions if instruction.opcode == "nop")
-    reject_mapped_mutation(nop, bitwise.raw, opcode, bitwise.srcs, dataflow_message)
-    redirected = next(operand for operand in bitwise.srcs if operand != bitwise.dst)
+    reject_mapped_mutation(nop, binary.raw, opcode, binary.srcs, dataflow_message)
+    redirected = next(operand for operand in binary.srcs if operand != binary.dst)
     reject_mapped_mutation(store, store.raw & ~(0xff << 1) | redirected.value << 1, "stg.u32",
-                           (store.srcs[0], redirected), f"global store does not consume the u32 {operation}")
-    reject_mapped_mutation(bitwise, bitwise.raw | 1 << 14, None, (),
-                           f"unsupported A630 semantic at instruction {bitwise.index}", expected_name=opcode)
+                           (store.srcs[0], redirected), f"global store does not consume the {value_type} {operation}")
+    reject_mapped_mutation(binary, binary.raw | 1 << 14, None, (),
+                           f"unsupported A630 semantic at instruction {binary.index}", expected_name=opcode)
+    if unsupported_opcode_bits is not None:
+      self.assertIsNotNone(unsupported_name)
+      unsupported_raw = binary.raw & ~(0x3f << 53) | unsupported_opcode_bits << 53
+      reject_mapped_mutation(binary, unsupported_raw, None, (),
+                             f"unsupported A630 semantic at instruction {binary.index}", expected_name=unsupported_name)
 
   def test_production_integer_xor_uses_mapped_machine_bytes(self):
     import operator
@@ -1665,7 +1677,7 @@ class TestQCOMDriver(unittest.TestCase):
              (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 0),
              (dtypes.uint, dtypes.uint.max, 1, 0xfffffffe))
     # The opcode-only ADD.U mutation changes uint.max XOR 1 from 0xfffffffe to wrapped zero.
-    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
       tensor_operator=operator.xor, opcode="xor.b", opcode_bits=0x1f, operation="bitwise XOR", cases=cases,
       mutation_opcode="add.u", mutation_opcode_bits=0x10, mutation_expected=0)
     self.assertEqual(operator.xor(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
@@ -1685,7 +1697,7 @@ class TestQCOMDriver(unittest.TestCase):
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0x0a0a0a0a),
              (dtypes.uint, dtypes.uint.max, 0x80000001, 0x80000001))
     # The opcode-only XOR.B mutation changes uint.max AND 0x80000001 from 0x80000001 to 0x7ffffffe.
-    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
       tensor_operator=operator.and_, opcode="and.b", opcode_bits=0x1c, operation="bitwise AND", cases=cases,
       mutation_opcode="xor.b", mutation_opcode_bits=0x1f, mutation_expected=0x7ffffffe)
     self.assertEqual(operator.and_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
@@ -1705,11 +1717,45 @@ class TestQCOMDriver(unittest.TestCase):
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xafafafaf),
              (dtypes.uint, dtypes.uint.max, 0x80000001, dtypes.uint.max))
     # The opcode-only AND.B mutation changes uint.max OR 0x80000001 from uint.max to 0x80000001.
-    self._assert_production_integer_bitwise_uses_mapped_machine_bytes(
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
       tensor_operator=operator.or_, opcode="or.b", opcode_bits=0x1d, operation="bitwise OR", cases=cases,
       mutation_opcode="and.b", mutation_opcode_bits=0x1c, mutation_expected=0x80000001)
     self.assertEqual(operator.or_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                   Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xafafafaf])
+
+  def test_production_signed_maximum_uses_mapped_machine_bytes(self):
+    from tinygrad import Device, Tensor, dtypes
+    cases = ((dtypes.int, 0, 0, 0),
+             (dtypes.int, -1, 0, 0),
+             (dtypes.int, 0, -1, 0),
+             (dtypes.int, dtypes.int.min, dtypes.int.max, dtypes.int.max),
+             (dtypes.int, dtypes.int.min, -1, -1),
+             (dtypes.int, dtypes.int.max, dtypes.int.min, dtypes.int.max),
+             (dtypes.int, -1431655766, 252645135, 252645135),
+             (dtypes.int, -7, 3, 3))
+    # The opcode-only OR.B mutation changes signed max(-7, 3) from 3 to the raw bit pattern for -5.
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
+      tensor_operator=Tensor.maximum, opcode="max.s", opcode_bits=0x19, operation="maximum", cases=cases,
+      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=0xfffffffb,
+      unsupported_opcode_bits=0x17, unsupported_name="min.s", value_type="s32")
+    self.assertEqual(Tensor([-7], dtype=dtypes.int, device=Device.DEFAULT).maximum(
+      Tensor([3], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [3])
+
+  def test_production_unsigned_maximum_uses_mapped_machine_bytes(self):
+    from tinygrad import Device, Tensor, dtypes
+    cases = ((dtypes.uint, 0, 0, 0),
+             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
+             (dtypes.uint, dtypes.uint.max, 0, dtypes.uint.max),
+             (dtypes.uint, 1, 2, 2),
+             (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xaaaaaaaa),
+             (dtypes.uint, 0x80000000, 0x7fffffff, 0x80000000))
+    # The opcode-only OR.B mutation changes unsigned max(0x80000000, 0x7fffffff) to uint.max.
+    self._assert_production_integer_binary_uses_mapped_machine_bytes(
+      tensor_operator=Tensor.maximum, opcode="max.u", opcode_bits=0x18, operation="maximum", cases=cases,
+      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=dtypes.uint.max,
+      unsupported_opcode_bits=0x16, unsupported_name="min.u")
+    self.assertEqual(Tensor([0x80000000], dtype=dtypes.uint, device=Device.DEFAULT).maximum(
+      Tensor([0x7fffffff], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x80000000])
 
   def test_production_integer_multiply_wraps_from_mapped_machine_bytes(self):
     import struct
