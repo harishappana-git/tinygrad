@@ -315,29 +315,31 @@ class QCOMDriver(VirtDriver):
     for journal_write in journal:
       self._require(not self._overlaps(journal_write.address, len(journal_write.data), command_address, command_size),
                     f"{journal_write.purpose} aliases the command image")
-    for index,left in enumerate(journal):
-      for right in journal[index+1:]:
-        if not self._overlaps(left.address, len(left.data), right.address, len(right.data)): continue
-        repeated_pm4_target = not left.from_dispatch and not right.from_dispatch and \
-          (left.address, len(left.data)) == (right.address, len(right.data))
-        self._require(repeated_pm4_target, f"overlapping {left.purpose} and {right.purpose}")
+    # Preserve temporal journal order for commit, but validate address intervals in O(J log J). If an invalid
+    # overlap exists in address order, an adjacent invalid pair exists; a chain of permitted overlaps can contain
+    # only identical repeated PM4 targets.
+    address_journal = sorted(journal, key=lambda write: (write.address, len(write.data), write.word_offset, write.ordinal))
+    for left,right in zip(address_journal, address_journal[1:]):
+      if not self._overlaps(left.address, len(left.data), right.address, len(right.data)): continue
+      repeated_pm4_target = not left.from_dispatch and not right.from_dispatch and \
+        (left.address, len(left.data)) == (right.address, len(right.data))
+      self._require(repeated_pm4_target, f"overlapping {left.purpose} and {right.purpose}")
 
     if submission.dispatches:
       immutable_reads = [(memory_range.address, memory_range.size, memory_range.purpose)
                          for memory_range in submission.memory_ranges if memory_range.read and memory_range.purpose != "wait value"]
-      # Actual machine execution is the source of truth for dynamic loads. Coalesce the exact observed union by purpose so
-      # maximum-sized vector dispatches do not turn the subsequent journal/read overlap audit into a quadratic operation.
-      coalesced_reads:list[tuple[int, int, str]] = []
-      for address,size,purpose in sorted(execution_reads, key=lambda read: (read[2], read[0], read[1])):
-        if coalesced_reads and coalesced_reads[-1][2] == purpose and address <= coalesced_reads[-1][0] + coalesced_reads[-1][1]:
-          previous_address,previous_size,_ = coalesced_reads[-1]
-          coalesced_reads[-1] = (previous_address, max(previous_address + previous_size, address + size) - previous_address, purpose)
-        else: coalesced_reads.append((address, size, purpose))
-      immutable_reads.extend(coalesced_reads)
-      for journal_write in journal:
-        for address,size,purpose in immutable_reads:
-          self._require(not self._overlaps(journal_write.address, len(journal_write.data), address, size),
-                        f"{journal_write.purpose} aliases snapshotted {purpose}")
+      # Actual machine execution is the source of truth for dynamic loads. Sweep the exact intervals rather than
+      # coalescing away diagnostic provenance or multiplying every write by every read.
+      immutable_reads.extend(execution_reads)
+      address_reads = sorted(immutable_reads, key=lambda read: (read[0], read[1], read[2]))
+      write_index = read_index = 0
+      while write_index < len(address_journal) and read_index < len(address_reads):
+        journal_write = address_journal[write_index]
+        address,size,purpose = address_reads[read_index]
+        if self._overlaps(journal_write.address, len(journal_write.data), address, size):
+          self._require(False, f"{journal_write.purpose} aliases snapshotted {purpose}")
+        if journal_write.address + len(journal_write.data) <= address: write_index += 1
+        else: read_index += 1
 
     return tuple(journal), planned_counter
 
