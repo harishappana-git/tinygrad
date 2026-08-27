@@ -171,6 +171,11 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     immediate = _same_int_field(fields, "IMMED")
     _require(0 <= immediate < 1 << 32, "invalid Cat0 jump immediate")
     return "jump", None, (A630IR3Operand("iim", immediate - (1 << 32) if immediate & 0x80000000 else immediate),)
+  # ir3-cat0.xml defines these exact predicate-region controls. PREDT captures p0.x for all fibers; PREDE
+  # returns to unpredicated execution. Keep the implicit predicate operand explicit in the normalized contract.
+  if category == 0 and name == "predt" and raw == 0x0682000000000000:
+    return "predt.p0", None, (A630IR3Operand("pred", 0),)
+  if category == 0 and name == "prede" and raw == 0x0782000000000000: return "prede", None, ()
   # These cat1 leaves have no NAME callback, so fixed leaf bits and typed callback fields identify them without parsing text.
   cat1_schedule = (1 << 44) | (1 << 60)
   mov_gpr_variable = (0xff << 32) | 0xff | cat1_schedule
@@ -224,14 +229,18 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(src is not None and src.kind == "gpr" and src.value + 3 < 0xc0 for src in srcs):
       assert srcs[0] is not None and srcs[1] is not None
       return "add.f.rpt4", dst, (srcs[0], srcs[1])
-  if category == 2 and name == "cmps.s" and _same_int_field(fields, "COND") == 3 and \
+  if category == 2 and name == "cmps.s" and _same_int_field(fields, "COND") in (3, 4) and \
      (_same_int_field(fields, "DST_HALF"), _same_int_field(fields, "DST")) == (0, 0xf8) and _has_no_repeat(fields) and \
      all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG", "SRC_R", "SY", "SS")) and \
-     (raw >> 52 & 1, raw >> 46 & 1) == (1, 0) and all(value == 0 for value in _field_values(fields, "HALF")):
+     (raw >> 52 & 1, raw >> 46 & 1) == (1, 0) and \
+     ((_same_int_field(fields, "COND") == 3 and raw >> 51 & 1 == 1) or
+      (_same_int_field(fields, "COND") == 4 and (raw >> 43 & 1, raw >> 51 & 1) == (0, 0))) and \
+     all(value == 0 for value in _field_values(fields, "HALF")):
     srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), True),
             _multisrc_operand(_same_int_field(fields, "SRC2"), True))
     if srcs[0] is not None and srcs[1] is not None:
-      return "cmps.s.ge.p0", A630IR3Operand("pred", 0), (srcs[0], srcs[1])
+      return ("cmps.s.ge.p0" if _same_int_field(fields, "COND") == 3 else "cmps.s.eq.p0"), \
+             A630IR3Operand("pred", 0), (srcs[0], srcs[1])
   cat2_compare = name in {"cmps.u", "cmps.s"}
   if category == 2 and name in {"ashr.b", "shl.b", "shr.b", "add.u", "sub.u", "max.s", "max.u", "xor.b", "and.b", "or.b",
                                 "mull.u", "cmps.u", "cmps.s", "add.f"} and \
@@ -301,6 +310,24 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     address,data = _register_operand(_same_int_field(fields, "SRC1"), True), _register_operand(_same_int_field(fields, "SRC3"), False)
     if address is not None and address.kind == "gpr" and address.value + 1 < 0xc0 and data is not None and data.kind == "half":
       return "stg.u8", None, (address, data)
+  # Local-memory offsets are byte-addressed scalar GPRs, unlike the adjacent GPR pair used by global memory.
+  # ir3-cat6.xml gives LDL's address in SRC and STL's address in DST; SIZE is the U32 component count.
+  ldl_variable = (0xff << 32) | (0xff << 14) | (0x7 << 24) | cat6_schedule
+  if category == 6 and name == "ldl" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "OFF"),
+                                           _same_int_field(fields, "SIZE")) == (3, 0, 4) and \
+     _int_field_is(fields, "JP", 0) and raw & ~ldl_variable == 0xc046000000800001:
+    dst,address = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC"), True)
+    if dst is not None and dst.kind == "gpr" and dst.value + 3 < 0xc0 and address is not None and address.kind == "gpr":
+      return "ldl.u32x4", dst, (address,)
+  stl_variable = (0xff << 41) | (0xff << 1) | (0x7 << 24) | cat6_schedule
+  if category == 6 and name == "stl" and (_same_int_field(fields, "TYPE"), _same_int_field(fields, "OFF"),
+                                           _same_int_field(fields, "SIZE")) == (3, 0, 1) and \
+     _int_field_is(fields, "JP", 0) and raw & ~stl_variable == 0xc106010000800000:
+    address,data = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC"), True)
+    if address is not None and address.kind == "gpr" and data is not None and data.kind == "gpr":
+      return "stl.u32", None, (address, data)
+  # ir3-cat7.xml distinguishes this exact workgroup execution barrier from FENCE and from other BAR scopes.
+  if category == 7 and name == "bar" and raw == 0xe042000000000000: return "bar.g", None, ()
   return None, None, ()
 
 def decode_a630_ir3(image:bytes) -> tuple[A630IR3Instruction, ...]:
@@ -1383,6 +1410,150 @@ def _validate_scalar_reduction_dispatch(dispatch:A630Dispatch, active:Sequence[A
   _validate_register_footprint(registers, full_registers, half_registers,
                                "A630 scalar reduction register footprint does not match decoded operands")
 
+def _validate_workgroup_reduction_dispatch(dispatch:A630Dispatch, active:Sequence[A630IR3Instruction],
+                                           registers:dict[int, int], wgid:int, lid:int) -> None:
+  # Pinned ir3_compiler_nir.c lowers the shared byte offsets to STL/LDL and emits BAR.G for a workgroup
+  # control barrier. ir3-cat0.xml defines PREDT as the p0.x fiber mask and PREDE as its terminator. This is
+  # deliberately one exact one-wave reduction shape, not general SIMT, local-memory, or predicated execution.
+  _require(dispatch.local_size == dispatch.global_size == (16, 1, 1) and dispatch.groups == (1, 1, 1),
+           "A630 workgroup reduction requires one exact sixteen-lane workgroup")
+  _require((wgid, lid) == (0xfc, 0), "unsupported A630 workgroup reduction system-value mapping")
+  _require(registers.get(mesa.REG_A6XX_SP_CS_CNTL_1) == 0x41 and
+           registers.get(mesa.REG_A6XX_SP_CS_BOOLEAN_CF_MASK) == 0 and
+           registers.get(mesa.REG_A6XX_SP_CS_NDRANGE_0) == 0x3f,
+           "unsupported A630 workgroup reduction control state")
+  _require(not any(operand.kind == "shared" for instruction in active for operand in instruction.srcs),
+           "A630 workgroup reduction uses a shared system-value register")
+
+  opcodes = tuple(instruction.opcode for instruction in active)
+  expected_counts = {"shl.b":20, "ashr.b":17, "cmps.s.eq.p0":1, "add.u":78, "cmps.u.lt":16,
+                     "shrg":17, "cov.u16s32":16, "ldg.u32":16, "mov.u32":10, "add.f":30,
+                     "nop":7, "stl.u32":1, "bar.g":1, "ldl.u32x4":4, "predt.p0":1,
+                     "stg.u32":1, "prede":1, "end":1}
+  _require(len(opcodes) == sum(expected_counts.values()) and
+           all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
+           "unsupported A630 workgroup reduction instruction inventory")
+
+  for instruction in active:
+    dst_kind = instruction.dst.kind if instruction.dst is not None else None
+    src_kinds = tuple(operand.kind for operand in instruction.srcs)
+    valid = instruction.opcode in {"nop", "bar.g", "prede", "end"} and dst_kind is None and not src_kinds
+    if instruction.opcode == "cmps.s.eq.p0":
+      valid = instruction.dst == A630IR3Operand("pred", 0) and instruction.srcs == \
+        (A630IR3Operand("gpr", lid), A630IR3Operand("iim", 0))
+    elif instruction.opcode == "predt.p0":
+      valid = dst_kind is None and instruction.srcs == (A630IR3Operand("pred", 0),)
+    elif instruction.opcode == "ashr.b":
+      valid = dst_kind == "gpr" and src_kinds == ("gpr", "iim") and instruction.srcs[1].value == 31
+    elif instruction.opcode == "shl.b":
+      valid = dst_kind == "gpr" and src_kinds == ("gpr", "iim") and instruction.srcs[1].value in (2, 4, 6)
+    elif instruction.opcode == "shrg":
+      valid = dst_kind == "gpr" and src_kinds == ("iim", "gpr", "gpr") and instruction.srcs[0].value == 30
+    elif instruction.opcode == "add.u":
+      valid = dst_kind == "gpr" and src_kinds in (("gpr", "gpr"), ("const", "gpr"), ("gpr", "iim"))
+    elif instruction.opcode == "cmps.u.lt": valid = dst_kind == "half" and src_kinds == ("gpr", "const")
+    elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
+    elif instruction.opcode == "mov.u32": valid = dst_kind == "gpr" and src_kinds in (("uim",), ("const",))
+    elif instruction.opcode in {"ldg.u32", "add.f"}:
+      valid = dst_kind == "gpr" and src_kinds == (("gpr",) if instruction.opcode == "ldg.u32" else ("gpr", "gpr"))
+    elif instruction.opcode == "stl.u32": valid = dst_kind is None and src_kinds == ("gpr", "gpr")
+    elif instruction.opcode == "ldl.u32x4": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
+    elif instruction.opcode == "stg.u32": valid = dst_kind is None and src_kinds == ("gpr", "gpr")
+    _require(valid, f"unsupported A630 workgroup reduction operand contract at instruction {instruction.index}")
+
+  compare = next(instruction for instruction in active if instruction.opcode == "cmps.s.eq.p0")
+  store_local = next(instruction for instruction in active if instruction.opcode == "stl.u32")
+  barrier = next(instruction for instruction in active if instruction.opcode == "bar.g")
+  loads_local = tuple(instruction for instruction in active if instruction.opcode == "ldl.u32x4")
+  predt = next(instruction for instruction in active if instruction.opcode == "predt.p0")
+  store_global = next(instruction for instruction in active if instruction.opcode == "stg.u32")
+  prede = next(instruction for instruction in active if instruction.opcode == "prede")
+  end = next(instruction for instruction in active if instruction.opcode == "end")
+  _require(compare.index < store_local.index < barrier.index < min(instruction.index for instruction in loads_local) and
+           max(instruction.index for instruction in loads_local) < predt.index < store_global.index < prede.index < end.index,
+           "unsupported A630 workgroup reduction phase ordering")
+  _require(tuple(instruction.opcode for instruction in active[predt.index:end.index+1]) ==
+           ("predt.p0", "nop", "stg.u32", "prede", "end"),
+           "unsupported A630 workgroup reduction predicate region")
+
+  lane_bytes = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                     instruction.dst == store_local.srcs[0] and
+                     instruction.srcs == (A630IR3Operand("gpr", lid), A630IR3Operand("iim", 2)))
+  _require(len(lane_bytes) == 1 and lane_bytes[0].index < store_local.index,
+           "A630 workgroup reduction local store lacks the lane byte offset")
+  _require(store_local.srcs[1] == A630IR3Operand("gpr", 13),
+           "A630 workgroup reduction local store lacks the lane partial")
+
+  local_plan = {(instruction.dst.value, instruction.srcs[0].value):instruction for instruction in loads_local
+                if instruction.dst is not None}
+  _require(set(local_plan) == {(44, 0), (0, 2), (4, 4), (8, 16)},
+           "unsupported A630 workgroup reduction local-load register plan")
+  immediate_moves = {instruction.dst.value:instruction for instruction in active
+                     if instruction.opcode == "mov.u32" and instruction.dst is not None and instruction.srcs[0].kind == "uim"}
+  _require(set(immediate_moves) == {0, 1, 2, 3, 4, 5, 16, 17} and
+           all(immediate_moves[register].srcs[0].value == 0 for register in (1, 3, 5, 17)) and
+           all(0 <= immediate_moves[register].srcs[0].value <= 2032 and immediate_moves[register].srcs[0].value % 4 == 0
+               for register in (0, 2, 4, 16)),
+           "unsupported A630 workgroup reduction local-offset moves")
+  # LDL addresses are scalar byte offsets. Aligned overlapping initialized reads are legal, which also leaves a
+  # machine-byte causal control; the executor separately rejects every uninitialized or out-of-range dword.
+  for (_,source),load in local_plan.items():
+    _require(immediate_moves[source].index < load.index,
+             "A630 workgroup reduction local offset does not dominate its load")
+  pointer_moves = {(instruction.srcs[0].value, instruction.dst.value):instruction for instruction in active
+                   if instruction.opcode == "mov.u32" and instruction.dst is not None and instruction.srcs[0].kind == "const"}
+  _require(set(pointer_moves) == {(0, 18), (1, 19)} and store_global.srcs[0] == A630IR3Operand("gpr", 18) and
+           all(move.index < store_global.index for move in pointer_moves.values()),
+           "A630 workgroup reduction output pointer does not match the constant ABI")
+
+  first_adds = tuple(instruction for instruction in active if instruction.opcode == "add.f" and instruction.index < store_local.index)
+  final_adds = tuple(instruction for instruction in active if instruction.opcode == "add.f" and barrier.index < instruction.index < predt.index)
+  _require(len(first_adds) == len(final_adds) == 15 and
+           all(instruction.dst == A630IR3Operand("gpr", 13) and instruction.srcs[0] == instruction.dst
+               for instruction in first_adds),
+           "unsupported A630 workgroup reduction lane accumulator")
+  local_values = tuple(A630IR3Operand("gpr", register) for register in (45, 46, 47, *range(12)))
+  _require(all(instruction.dst == A630IR3Operand("gpr", 44) and instruction.srcs[0] == instruction.dst
+               for instruction in final_adds) and tuple(instruction.srcs[1] for instruction in final_adds) == local_values and
+           store_global.srcs[1] == A630IR3Operand("gpr", 44),
+           "unsupported A630 workgroup reduction final accumulator")
+  constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
+  _require(constant_uses == [0, 1] + [2] * 32 + [3] * 16,
+           "A630 workgroup reduction constants do not match the buffer ABI")
+  pre_store_nop,post_barrier_nop = active[store_local.index-1],active[barrier.index+1]
+  post_first_load_nop,predicate_delay = active[loads_local[0].index+1],active[predt.index+1]
+  _require((pre_store_nop.opcode, _same_int_field(pre_store_nop.fields, "REPEAT"),
+            _same_int_field(pre_store_nop.fields, "SS"), _same_int_field(pre_store_nop.fields, "SY")) == ("nop", 2, 0, 0) and
+           (post_barrier_nop.opcode, _same_int_field(post_barrier_nop.fields, "REPEAT"),
+            _same_int_field(post_barrier_nop.fields, "SS"), _same_int_field(post_barrier_nop.fields, "SY")) == ("nop", 0, 1, 0) and
+           post_barrier_nop.index + 1 == loads_local[0].index and
+           (post_first_load_nop.opcode, _same_int_field(post_first_load_nop.fields, "REPEAT"),
+            _same_int_field(post_first_load_nop.fields, "SS"), _same_int_field(post_first_load_nop.fields, "SY")) == ("nop", 0, 1, 0) and
+           post_first_load_nop.index + 1 == loads_local[1].index and
+           _same_int_field(final_adds[3].fields, "SS") == 1 and final_adds[3].srcs[1] == A630IR3Operand("gpr", 0) and
+           (predicate_delay.opcode, _same_int_field(predicate_delay.fields, "REPEAT"),
+            _same_int_field(predicate_delay.fields, "SS"), _same_int_field(predicate_delay.fields, "SY")) == ("nop", 4, 0, 0) and
+           predicate_delay.index + 1 == store_global.index,
+           "unsupported A630 workgroup reduction hazard schedule")
+  _require(_same_int_field(loads_local[0].fields, "SY") == 1 and
+           all(_same_int_field(instruction.fields, "SY") == 0 for instruction in loads_local[1:]) and
+           _same_int_field(store_local.fields, "SY") == 0,
+           "unsupported A630 workgroup reduction local-load scheduling")
+
+  full_registers = [lid, lid + 1, lid + 2]
+  half_registers:list[int] = []
+  for instruction in active:
+    operands = ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs
+    for operand in operands:
+      if operand.kind == "gpr": full_registers.append(operand.value)
+      elif operand.kind == "half": half_registers.append(operand.value)
+    if instruction.opcode in {"ldg.u32", "stg.u32"}: full_registers.append(instruction.srcs[0].value + 1)
+    if instruction.opcode == "ldl.u32x4" and instruction.dst is not None:
+      full_registers.extend(range(instruction.dst.value + 1, instruction.dst.value + 4))
+  _validate_carry_conversions(active)
+  _validate_register_footprint(registers, full_registers, half_registers,
+                               "A630 workgroup reduction register footprint does not match decoded operands")
+
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
@@ -1400,6 +1571,9 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   unsupported = next((instruction for instruction in active if instruction.opcode is None), None)
   _require(unsupported is None, f"unsupported A630 semantic at instruction {unsupported.index if unsupported else -1}")
   opcodes = tuple(instruction.opcode for instruction in active)
+  if any(opcode in {"stl.u32", "bar.g", "ldl.u32x4", "predt.p0", "prede"} for opcode in opcodes):
+    _validate_workgroup_reduction_dispatch(dispatch, active, registers, wgid, lid)
+    return dispatch
   if any(opcode in {"cmps.s.ge.p0", "br.p0", "jump"} for opcode in opcodes):
     _validate_scalar_reduction_dispatch(dispatch, active, registers, wgid, lid)
     return dispatch
@@ -1595,6 +1769,149 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _validate_register_footprint(registers, full_registers, half_registers, "A630 register footprints do not match decoded operands")
   return dispatch
 
+def _execute_workgroup_reduction(dispatch:A630Dispatch, resolver:Resolver, active:Sequence[A630IR3Instruction],
+                                 read_observer:ReadObserver|None) -> tuple[A630ExecutionWrite, ...]:
+  constants = struct.unpack("<1024I", dispatch.constants_image)
+  output_base = constants[0] | constants[1] << 32
+  input_base = constants[2] | constants[3] << 32
+  _require(output_base != 0 and output_base % 4 == 0 and output_base + 4 <= 1 << 64 and
+           input_base != 0 and input_base % 4 == 0 and input_base + 256 * 4 <= 1 << 64,
+           "invalid A630 workgroup reduction argument range")
+  lane_count = 16
+  _,lid = _system_registers(dispatch)
+  full = [{lid:lane, lid+1:0, lid+2:0} for lane in range(lane_count)]
+  half:list[dict[int, int]] = [{} for _ in range(lane_count)]
+  predicates:list[dict[int, bool]] = [{} for _ in range(lane_count)]
+  # An origin is the ordered multiset of mapped input words feeding a value. Before BAR.G the lane partials
+  # must be disjoint; after it, legal overlapping initialized LDL ranges remain observable machine semantics.
+  origins:list[dict[int, tuple[int, ...]]] = [{} for _ in range(lane_count)]
+  local:dict[int, tuple[int, tuple[int, ...]]] = {}
+  seen_inputs:set[int] = set()
+  active_lanes = [True] * lane_count
+  predicated = barrier_seen = False
+  writes:list[A630ExecutionWrite] = []
+
+  for instruction in active:
+    opcode = instruction.opcode
+    if opcode == "end": break
+    if opcode == "nop": continue
+    if opcode == "bar.g":
+      _require(not predicated and not barrier_seen and seen_inputs == set(range(256)) and
+               set(local) == set(range(0, 64, 4)),
+               "A630 workgroup reduction barrier lacks uniform initialized local state")
+      barrier_seen = True
+      continue
+    if opcode == "predt.p0":
+      _require(barrier_seen and not predicated and all(0 in lane_predicates for lane_predicates in predicates),
+               "A630 workgroup reduction predicate is unavailable")
+      active_lanes = [lane_predicates[0] for lane_predicates in predicates]
+      _require(active_lanes == [True] + [False] * 15,
+               "A630 workgroup reduction predicate does not select only lane zero")
+      predicated = True
+      continue
+    if opcode == "prede":
+      _require(predicated, "A630 workgroup reduction PREDE lacks a predicate region")
+      active_lanes = [True] * lane_count
+      predicated = False
+      continue
+
+    for lane in range(lane_count):
+      if not active_lanes[lane]: continue
+      try:
+        if opcode == "cmps.s.eq.p0":
+          left,right = (_read_ir3_operand(operand, full[lane], half[lane], {}, constants) for operand in instruction.srcs)
+          assert instruction.dst is not None
+          predicates[lane][instruction.dst.value] = left == right
+          continue
+        if opcode == "ldg.u32":
+          assert instruction.dst is not None
+          address = _gpr_address(full[lane], instruction.srcs[0])
+          _require(address % 4 == 0 and input_base <= address < input_base + 1024,
+                   "A630 workgroup reduction global load is outside its input")
+          index = (address - input_base) // 4
+          _require(index // 16 == lane and index not in seen_inputs,
+                   "A630 workgroup reduction global load does not cover its lane slice once")
+          view = resolver(address, 4)
+          _require(len(view) == 4, "short A630 workgroup reduction global-load range")
+          image = bytes(view)
+          if read_observer is not None: read_observer(address, 4, "A630 global input 0")
+          seen_inputs.add(index)
+          _write_ir3_operand(instruction.dst, struct.unpack("<I", image)[0], full[lane], half[lane])
+          origins[lane][instruction.dst.value] = (index,)
+          continue
+        if opcode == "stl.u32":
+          _require(not barrier_seen and not predicated, "A630 workgroup reduction has a late or predicated local store")
+          address = _read_ir3_operand(instruction.srcs[0], full[lane], half[lane], {}, constants)
+          _require(address == lane * 4 and address % 4 == 0 and address + 4 <= 2048 and address not in local,
+                   "A630 workgroup reduction local store does not uniquely address its lane slot")
+          data = _read_ir3_operand(instruction.srcs[1], full[lane], half[lane], {}, constants)
+          data_origin = origins[lane].get(instruction.srcs[1].value)
+          _require(data_origin == tuple(range(lane * 16, lane * 16 + 16)),
+                   "A630 workgroup reduction local store lacks its complete lane partial")
+          assert data_origin is not None
+          local[address] = (data, data_origin)
+          continue
+        if opcode == "ldl.u32x4":
+          _require(barrier_seen and not predicated, "A630 workgroup reduction has an early or predicated local load")
+          assert instruction.dst is not None
+          address = _read_ir3_operand(instruction.srcs[0], full[lane], half[lane], {}, constants)
+          _require(address % 4 == 0 and address + 16 <= 2048,
+                   "A630 workgroup reduction local load is unaligned or out of range")
+          _require(all(address + component * 4 in local for component in range(4)),
+                   "A630 workgroup reduction local load reads an uninitialized dword")
+          for component in range(4):
+            value,local_origin = local[address + component * 4]
+            full[lane][instruction.dst.value + component] = value
+            origins[lane][instruction.dst.value + component] = local_origin
+          continue
+        if opcode == "stg.u32":
+          _require(predicated and lane == 0, "A630 workgroup reduction global store is not lane-zero predicated")
+          address = _gpr_address(full[lane], instruction.srcs[0])
+          _require(address == output_base, "A630 workgroup reduction store does not address its scalar output")
+          view = resolver(address, 4)
+          _require(len(view) == 4, "short A630 workgroup reduction global-store range")
+          data = _read_ir3_operand(instruction.srcs[1], full[lane], half[lane], {}, constants)
+          store_origin = origins[lane].get(instruction.srcs[1].value)
+          _require(store_origin is not None and len(store_origin) == 256,
+                   "A630 workgroup reduction store lacks all sixteen local partials")
+          writes.append(A630ExecutionWrite(address, struct.pack("<I", data)))
+          continue
+
+        src = tuple(_read_ir3_operand(operand, full[lane], half[lane], {}, constants) for operand in instruction.srcs)
+        _require(instruction.dst is not None, f"unsupported A630 workgroup reduction semantic {opcode}")
+        assert instruction.dst is not None
+        result_origin:tuple[int, ...]|None = None
+        if opcode == "mov.u32": value = src[0]
+        elif opcode == "add.u": value = src[0] + src[1]
+        elif opcode == "shl.b": value = src[0] << (src[1] & 31)
+        elif opcode == "ashr.b":
+          signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
+          value = signed >> (src[1] & 31)
+        elif opcode == "shrg": value = (src[1] >> (src[0] & 31)) | src[2]
+        elif opcode == "cmps.u.lt": value = int(src[0] < src[1])
+        elif opcode == "cov.u16s32": value = src[0] & 0xffff
+        elif opcode == "add.f":
+          left_origin,right_origin = (origins[lane].get(operand.value) for operand in instruction.srcs)
+          _require(left_origin is not None and right_origin is not None,
+                   "A630 workgroup reduction f32 add lacks mapped-data provenance")
+          assert left_origin is not None and right_origin is not None
+          if not barrier_seen:
+            _require(set(left_origin).isdisjoint(right_origin),
+                     "A630 workgroup reduction lane accumulator duplicates an input")
+          value,result_origin = _f32_add_bits(src[0], src[1]),left_origin + right_origin
+        else: raise ValueError(f"unsupported A630 workgroup reduction opcode {opcode}")
+        _write_ir3_operand(instruction.dst, value, full[lane], half[lane])
+        if instruction.dst.kind == "gpr":
+          if result_origin is None: origins[lane].pop(instruction.dst.value, None)
+          else: origins[lane][instruction.dst.value] = result_origin
+      except (KeyError, ValueError, RuntimeError) as error:
+        raise ValueError(f"A630 workgroup reduction instruction {instruction.index} lane {lane}: {error}") from error
+
+  _require(barrier_seen and not predicated and active_lanes == [True] * lane_count and seen_inputs == set(range(256)) and
+           len(writes) == 1 and writes[0].address == output_base,
+           "A630 workgroup reduction did not converge to one output journal entry")
+  return tuple(writes)
+
 def _execute_scalar_reduction(dispatch:A630Dispatch, resolver:Resolver, active:Sequence[A630IR3Instruction],
                               read_observer:ReadObserver|None) -> tuple[A630ExecutionWrite, ...]:
   constants = struct.unpack("<1024I", dispatch.constants_image)
@@ -1788,6 +2105,8 @@ def execute_a630(submission:A630Submission, resolver:Resolver, *,
   """Execute supported A630 images into an immutable write journal; this does not retire the KGSL submission."""
   dispatch = _execution_dispatch(submission)
   active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
+  if any(instruction.opcode in {"stl.u32", "bar.g", "ldl.u32x4", "predt.p0", "prede"} for instruction in active):
+    return _execute_workgroup_reduction(dispatch, resolver, active, read_observer)
   if any(instruction.opcode in {"cmps.s.ge.p0", "br.p0", "jump"} for instruction in active):
     return _execute_scalar_reduction(dispatch, resolver, active, read_observer)
   if any(instruction.opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for instruction in active):
