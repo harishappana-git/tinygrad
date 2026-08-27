@@ -6,7 +6,7 @@ from tinygrad.helpers import DEV, mv_address
 QCOM_MOCK = DEV.interface == "MOCK" and DEV.device == "QCOM" and DEV.renderer == "IR3" and DEV.arch == "a630"
 
 @unittest.skipUnless(QCOM_MOCK, "requires DEV=MOCK+QCOM:IR3:a630")
-class TestQCOMDriver(unittest.TestCase):
+class _QCOMTestBase(unittest.TestCase):
   device:Any
   driver:Any
 
@@ -100,6 +100,7 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, message): kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
     self.assertEqual((request.timestamp, state()), (marker, before))
 
+class TestQCOMDriver(_QCOMTestBase):
   def test_production_backend_identity_and_initialization(self):
     from tinygrad.device import Device
     from tinygrad.renderer.nir import IR3Renderer
@@ -828,6 +829,7 @@ assert 'test.mockgpu.qcom.qcomdriver' not in sys.modules
       self.driver.context_timestamps[self.device.ctx],self.device.last_cmd = before["context_timestamp"],before["last_cmd"]
       self.driver.always_on_counter,self.device.error_state = before["counter"],before["error_state"]
 
+class TestA630Contracts(_QCOMTestBase):
   def test_ir3_decoder_rejects_invalid_and_private_encodings(self):
     from test.mockgpu.qcom import a630 as a630_module
     from test.mockgpu.qcom.a630 import decode_a630_ir3
@@ -1255,6 +1257,7 @@ assert 'test.mockgpu.qcom.qcomdriver' not in sys.modules
     with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
       decode_one(words[7] | 1 << 41)
 
+class TestA630Execution(_QCOMTestBase):
   def test_production_add_machine_execution_and_retirement(self):
     import struct
     from tinygrad import Device, Tensor
@@ -2281,6 +2284,7 @@ assert 'test.mockgpu.qcom.qcomdriver' not in sys.modules
           request=mutated_request, message=message, marker=marker, state=retirement_state)
     self.assertEqual((bytes(shader), source.sum().item()), (dispatch.shader_image, 32896.0))
 
+class TestQCOMDriverFailures(_QCOMTestBase):
   def test_ioctl_and_mmap_fail_closed(self):
     from tinygrad.runtime.autogen import kgsl
     from test.mockgpu.qcom import qcomdriver
