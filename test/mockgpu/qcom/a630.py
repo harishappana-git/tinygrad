@@ -989,6 +989,223 @@ def _validate_vector_u32_dispatch(dispatch:A630Dispatch, active:Sequence[A630IR3
   _validate_register_footprint(registers, full_registers, half_registers,
                                "A630 register footprints do not match decoded four-component operands")
 
+def _validate_two_segment_u32_copy(dispatch:A630Dispatch, active:Sequence[A630IR3Instruction], registers:dict[int, int],
+                                   wgid:int, lid:int) \
+    -> tuple[tuple[A630IR3Instruction, A630IR3Instruction], tuple[A630IR3Instruction, A630IR3Instruction]]:
+  # Exact equal-eight-word two-segment copy: two scalar loads feed disjoint output segments. Pinned
+  # nir_lower_int64.c:296-309 forms each 64-bit pointer as low ADD.U, unsigned carry, and high ADD.U;
+  # ir3-cat6.xml:90-123,251-295 and ir3_a6xx.c:411-494 define one-component U32 LDG/STG operands.
+  _require(dispatch.local_size == dispatch.global_size == (8, 1, 1) and dispatch.groups == (1, 1, 1),
+           "A630 two-segment u32 copy requires one exact eight-lane workgroup")
+  _require((wgid, lid) == (0xfc, 0), "unsupported A630 two-segment u32 copy system-value mapping")
+  _require(not any(operand.kind == "shared" for instruction in active for operand in instruction.srcs),
+           "A630 two-segment u32 copy uses a shared system value")
+  opcodes = tuple(instruction.opcode for instruction in active)
+  expected_counts = {"ashr.b":2, "shl.b":3, "add.u":14, "shrg":2, "cmps.u.lt":4, "cov.u16s32":4,
+                     "ldg.u32":2, "nop":2, "stg.u32":2, "end":1}
+  _require(len(opcodes) == sum(expected_counts.values()) and
+           all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
+           "unsupported A630 two-segment u32 copy instruction inventory")
+
+  def one(matches:Sequence[A630IR3Instruction], message:str) -> A630IR3Instruction:
+    _require(len(matches) == 1, message)
+    return matches[0]
+
+  def live_until(producer:A630IR3Instruction, consumers:Sequence[A630IR3Instruction], message:str) -> None:
+    _require(producer.dst is not None and all(producer.index < consumer.index and
+             not any(instruction.dst == producer.dst and producer.index < instruction.index < consumer.index
+                     for instruction in active) for consumer in consumers), message)
+
+  local_id = A630IR3Operand("gpr", lid)
+  lane_bytes = one(tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                         instruction.srcs == (local_id, A630IR3Operand("iim", 2))),
+                   "A630 two-segment u32 copy lacks the lane byte offset")
+  second_lane = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                          instruction.srcs == (local_id, A630IR3Operand("iim", 8))),
+                    "A630 two-segment u32 copy lacks the second-segment lane offset")
+  lane_sign = one(tuple(instruction for instruction in active if instruction.opcode == "ashr.b" and
+                        instruction.srcs == (local_id, A630IR3Operand("iim", 31)) and instruction.index < second_lane.index),
+                  "A630 two-segment u32 copy lacks the lane sign extension")
+  _require(lane_sign.dst is not None and lane_bytes.dst is not None and second_lane.dst is not None,
+           "A630 two-segment u32 copy lane offset lacks a destination")
+  lane_sign_bytes = one(tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                               instruction.srcs == (lane_sign.dst, A630IR3Operand("iim", 2))),
+                         "A630 two-segment u32 copy lacks the high lane byte offset")
+  _require(lane_sign_bytes.dst is not None, "A630 two-segment u32 copy high lane offset lacks a destination")
+  lane_high = one(tuple(instruction for instruction in active if instruction.opcode == "shrg" and
+                        instruction.srcs == (A630IR3Operand("iim", 30), local_id, lane_sign_bytes.dst)),
+                  "A630 two-segment u32 copy lacks the packed high lane offset")
+  _require(lane_high.dst is not None, "A630 two-segment u32 copy packed lane offset lacks a destination")
+
+  second_bytes = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                           instruction.srcs == (lane_bytes.dst, A630IR3Operand("iim", 32))),
+                     "A630 two-segment u32 copy lacks the second-segment byte offset")
+  _require(second_lane.dst is not None and second_bytes.dst is not None,
+           "A630 two-segment u32 copy second-segment offset lacks a destination")
+  second_sign = one(tuple(instruction for instruction in active if instruction.opcode == "ashr.b" and
+                          instruction.srcs == (second_lane.dst, A630IR3Operand("iim", 31)) and
+                          instruction.index > second_lane.index),
+                    "A630 two-segment u32 copy lacks the second-segment sign extension")
+  _require(second_sign.dst is not None, "A630 two-segment u32 copy second-segment sign lacks a destination")
+  second_sign_bytes = one(tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                                 instruction.srcs == (second_sign.dst, A630IR3Operand("iim", 2))),
+                           "A630 two-segment u32 copy lacks the second-segment high byte offset")
+  _require(second_sign_bytes.dst is not None,
+           "A630 two-segment u32 copy second-segment high offset lacks a destination")
+  second_high = one(tuple(instruction for instruction in active if instruction.opcode == "shrg" and
+                          instruction.srcs == (A630IR3Operand("iim", 30), second_lane.dst, second_sign_bytes.dst)),
+                    "A630 two-segment u32 copy lacks the packed second-segment high offset")
+  _require(second_high.dst is not None, "A630 two-segment u32 copy packed second-segment offset lacks a destination")
+  _require(lane_sign.index < lane_sign_bytes.index < lane_high.index and lane_bytes.index < second_bytes.index and
+           second_lane.index < second_sign.index < second_sign_bytes.index < second_high.index,
+           "A630 two-segment u32 copy offset producers do not dominate their consumers")
+  local_consumers = (lane_bytes, second_lane, lane_sign, lane_high)
+  _require(not any(instruction.dst == local_id and instruction.index < consumer.index
+                   for instruction in active for consumer in local_consumers),
+           "A630 two-segment u32 copy local-id register is overwritten before an offset consumer")
+  live_until(lane_sign, (lane_sign_bytes,),
+             "A630 two-segment u32 copy lane-sign register is overwritten before its byte shift")
+  live_until(lane_sign_bytes, (lane_high,),
+             "A630 two-segment u32 copy high lane byte register is overwritten before its packed shift")
+  live_until(lane_bytes, (second_bytes,),
+             "A630 two-segment u32 copy lane-byte register is overwritten before the second-segment offset")
+  live_until(second_lane, (second_sign, second_high),
+             "A630 two-segment u32 copy second-segment lane register is overwritten before an offset consumer")
+  live_until(second_sign, (second_sign_bytes,),
+             "A630 two-segment u32 copy second-segment sign register is overwritten before its byte shift")
+  live_until(second_sign_bytes, (second_high,),
+             "A630 two-segment u32 copy second-segment high byte register is overwritten before its packed shift")
+  assert lane_bytes.dst is not None and lane_high.dst is not None and second_bytes.dst is not None and second_high.dst is not None
+  lane_bytes_dst,lane_high_dst = lane_bytes.dst,lane_high.dst
+  second_bytes_dst,second_high_dst = second_bytes.dst,second_high.dst
+
+  loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
+  stores = tuple(instruction for instruction in active if instruction.opcode == "stg.u32")
+  _require(all(instruction.dst is not None and instruction.dst.kind == "gpr" and
+               instruction.srcs[0].kind == "gpr" for instruction in loads) and
+           all(instruction.srcs[0].kind == instruction.srcs[1].kind == "gpr" for instruction in stores),
+           "unsupported A630 two-segment u32 copy memory operands")
+
+  address_adds:set[int] = set()
+  address_pairs:list[set[int]] = []
+  def address_chain(low_constant:int, high_constant:int, low_offset:A630IR3Operand, high_offset:A630IR3Operand,
+                    low_offset_index:int, high_offset_index:int, consumer:A630IR3Instruction,
+                    low:A630IR3Instruction, purpose:str) -> None:
+    address = consumer.srcs[0]
+    _require(low.opcode == "add.u" and low.dst == address and
+             frozenset(low.srcs) == frozenset((A630IR3Operand("const", low_constant), low_offset)),
+             f"A630 two-segment u32 copy {purpose} low address is not the compiler pointer chain")
+    carry = one(tuple(instruction for instruction in active if instruction.opcode == "cmps.u.lt" and
+                      instruction.srcs == (address, A630IR3Operand("const", low_constant))),
+                f"A630 two-segment u32 copy {purpose} carry is not the compiler pointer chain")
+    _require(carry.dst is not None, f"A630 two-segment u32 copy {purpose} carry lacks a destination")
+    carry_conversion = one(tuple(instruction for instruction in active if instruction.opcode == "cov.u16s32" and
+                                 instruction.srcs == (carry.dst,)),
+                           f"A630 two-segment u32 copy {purpose} carry lacks a conversion")
+    high = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and instruction.dst is not None and
+                     frozenset(instruction.srcs) == frozenset((A630IR3Operand("const", high_constant), high_offset))),
+               f"A630 two-segment u32 copy {purpose} high address is not the compiler pointer chain")
+    _require(carry_conversion.dst is not None and high.dst is not None,
+             f"A630 two-segment u32 copy {purpose} high address lacks a destination")
+    high_address = A630IR3Operand("gpr", address.value + 1)
+    final = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and instruction.dst == high_address and
+                      frozenset(instruction.srcs) == frozenset((carry_conversion.dst, high.dst))),
+                f"A630 two-segment u32 copy {purpose} final high address is not the compiler pointer chain")
+    _require(low_offset_index < low.index < carry.index < carry_conversion.index < consumer.index and
+             high_offset_index < high.index < final.index < consumer.index and
+             max(carry_conversion.index, high.index) < final.index,
+             f"A630 two-segment u32 copy {purpose} pointer producers do not dominate the memory operation")
+    _require(carry_conversion.dst != high.dst,
+             f"A630 two-segment u32 copy {purpose} final high-address sources alias")
+    low_offset_producer = one(tuple(instruction for instruction in active if instruction.index == low_offset_index and
+                                    instruction.dst == low_offset),
+                              f"A630 two-segment u32 copy {purpose} low offset lacks its producer")
+    high_offset_producer = one(tuple(instruction for instruction in active if instruction.index == high_offset_index and
+                                     instruction.dst == high_offset),
+                               f"A630 two-segment u32 copy {purpose} high offset lacks its producer")
+    live_until(low_offset_producer, (low,),
+               f"A630 two-segment u32 copy {purpose} low offset is overwritten before the address add")
+    live_until(high_offset_producer, (high,),
+               f"A630 two-segment u32 copy {purpose} high offset is overwritten before the address add")
+    live_until(carry, (carry_conversion,),
+               f"A630 two-segment u32 copy {purpose} carry is overwritten before conversion")
+    live_until(carry_conversion, (final,),
+               f"A630 two-segment u32 copy {purpose} converted carry is overwritten before the final add")
+    live_until(high, (final,),
+               f"A630 two-segment u32 copy {purpose} high temporary is overwritten before the final add")
+    for register,producer in ((address, low), (high_address, final)):
+      _require(not any(instruction.dst == register and producer.index < instruction.index < consumer.index
+                       for instruction in active),
+               f"A630 two-segment u32 copy {purpose} pointer is overwritten before the memory operation")
+    address_adds.update((low.index, high.index, final.index))
+    address_pairs.append({address.value, address.value + 1})
+
+  input_loads:list[A630IR3Instruction] = []
+  for pointer,low_offset,high_offset in ((1, lane_bytes_dst, lane_high_dst), (2, lane_bytes_dst, lane_high_dst)):
+    low_constant = 2 * pointer
+    low_add = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and instruction.dst is not None and
+                        frozenset(instruction.srcs) == frozenset((A630IR3Operand("const", low_constant), low_offset))),
+                  f"A630 two-segment u32 copy input {pointer-1} lacks a low address")
+    assert low_add.dst is not None
+    load = one(tuple(instruction for instruction in loads if instruction.srcs == (low_add.dst,)),
+               f"A630 two-segment u32 copy input {pointer-1} lacks its global load")
+    address_chain(low_constant, low_constant + 1, low_offset, high_offset, lane_bytes.index, lane_high.index,
+                  load, low_add, f"input {pointer-1}")
+    input_loads.append(load)
+
+  output_stores:list[A630IR3Instruction] = []
+  for segment,(low_offset,high_offset) in enumerate(((lane_bytes_dst, lane_high_dst), (second_bytes_dst, second_high_dst))):
+    low_add = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and instruction.dst is not None and
+                        frozenset(instruction.srcs) == frozenset((A630IR3Operand("const", 0), low_offset)) and
+                        (instruction.index < second_bytes.index if segment == 0 else instruction.index > second_bytes.index)),
+                  f"A630 two-segment u32 copy output segment {segment} lacks a low address")
+    assert low_add.dst is not None
+    store = one(tuple(instruction for instruction in stores if instruction.srcs[0] == low_add.dst),
+                f"A630 two-segment u32 copy output segment {segment} lacks its global store")
+    address_chain(0, 1, low_offset, high_offset,
+                  lane_bytes.index if segment == 0 else second_bytes.index,
+                  lane_high.index if segment == 0 else second_high.index,
+                  store, low_add, f"output segment {segment}")
+    output_stores.append(store)
+
+  load_destinations = tuple(instruction.dst for instruction in input_loads)
+  _require(None not in load_destinations and len(set(load_destinations)) == 2 and
+           set(store.srcs[1] for store in output_stores) == set(load_destinations),
+           "A630 two-segment u32 copy stores do not form a bijection over the global loads")
+  for store in output_stores:
+    load = next(instruction for instruction in input_loads if instruction.dst == store.srcs[1])
+    _require(load.index < store.index and not any(instruction.dst == load.dst and load.index < instruction.index < store.index
+                                                  for instruction in active),
+             "A630 two-segment u32 copy load does not dominate its store")
+
+  _require(all(left.isdisjoint(right) for index,left in enumerate(address_pairs) for right in address_pairs[index+1:]),
+           "A630 two-segment u32 copy address pairs overlap")
+  address_registers = set().union(*address_pairs)
+  _require(all(instruction.dst is not None and instruction.dst.value not in address_registers for instruction in input_loads),
+           "A630 two-segment u32 copy data registers overlap pointer registers")
+  _require(address_registers.isdisjoint((lid, lid + 1, lid + 2)) and
+           all(instruction.dst is not None and instruction.dst.value not in (lid, lid + 1, lid + 2) for instruction in input_loads),
+           "A630 two-segment u32 copy memory registers overlap the local-id vector")
+  all_adds = {instruction.index for instruction in active if instruction.opcode == "add.u"}
+  _require(all_adds == address_adds | {second_lane.index, second_bytes.index},
+           "unsupported A630 two-segment u32 copy address arithmetic")
+  _validate_carry_conversions(active)
+
+  constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
+  _require(constant_uses == [0, 0, 0, 0, 1, 1, 2, 2, 3, 4, 4, 5],
+           "A630 two-segment u32 copy constants do not match the buffer argument ABI")
+  full_registers = [lid, lid + 1, lid + 2]
+  half_registers:list[int] = []
+  for instruction in active:
+    operands = ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs
+    for operand in operands:
+      if operand.kind == "gpr": full_registers.append(operand.value)
+      elif operand.kind == "half": half_registers.append(operand.value)
+    if instruction.opcode in {"ldg.u32", "stg.u32"}: full_registers.append(instruction.srcs[0].value + 1)
+  _validate_register_footprint(registers, full_registers, half_registers,
+                               "A630 register footprints do not match decoded two-segment u32 copy operands")
+  return (input_loads[0], input_loads[1]), (output_stores[0], output_stores[1])
+
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
@@ -1008,6 +1225,9 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   opcodes = tuple(instruction.opcode for instruction in active)
   if any(opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for opcode in opcodes):
     _validate_vector_u32_dispatch(dispatch, active, registers, wgid, lid)
+    return dispatch
+  if opcodes.count("stg.u32") == 2:
+    _validate_two_segment_u32_copy(dispatch, active, registers, wgid, lid)
     return dispatch
   input_count = opcodes.count("ldg.u32")
   float_add_count = opcodes.count("add.f")
@@ -1270,7 +1490,9 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   lane_count = dispatch.local_size[0]
   invocation_count = dispatch.global_size[0]
   wgid,lid = _system_registers(dispatch)
-  loads = tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
+  copy_plan = _validate_two_segment_u32_copy(dispatch, active, dict(dispatch.registers), wgid, lid) \
+    if sum(instruction.opcode == "stg.u32" for instruction in active) == 2 else None
+  loads = copy_plan[0] if copy_plan is not None else tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
   comparison_instruction = _u32_comparison_instruction(active)
   conversion_instruction = _integer_to_f32_instruction(active)
@@ -1284,10 +1506,14 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
   output_base = constants[0] | constants[1] << 32
   input_bases = tuple(constants[2*index+2] | constants[2*index+3] << 32 for index in range(len(loads)))
   output_itemsize = 1 if comparison_instruction is not None else 4
-  _require(output_base != 0 and output_base + invocation_count * output_itemsize <= 1 << 64 and
+  output_count = invocation_count * (2 if copy_plan is not None else 1)
+  _require(output_base != 0 and output_base % output_itemsize == 0 and output_base + output_count * output_itemsize <= 1 << 64 and
            all(base != 0 and base % 4 == 0 and base + invocation_count * 4 <= 1 << 64 for base in input_bases),
            "invalid A630 scalar argument range")
   writes:list[A630ExecutionWrite] = []
+  copy_store_segments = {instruction.index:segment for segment,instruction in enumerate(copy_plan[1])} if copy_plan is not None else {}
+  copy_load_by_destination = {instruction.dst.value:ordinal for ordinal,instruction in enumerate(loads)
+                              if copy_plan is not None and instruction.dst is not None}
 
   for group in range(dispatch.groups[0]):
     full = [({lid:lane, lid+1:0, lid+2:0} if lid != 0xfc else {}) for lane in range(lane_count)]
@@ -1402,23 +1628,30 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             origin = ("load", ordinal)
           elif opcode == "stg.u32":
             address = _gpr_address(full[lane], instruction.srcs[0])
-            _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
-            if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
-            elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
-            elif conversion_instruction is not None:
-              assert conversion_instruction.opcode is not None
-              signed_conversion = conversion_instruction.opcode == "cov.s32f32"
-              expected_origin = ("s32-to-f32-rne" if signed_conversion else "u32-to-f32-rne", 0)
-              store_source = "s32-to-f32 conversion" if signed_conversion else "u32-to-f32 conversion"
-            elif integer_instruction is not None:
-              if integer_instruction.opcode in _SIMPLE_CAT2_INTEGER:
-                integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[integer_instruction.opcode]
-                expected_origin,store_source = (origin_tag, 0),f"u32 {integer_kind}"
-              elif integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
-              elif integer_instruction.opcode == "max.s": expected_origin,store_source = ("s32-maximum", 0),"s32 maximum"
-              elif integer_instruction.opcode == "max.u": expected_origin,store_source = ("u32-maximum", 0),"u32 maximum"
-              else: expected_origin,store_source = ("u32-multiply", 0),"u32 multiplication"
-            else: expected_origin,store_source = ("load", 0),"global load"
+            if copy_plan is not None:
+              segment = copy_store_segments[instruction.index]
+              _require(address == output_base + (segment * invocation_count + global_lane) * 4,
+                       f"two-segment u32 copy store {segment} does not address its output segment")
+              ordinal = copy_load_by_destination[instruction.srcs[1].value]
+              expected_origin,store_source = ("load", ordinal),f"two-segment u32 copy input {ordinal}"
+            else:
+              _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
+              if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
+              elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
+              elif conversion_instruction is not None:
+                assert conversion_instruction.opcode is not None
+                signed_conversion = conversion_instruction.opcode == "cov.s32f32"
+                expected_origin = ("s32-to-f32-rne" if signed_conversion else "u32-to-f32-rne", 0)
+                store_source = "s32-to-f32 conversion" if signed_conversion else "u32-to-f32 conversion"
+              elif integer_instruction is not None:
+                if integer_instruction.opcode in _SIMPLE_CAT2_INTEGER:
+                  integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[integer_instruction.opcode]
+                  expected_origin,store_source = (origin_tag, 0),f"u32 {integer_kind}"
+                elif integer_instruction.opcode == "add.u": expected_origin,store_source = ("u32-add", 0),"u32 add"
+                elif integer_instruction.opcode == "max.s": expected_origin,store_source = ("s32-maximum", 0),"s32 maximum"
+                elif integer_instruction.opcode == "max.u": expected_origin,store_source = ("u32-maximum", 0),"u32 maximum"
+                else: expected_origin,store_source = ("u32-multiply", 0),"u32 multiplication"
+              else: expected_origin,store_source = ("load", 0),"global load"
             _require(origins[lane].get(instruction.srcs[1].value) == expected_origin,
                      f"global store does not consume the {store_source}")
             _require(address % 4 == 0 and address + 4 <= 1 << 64, "invalid A630 global-store address")

@@ -1494,6 +1494,207 @@ class TestQCOMDriver(unittest.TestCase):
       self.device._gpu_free(alias_buffer)
     finally: constants_view[:8] = original_output_pointer
 
+  def test_production_two_segment_u32_copy_uses_mapped_machine_bytes(self):
+    import struct
+    from tinygrad import Device, Tensor
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import parse_pm4
+
+    left_values = [1.25, -2.5, 3.75, -4.0, 5.5, -6.25, 7.0, -8.75]
+    right_values = [9.5, -10.0, 11.25, -12.5, 13.0, -14.75, 15.5, -16.0]
+    left,right = Tensor(left_values, device=Device.DEFAULT).realize(), Tensor(right_values, device=Device.DEFAULT).realize()
+    python_reference = cast(list[float], Tensor.cat(Tensor(left_values, device="PYTHON"),
+                                                    Tensor(right_values, device="PYTHON")).tolist())
+    cpu_reference = cast(list[float], Tensor.cat(Tensor(left_values, device="CPU"), Tensor(right_values, device="CPU")).tolist())
+    timeline_before = self.device.timeline_value
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
+      result = Tensor.cat(left, right).realize()
+    actual = cast(list[float], result.tolist())
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual((actual, python_reference, cpu_reference), (left_values + right_values,) * 3)
+    self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value), (timeline_before + 1, timeline_before))
+    self.assertIsNone(self.device.error_state)
+    self.assertEqual((len(submissions), len(command_images)), (1, 1))
+    submission,dispatch = submissions[0],submissions[0].dispatches[0]
+    self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size, dispatch.resources),
+                     ((8, 1, 1), (1, 1, 1), (8, 1, 1), ()))
+    loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+    stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
+    self.assertEqual((len(loads), len(stores), len({instruction.dst for instruction in loads})), (2, 2, 2))
+    self.assertEqual(set(store.srcs[1] for store in stores), set(load.dst for load in loads))
+    self.assertTrue(all(load.index < next(store.index for store in stores if store.srcs[1] == load.dst) for load in loads))
+    self.assertTrue(all(dict(instruction.fields)["SIZE"] == 1 for instruction in loads + stores))
+    self.assertEqual(bytes(self._resolve_owned(dispatch.shader_address, dispatch.shader_size)), dispatch.shader_image)
+
+    output_base,input0_base,input1_base = struct.unpack_from("<3Q", dispatch.constants_image)
+    output = self._resolve_owned(output_base, 64)
+    inputs = (self._resolve_owned(input0_base, 32), self._resolve_owned(input1_base, 32))
+    self.assertEqual({tuple(struct.unpack("<8f", view)) for view in inputs}, {tuple(left_values), tuple(right_values)})
+    original_output = bytes(output)
+    output[:] = bytes([0x93]) * len(output)
+    try:
+      journal = real_execute(submission, self._resolve_owned)
+      self.assertEqual(bytes(output), bytes([0x93]) * len(output))
+      self.assertEqual(tuple(len(write.data) for write in journal), (4,) * 16)
+      self.assertEqual(b"".join(write.data for write in sorted(journal, key=lambda write: write.address)),
+                       struct.pack("<16f", *python_reference))
+    finally: output[:] = original_output
+
+    constants = self._resolve_owned(dispatch.constants_address, dispatch.constants_size)
+    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+    def state():
+      return (bytes(output), bytes(inputs[0]), bytes(inputs[1]), bytes(constants), bytes(signal), self.device.timeline_value,
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
+              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
+    command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
+    first_store,second_store = stores
+    first_data,second_data = first_store.srcs[1],second_store.srcs[1]
+    store_data_mask = 0xff << 1
+    def store_data_edit(store, source):
+      raw = store.raw & ~store_data_mask | source.value << 1
+      self.assertEqual((raw ^ store.raw) & ~store_data_mask, 0)
+      return store,raw
+    swap_edits = (store_data_edit(first_store, second_data), store_data_edit(second_store, first_data))
+
+    # Swapping only the two mapped store data operands preserves the validated copy bijection and reverses the segments.
+    with self._mutate_a630_replay(submission, command_words, swap_edits) as (_,mutated_dispatch,request):
+      mutated_stores = tuple(instruction for instruction in mutated_dispatch.instructions if instruction.opcode == "stg.u32")
+      self.assertEqual(tuple(store.srcs[1] for store in mutated_stores), (second_data, first_data))
+      self.assertTrue(all((mutated.opcode, mutated.srcs[0]) == (original.opcode, original.srcs[0]) and
+                          (mutated.raw ^ original.raw) & ~store_data_mask == 0
+                          for original,mutated in zip(stores, mutated_stores)))
+      output[:] = bytes([0x94]) * len(output)
+      timestamp_before,timeline_value_before,last_command = (self.driver.context_timestamps[self.device.ctx],
+                                                              self.device.timeline_value, self.device.last_cmd)
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual(list(struct.unpack("<16f", output)), right_values + left_values)
+      retired_timestamp = (timestamp_before + 1) & 0xffffffff
+      self.assertEqual((request.timestamp, self.driver.context_timestamps[self.device.ctx]),
+                       (retired_timestamp, retired_timestamp))
+      self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
+                        self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
+
+    output[:] = bytes([0x95]) * len(output)
+    recovery_buffer,_,recovery_request = self.gpu_command(command_words)
+    timestamp_before,timeline_value_before,last_command = (self.driver.context_timestamps[self.device.ctx],
+                                                            self.device.timeline_value, self.device.last_cmd)
+    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
+    finally: self.device._gpu_free(recovery_buffer)
+    self.assertEqual(list(struct.unpack("<16f", output)), python_reference)
+    retired_timestamp = (timestamp_before + 1) & 0xffffffff
+    self.assertEqual((recovery_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
+                     (retired_timestamp, retired_timestamp))
+    self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
+                      self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
+    self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
+
+    second_lane = next(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                       instruction.srcs[1].kind == "iim" and instruction.srcs[1].value == 8)
+    second_bytes = next(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                        instruction.srcs[1].kind == "iim" and instruction.srcs[1].value == 32)
+    first_load,second_load = loads
+    consumed_load = next(load for load in loads if load.dst == first_store.srcs[1])
+    trailing_nop = next(instruction for instruction in dispatch.instructions
+                        if instruction.opcode == "nop" and instruction.index > first_store.index)
+    final_high_add = next(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                          instruction.dst is not None and instruction.dst.kind == "gpr" and
+                          instruction.dst.value == first_load.srcs[0].value + 1 and
+                          all(source.kind == "gpr" for source in instruction.srcs))
+    carry_conversion = next(instruction for instruction in dispatch.instructions if instruction.opcode == "cov.u16s32" and
+                            instruction.dst in final_high_add.srcs)
+    assert carry_conversion.dst is not None
+    high_temporary = next(source for source in final_high_add.srcs if source != carry_conversion.dst)
+    final_carry_slot = final_high_add.srcs.index(carry_conversion.dst)
+    final_carry_mask = 0xffff << (16 * final_carry_slot)
+    aliased_conversion_raw = carry_conversion.raw & ~(0xff << 32) | high_temporary.value << 32
+    aliased_final_raw = final_high_add.raw & ~final_carry_mask | high_temporary.value << (16 * final_carry_slot)
+    self.assertEqual((aliased_conversion_raw ^ carry_conversion.raw) & ~(0xff << 32), 0)
+    self.assertEqual((aliased_final_raw ^ final_high_add.raw) & ~final_carry_mask, 0)
+    rejection_edits = (
+      ((store_data_edit(second_store, first_data),),
+       "stores do not form a bijection"),
+      (((second_lane, second_lane.raw & ~(0xffff << 16) | 0x2007 << 16),),
+       "lacks the second-segment lane offset"),
+      (((second_bytes, second_bytes.raw & ~(0xffff << 16) | 0x201c << 16),),
+       "lacks the second-segment byte offset"),
+      (((second_store, second_store.raw & ~(0xff << 41) | first_store.srcs[0].value << 41),),
+       "output segment [01] lacks its global store"),
+      (((second_load, second_load.raw & ~(0xff << 14) | first_load.srcs[0].value << 14),),
+       "input [01] lacks its global load"),
+      (((consumed_load, trailing_nop.raw), (trailing_nop, consumed_load.raw)),
+       "load does not dominate its store"),
+      (((carry_conversion, final_high_add.raw), (final_high_add, carry_conversion.raw)),
+       "pointer producers do not dominate"),
+      (((carry_conversion, aliased_conversion_raw), (final_high_add, aliased_final_raw)),
+       "final high-address sources alias"),
+    )
+    for case,(edits,message) in enumerate(rejection_edits):
+      output[:] = bytes([0xa1 + case]) * len(output)
+      marker = 0x13570000 + case
+      with self.subTest(copy_rejection=message), \
+           self._mutate_a630_replay(submission, command_words, edits, timestamp=marker) as \
+           (mutated_submission,mutated_dispatch,request):
+        self.assertNotEqual(mutated_dispatch.shader_image, dispatch.shader_image)
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=state)
+
+    # Retirement also fails atomically when either immutable input aliases the planned output range.
+    original_pointer = bytes(constants[:8])
+    for ordinal,input_base in enumerate((input0_base, input1_base)):
+      constants[:8] = struct.pack("<Q", input_base)
+      alias_buffer,_,alias_request = self.gpu_command(command_words)
+      alias_request.timestamp = marker = 0x13570100 + ordinal
+      try:
+        alias_before = state()
+        with self.subTest(output_alias=ordinal), \
+             self.assertRaisesRegex(RuntimeError, f"aliases snapshotted A630 global input {ordinal}"):
+          kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
+        self.assertEqual((alias_request.timestamp, state()), (marker, alias_before))
+      finally:
+        self.device._gpu_free(alias_buffer)
+        constants[:8] = original_pointer
+
+    # A late second-segment failure must discard the first segment's complete journal and all PM4/timeline effects.
+    output_allocation = self.allocation_for(output_base, len(output))
+    assert output_allocation is not None and output_allocation.addr is not None
+    late_base = output_allocation.addr + output_allocation.size - 32
+    late_target = self._resolve_owned(late_base, 32)
+    late_original = bytes(late_target)
+    late_buffer,_,late_request = self.gpu_command(command_words)
+    late_request.timestamp = late_marker = 0x13570200
+    try:
+      constants[:8] = struct.pack("<Q", late_base)
+      late_submission = stage_a630(parse_pm4(command_words), self._resolve_owned)
+      late_target[:] = bytes([0xb4]) * len(late_target)
+      def late_state(): return (bytes(late_target), bytes(constants), *state()[1:])
+      late_before = late_state()
+      with self.assertRaisesRegex(ValueError, "A630 instruction .* lane 0 group 0"):
+        real_execute(late_submission, self._resolve_owned)
+      with self.assertRaisesRegex(RuntimeError, "A630 instruction .* lane 0 group 0"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
+      self.assertEqual((late_request.timestamp, late_state()), (late_marker, late_before))
+    finally:
+      constants[:8] = original_pointer
+      late_target[:] = late_original
+      self.device._gpu_free(late_buffer)
+
+    output[:] = bytes([0x96]) * len(output)
+    final_buffer,_,final_request = self.gpu_command(command_words)
+    timestamp_before,timeline_value_before,last_command = (self.driver.context_timestamps[self.device.ctx],
+                                                            self.device.timeline_value, self.device.last_cmd)
+    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=final_request)
+    finally: self.device._gpu_free(final_buffer)
+    self.assertEqual((list(struct.unpack("<16f", output)), bytes(constants[:8])), (python_reference, original_pointer))
+    retired_timestamp = (timestamp_before + 1) & 0xffffffff
+    self.assertEqual((final_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
+                     (retired_timestamp, retired_timestamp))
+    self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
+                      self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
+    self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
+
   def test_production_vector_fill_and_add_use_mapped_machine_bytes(self):
     import struct
     from dataclasses import replace
