@@ -43,21 +43,6 @@ class A630Write:
   purpose:str
 
 @dataclass(frozen=True)
-class A630Resource:
-  kind:str
-  index:int
-  descriptor_address:int
-  address:int
-  size:int
-  read:bool
-  write:bool
-  width:int
-  height:int
-  pitch:int
-  itemsize:int
-  image:bytes|None = None
-
-@dataclass(frozen=True)
 class A630IR3Operand:
   kind:str
   value:int
@@ -94,7 +79,6 @@ class A630Dispatch:
   local_size:tuple[int, int, int]
   global_size:tuple[int, int, int]
   groups:tuple[int, int, int]
-  resources:tuple[A630Resource, ...] = ()
   instructions:tuple[A630IR3Instruction, ...] = ()
 
 @dataclass(frozen=True)
@@ -199,16 +183,6 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
     dst = _register_operand(_same_int_field(fields, "DST"), True)
     if dst is not None and dst.kind == "gpr": return "mov.u32", dst, (A630IR3Operand("uim", _same_int_field(fields, "SRC")),)
   cov_variable = (0xff << 32) | 0xff | (1 << 44) | (1 << 60)
-  typed_cov_variable = cov_variable | (0x7 << 46) | (0x7 << 50) | (0x3 << 55)
-  if category == 1 and name is None and raw & ~typed_cov_variable == 0x2000000000000000:
-    src_type = _same_int_field(fields, "SRC_TYPE")
-    opcode = {5:"cov.s32f32", 3:"cov.u32f32"}.get(src_type)
-    if (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "ROUND"),
-        _same_int_field(fields, "DST_HALF"), _same_int_field(fields, "HALF")) == (src_type, 1, 1, 0, 0) and \
-       opcode is not None and _has_no_repeat(fields) and \
-       all(_int_field_is(fields, field, 0) for field in ("JP", "UL", "SRC_R", "LAST")):
-      dst,src = _register_operand(_same_int_field(fields, "DST"), True), _register_operand(_same_int_field(fields, "SRC"), True)
-      if dst is not None and dst.kind == "gpr" and src is not None and src.kind == "gpr": return opcode, dst, (src,)
   if category == 1 and raw & ~cov_variable == 0x2009400000000000:
     if (_same_int_field(fields, "SRC_TYPE"), _same_int_field(fields, "DST_TYPE"), _same_int_field(fields, "DST_HALF"),
         _same_int_field(fields, "HALF")) == (2, 5, 0, 1) and _has_no_repeat(fields) and \
@@ -496,52 +470,6 @@ def _load_state(values:tuple[int, ...]) -> A630LoadState:
   address = _address(values[1], values[2], alignment, kind)
   return A630LoadState(kind, address, units * unit_size, units)
 
-def _resource_descriptor(kind:str, index:int, descriptor_address:int, image:bytes) -> A630Resource:
-  words = struct.unpack("<16I", image)
-  fmt = words[0] >> 22 & 0xff
-  formats = {mesa.FMT6_16_16_16_16_FLOAT:2, mesa.FMT6_32_32_32_32_FLOAT:4}
-  _require(fmt in formats, f"unsupported {kind} descriptor format {fmt}")
-  # Bit 3 and words 6/7 are opaque unchanged-runtime literals: the pinned descriptor XML does not assign them these meanings.
-  expected_word0 = fmt << 22 | (0x6888 if kind == "texture" else 0)
-  _require(words[0] == expected_word0, f"unsupported {kind} descriptor word 0")
-  _require(words[1] & 0xc0000000 == 0, f"unsupported {kind} descriptor word 1")
-  width, height = words[1] & 0x7fff, words[1] >> 15 & 0x7fff
-  _require(0 < width <= 16384 and 0 < height <= 16384, f"unsupported {kind} descriptor dimensions")
-  _require(words[2] & 0x70 == 0 and words[2] >> 29 == mesa.A6XX_TEX_2D, f"unsupported {kind} descriptor word 2")
-  pitch, pitch_alignment = words[2] >> 7 & 0x3fffff, words[2] & 0xf
-  itemsize = formats[fmt]
-  _require(pitch >= 64 and pitch % 64 == 0 and pitch == width * 4 * itemsize, f"unsupported {kind} descriptor pitch")
-  _require(pitch_alignment == (pitch & -pitch).bit_length() - 7, f"invalid {kind} descriptor pitch alignment")
-  _require(words[3] == 0, f"unsupported {kind} descriptor word 3")
-  _require(words[5] & ~0x1ffff == 0, f"unsupported {kind} descriptor depth or address")
-  address = _address(words[4], words[5], 32, f"{kind} target")
-  _require(words[6:] == (0x40000000, 13) + (0,) * 8, f"unsupported {kind} descriptor tail")
-  size = pitch * height
-  _require(address + size <= 1 << 49, f"overflowing {kind} target range")
-  return A630Resource(kind, index, descriptor_address, address, size, True, kind == "uav", width, height, pitch, itemsize)
-
-def _resources(dispatch:A630Dispatch, read_images:dict[tuple[int, int, str], bytes]) -> tuple[A630Resource, ...]:
-  registers = dict(dispatch.registers)
-  config = registers[mesa.REG_A6XX_SP_CS_CONFIG]
-  counts = {"samplers":config >> 17 & 0x1f, "textures":config >> 9 & 0xff, "uavs":config >> 22 & 0x7f}
-  loads = {load.kind:load for load in dispatch.loads}
-  if (count:=counts["samplers"]):
-    table = read_images[(loads["samplers"].address, count * 16, "samplers descriptors")]
-    for index in range(count):
-      _require(struct.unpack_from("<4I", table, index * 16) == (0x1b60, 0x30, 0, 0), f"unsupported sampler descriptor {index}")
-    border_words = _registers(registers, mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE, 2, "border-color base")
-    border_address = _address(border_words[0], border_words[1], 128, "border-color")
-    _require(read_images[(border_address, 128, "border color")] == bytes(128), "unsupported border color")
-
-  resources:list[A630Resource] = []
-  for plural,kind in (("textures", "texture"), ("uavs", "uav")):
-    if not (count:=counts[plural]): continue
-    load = loads[plural]
-    table = read_images[(load.address, count * 64, f"{plural} descriptors")]
-    resources.extend(_resource_descriptor(kind, index, load.address + index * 64, table[index*64:(index+1)*64])
-                     for index in range(count))
-  return tuple(resources)
-
 def _dispatch(regs:dict[int, int], loads:dict[str, A630LoadState], packet:PM4Type7Packet,
               ranges:list[A630MemoryRange]) -> A630Dispatch:
   values = packet.values
@@ -574,27 +502,10 @@ def _dispatch(regs:dict[int, int], loads:dict[str, A630LoadState], packet:PM4Typ
   _require(stack_offset == 0x1000, "unsupported private-stack offset")
 
   nsamp, ntex, nuav = config >> 17 & 0x1f, config >> 9 & 0xff, config >> 22 & 0x7f
-  _require(nsamp == ntex and ntex + nuav <= mesa.IR3_MAX_SHADER_IMAGES, "unsupported IR3 resource counts")
-  resources = (("samplers", nsamp, mesa.REG_A6XX_SP_CS_SAMPLER_BASE, 16, nsamp),
-               ("textures", ntex, mesa.REG_A6XX_SP_CS_TEXMEMOBJ_BASE, 64, min(16, ntex)),
-               ("uavs", nuav, mesa.REG_A6XX_SP_CS_UAV_BASE, 64, nuav))
-  for kind,count,base_register,unit_size,load_units in resources:
-    if count == 0: continue
-    _require(kind in loads and loads[kind].units == load_units, f"missing or inconsistent {kind} state load")
-    base_words = _registers(regs, base_register, 2, f"{kind} base")
-    base = _address(base_words[0], base_words[1], unit_size if kind != "uavs" else 16, kind)
-    _require(base == loads[kind].address, f"{kind} base differs from state load")
-    expected_base = constants.address + {"textures":2048, "uavs":2048 + 64*ntex,
-                                         "samplers":2048 + 64*(ntex+nuav)}[kind]
-    _require(base == expected_base, f"unsupported {kind} descriptor-table placement")
-    _require(base % 64 == 0, f"unsupported {kind} descriptor-table alignment")
-    ranges.append(A630MemoryRange(base, count * unit_size, read=True, write=False, purpose=f"{kind} descriptors"))
-  if nsamp:
-    border = _registers(regs, mesa.REG_A6XX_TPL1_CS_BORDER_COLOR_BASE, 2, "border-color base")
-    ranges.append(A630MemoryRange(_address(border[0], border[1], 128, "border-color"), 128,
-                                  read=True, write=False, purpose="border color"))
+  _require((nsamp, ntex, nuav) == (0, 0, 0) and not any(kind in loads for kind in ("samplers", "textures", "uavs")),
+           "A630 image execution is not implemented")
 
-  active_loads = tuple(loads[kind] for kind in ("constants", "shader", "samplers", "textures", "uavs") if kind in loads)
+  active_loads = tuple(loads[kind] for kind in ("constants", "shader"))
   return A630Dispatch(packet.word_offset, tuple(sorted(regs.items())), active_loads, shader.address, shader.size, b"", constants.address,
                       constants.size, b"", stack_base, stack_offset, local, global_size, groups)
 
@@ -668,24 +579,11 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
     if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
   dispatch_instructions = tuple(decode_a630_ir3(read_images[(dispatch.shader_address, dispatch.shader_size, "shader")])
                                 for dispatch in dispatches)
-  dispatch_resources = tuple(_resources(dispatch, read_images) for dispatch in dispatches)
-  nested_ranges = tuple(A630MemoryRange(resource.address, resource.size, read=resource.read, write=resource.write,
-                                        purpose=f"{resource.kind} {resource.index} target")
-                        for resources in dispatch_resources for resource in resources)
-  for memory_range in nested_ranges:
-    view = resolver(memory_range.address, memory_range.size)
-    _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
-    image = bytes(view) if memory_range.read else None
-    resolved.append(replace(memory_range, image=image))
-    if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
-
   frozen_dispatches = tuple(replace(dispatch,
     shader_image=read_images[(dispatch.shader_address, dispatch.shader_size, "shader")],
     constants_image=read_images[(dispatch.constants_address, dispatch.constants_size, "constants")],
-    resources=tuple(replace(resource,
-      image=read_images[(resource.address, resource.size, f"{resource.kind} {resource.index} target")]) for resource in resources),
     instructions=instructions)
-    for dispatch,resources,instructions in zip(dispatches, dispatch_resources, dispatch_instructions))
+    for dispatch,instructions in zip(dispatches, dispatch_instructions))
   return A630Submission(frozen_dispatches, tuple(resolved), tuple(waits), tuple(writes))
 
 def _read_ir3_operand(operand:A630IR3Operand, full:dict[int, int], half:dict[int, int], shared:dict[int, int],
@@ -741,29 +639,6 @@ def _u32_comparison_instruction(instructions:Sequence[A630IR3Instruction]) -> A6
   for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"):
     if (instruction:=_u32_binary_instruction(instructions, opcode)) is not None: matches.append(instruction)
   return matches[0] if len(matches) == 1 else None
-
-def _integer_to_f32_instruction(instructions:Sequence[A630IR3Instruction]) -> A630IR3Instruction|None:
-  loads = tuple(instruction for instruction in instructions if instruction.opcode == "ldg.u32")
-  if len(loads) != 1 or loads[0].dst is None: return None
-  matches = tuple(instruction for instruction in instructions if instruction.opcode in {"cov.s32f32", "cov.u32f32"} and
-                  instruction.srcs == (loads[0].dst,))
-  return matches[0] if len(matches) == 1 else None
-
-def _integer_to_f32_rne_bits(value:int, signed:bool) -> int:
-  _require(0 <= value <= 0xffffffff, "integer-to-f32 source is outside 32 bits")
-  sign = int(signed and bool(value & 0x80000000))
-  magnitude = (1 << 32) - value if sign else value
-  if magnitude == 0: return 0
-  exponent = magnitude.bit_length() - 1
-  if exponent <= 23: significand = magnitude << (23 - exponent)
-  else:
-    shift = exponent - 23
-    significand = magnitude >> shift
-    remainder,halfway = magnitude & ((1 << shift) - 1),1 << (shift - 1)
-    if remainder > halfway or remainder == halfway and significand & 1:
-      significand += 1
-      if significand == 1 << 24: significand,exponent = significand >> 1,exponent + 1
-  return sign << 31 | (exponent + 127) << 23 | significand & 0x7fffff
 
 def _u32_multiply_sequence(instructions:Sequence[A630IR3Instruction]) \
     -> tuple[A630IR3Instruction, A630IR3Instruction, A630IR3Instruction]|None:
@@ -1557,7 +1432,6 @@ def _validate_workgroup_reduction_dispatch(dispatch:A630Dispatch, active:Sequenc
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
-  _require(not dispatch.resources, "A630 image execution is not implemented")
   _require(dispatch.groups[1:] == (1, 1) and 1 <= dispatch.groups[0] and
            dispatch.local_size[1:] == (1, 1) and 1 <= dispatch.local_size[0] <= 64 and
            dispatch.global_size == (dispatch.groups[0] * dispatch.local_size[0], 1, 1) and dispatch.global_size[0] <= _MAX_INVOCATIONS,
@@ -1591,14 +1465,8 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   integer_kind:str|None = None
   integer_value_type = "u32"
   comparison_instruction = _u32_comparison_instruction(active)
-  conversion_instruction = _integer_to_f32_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   comparison_count = sum(opcodes.count(opcode) for opcode in ("cmps.s.lt", "cmps.u.lt", "cmps.s.eq"))
-  conversion_count = sum(opcodes.count(opcode) for opcode in ("cov.s32f32", "cov.u32f32"))
-  _require(conversion_count == int(conversion_instruction is not None), "integer-to-f32 conversion does not consume the global load")
-  if conversion_count:
-    _require((input_count, float_add_count, conversion_count) == (1, 0, 1),
-             "integer-to-f32 conversion requires one global load and no other data operation")
   simple_opcode = next((opcode for opcode in _SIMPLE_CAT2_INTEGER if opcodes.count(opcode)), None)
   if opcodes.count("stg.u8"):
     _require((input_count, float_add_count, comparison_count, opcodes.count("stg.u8")) == (2, 0, 1, 1) and
@@ -1636,14 +1504,11 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
   elif uses_constant_pointers:
-    _require((integer_instruction is not None or comparison_instruction is not None or conversion_instruction is not None) and not shared_uses,
-             "constant-pointer A630 execution supports only scalar 32-bit integer arithmetic, comparison, or conversion")
+    _require((integer_instruction is not None or comparison_instruction is not None) and not shared_uses,
+             "constant-pointer A630 execution supports only scalar 32-bit integer arithmetic or comparison")
     _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
              "constant-pointer A630 execution requires one scalar invocation")
-    if conversion_instruction is not None:
-      assert conversion_instruction.opcode is not None
-      expected_counts = {"mov.u32":4, "nop":2, "ldg.u32":1, conversion_instruction.opcode:1, "stg.u32":1, "end":1}
-    elif comparison_instruction is not None:
+    if comparison_instruction is not None:
       assert comparison_instruction.opcode is not None
       expected_counts = {"mov.u32":6, "nop":3, "ldg.u32":2, comparison_instruction.opcode:1, "stg.u8":1, "end":1}
     else:
@@ -1659,9 +1524,6 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
                        "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3,
                        "ldg.u32":input_count, "stg.u32":1, "end":1}
     if float_add_count: expected_counts["add.f"] = 1
-    if conversion_instruction is not None:
-      assert conversion_instruction.opcode is not None
-      expected_counts[conversion_instruction.opcode] = 1
     if shared_uses:
       _require(grouped_lane_add or dispatch.local_size == (1, 1, 1),
                "unsupported A630 scalar multi-workgroup shape")
@@ -1697,7 +1559,6 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
       valid = dst_kind == "half" and comparison_instruction is not None and instruction.index == comparison_instruction.index and \
               src_kinds == ("gpr", "gpr")
     elif instruction.opcode == "cov.u16s32": valid = dst_kind == "gpr" and src_kinds == ("half",)
-    elif instruction.opcode in {"cov.s32f32", "cov.u32f32"}: valid = dst_kind == "gpr" and src_kinds == ("gpr",)
     elif instruction.opcode == "ldg.u32": valid = dst_kind == "gpr" and src_kinds == ("gpr",)
     elif instruction.opcode == "add.f":
       valid = dst_kind == "gpr" and (src_kinds == ("gpr", "gpr") or
@@ -1715,10 +1576,6 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     assert comparison_instruction.dst is not None
     store = next(instruction for instruction in active if instruction.opcode == "stg.u8")
     _require(store.srcs[1] == comparison_instruction.dst, "global store does not consume the u32 comparison")
-  if conversion_instruction is not None:
-    assert conversion_instruction.dst is not None
-    store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
-    _require(store.srcs[1] == conversion_instruction.dst, "global store does not consume the integer-to-f32 conversion")
 
   constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
   expected_constants = list(range(2 * (input_count + 1))) if uses_constant_pointers else \
@@ -2120,7 +1977,6 @@ def execute_a630(submission:A630Submission, resolver:Resolver, *,
   loads = copy_plan[0] if copy_plan is not None else tuple(instruction for instruction in active if instruction.opcode == "ldg.u32")
   has_float_add = any(instruction.opcode == "add.f" for instruction in active)
   comparison_instruction = _u32_comparison_instruction(active)
-  conversion_instruction = _integer_to_f32_instruction(active)
   multiply_sequence = _u32_multiply_sequence(active)
   integer_instruction = multiply_sequence[-1] if multiply_sequence is not None else \
     _u32_binary_instruction(active, "shr.b") or _u32_binary_instruction(active, "sub.u") or _u32_binary_instruction(active, "xor.b") or \
@@ -2224,12 +2080,6 @@ def execute_a630(submission:A630Submission, resolver:Resolver, *,
               origin = (("u32-equal", 0) if opcode == "cmps.s.eq" else
                         ("s32-less-than" if opcode == "cmps.s.lt" else "u32-less-than", 0))
           elif opcode == "cov.u16s32": value = src[0] & 0xffff
-          elif opcode in {"cov.s32f32", "cov.u32f32"}:
-            _require(conversion_instruction is not None and instruction.index == conversion_instruction.index and
-                     origins[lane].get(instruction.srcs[0].value) == ("load", 0),
-                     "integer-to-f32 conversion does not consume the global load")
-            value = _integer_to_f32_rne_bits(src[0], opcode == "cov.s32f32")
-            origin = ("s32-to-f32-rne" if opcode == "cov.s32f32" else "u32-to-f32-rne", 0)
           elif opcode == "add.f":
             source_origins = tuple(("flut", operand.value) if operand.kind == "flut" else origins[lane].get(operand.value)
                                    if operand.kind == "gpr" else None for operand in instruction.srcs)
@@ -2265,11 +2115,6 @@ def execute_a630(submission:A630Submission, resolver:Resolver, *,
               _require(address == output_base + global_lane * 4, "global store does not address the scalar output")
               if not loads: expected_origin,store_source = ("fill", 0x3f800000),"A630 fill"
               elif has_float_add: expected_origin,store_source = ("f32-add", 0),"f32 add"
-              elif conversion_instruction is not None:
-                assert conversion_instruction.opcode is not None
-                signed_conversion = conversion_instruction.opcode == "cov.s32f32"
-                expected_origin = ("s32-to-f32-rne" if signed_conversion else "u32-to-f32-rne", 0)
-                store_source = "s32-to-f32 conversion" if signed_conversion else "u32-to-f32 conversion"
               elif integer_instruction is not None:
                 if integer_instruction.opcode in _SIMPLE_CAT2_INTEGER:
                   integer_kind,origin_tag = _SIMPLE_CAT2_INTEGER[integer_instruction.opcode]
