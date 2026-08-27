@@ -570,6 +570,39 @@ jobs:
           REMOTE=127.0.0.1:6667 python test/test_tiny.py
           REMOTE=127.0.0.1:6667 python -m pytest test/unit/test_disk_tensor.py -k test_copy_from_disk; kill %1
 
+  testmockqcom:
+    name: Linux (MOCK+QCOM:IR3:a630 MVP)
+    runs-on: ${{ github.repository == 'tinygrad/tinygrad' && github.event_name == 'pull_request' && github.event.pull_request.author_association == 'COLLABORATOR' && 'namespace-profile-tinygrad' || 'ubuntu-24.04' }}
+    timeout-minutes: 15
+    env:
+      DEV: MOCK+QCOM:IR3:a630
+      CACHELEVEL: 0
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+      - name: Setup Environment
+        uses: ./.github/actions/setup-tinygrad
+        with:
+          key: mockqcom-a630
+          deps: "testing_unit mesa"
+      - name: Check QCOM mock selection
+        run: python -c "from tinygrad import Device; assert Device.DEFAULT == 'QCOM', Device.DEFAULT"
+      - name: Run QCOM mock and supported public tests
+        run: |
+          python -m pytest -n12 --dist=loadscope --durations=20 \
+            test/mockgpu/qcom \
+            test/test_tiny.py::TestTiny::test_const \
+            test/test_tiny.py::TestTiny::test_copy \
+            test/test_tiny.py::TestTiny::test_plus \
+            test/test_tiny.py::TestTiny::test_plus_int \
+            test/test_tiny.py::TestTiny::test_plus_big \
+            test/test_tiny.py::TestTiny::test_cat \
+            test/test_tiny.py::TestTiny::test_sum \
+            test/test_tiny.py::TestTiny::test_eye \
+            test/test_tiny.py::TestTiny::test_jit \
+            test/test_tiny.py::TestTiny::test_symbolic \
+            test/test_tiny.py::TestTiny::test_symbolic_reduce
+
   testamd:
     strategy:
       fail-fast: false
