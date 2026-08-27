@@ -7,7 +7,8 @@ from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
 # adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, ir3_shader.h,
-# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3.c, ir3_a6xx.c, ir3_compiler_nir.c, ir3_legalize.c,
+# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3.c, ir3_a6xx.c, ir3_compiler.c, ir3_compiler_nir.c,
+# ir3_delay.c, ir3_legalize.c,
 # ir3_nir_analyze_ubo_ranges.c, ir3_nir_imul.py, ir3_nir_lower_64b.c, ir3_rpt.c, nir_lower_int64.c,
 # nir_lower_system_values.c, nir_opcodes.py, isaspec.h, and isaspec_decode_impl.c.
 
@@ -108,6 +109,24 @@ class A630Submission:
   waits:tuple[A630Wait, ...]
   writes:tuple[A630Write, ...]
 
+@dataclass(frozen=True)
+class _A630MemoryScheduleState:
+  force_ss:bool = False
+  force_sy:bool = False
+  needs_ss:frozenset[int] = frozenset()
+  needs_sy:frozenset[int] = frozenset()
+  needs_ss_war_full:frozenset[int] = frozenset()
+  needs_ss_war_half:frozenset[int] = frozenset()
+  needs_ss_or_sy_war_full:frozenset[int] = frozenset()
+
+@dataclass(frozen=True)
+class _A630DelayState:
+  full_alu:tuple[tuple[int, int], ...] = ()
+  full_non_alu:tuple[tuple[int, int], ...] = ()
+  half_alu:tuple[tuple[int, int], ...] = ()
+  half_non_alu:tuple[tuple[int, int], ...] = ()
+  predicate:tuple[tuple[int, int], ...] = ()
+
 Resolver = Callable[[int, int], memoryview]
 ReadObserver = Callable[[int, int, str], None]
 _MAX_INVOCATIONS = 0x10000
@@ -121,6 +140,9 @@ _MAX_LANE_INSTRUCTION_STEPS = 64 * _MAX_INVOCATIONS
 _MAX_MEMORY_EVENTS = 4 * _MAX_INVOCATIONS
 # Emulator policy bound, not an A630 hardware limit. It caps immutable state copied while staging one command.
 _MAX_A630_SNAPSHOT_BYTES = 1 << 20
+# Emulator resource policy, not an A630 hardware limit. It bounds fail-closed CFG dataflow validation even for a
+# maximum-size image whose branches repeatedly grow the abstract scoreboard or fixed-delay state.
+_MAX_SCHEDULE_VALIDATION_STEPS = 8 * _MAX_SHADER_INSTRUCTIONS
 _OPERAND_CONTRACTS:dict[str, tuple[str|None, tuple[tuple[str, ...], ...]]] = {
   "nop":(None, ((),)), "end":(None, ((),)), "bar.g":(None, ((),)), "prede":(None, ((),)),
   "br.p0":(None, (("pred", "iim"),)), "jump":(None, (("iim",),)), "predt.p0":(None, (("pred",),)),
@@ -648,8 +670,12 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
       view = resolver(memory_range.address, memory_range.size)
       _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
     resolved.append(memory_range)
-  dispatch_instructions = tuple(decode_a630_ir3(read_images[(dispatch.shader_address, dispatch.shader_size, "shader")])
-                                for dispatch in dispatches)
+  decoded_shaders:dict[tuple[int, int], tuple[A630IR3Instruction, ...]] = {}
+  dispatch_instructions:list[tuple[A630IR3Instruction, ...]] = []
+  for dispatch in dispatches:
+    shader_key = (dispatch.shader_address, dispatch.shader_size)
+    if shader_key not in decoded_shaders: decoded_shaders[shader_key] = decode_a630_ir3(snapshots[shader_key])
+    dispatch_instructions.append(decoded_shaders[shader_key])
   frozen_dispatches = tuple(replace(dispatch,
     shader_image=read_images[(dispatch.shader_address, dispatch.shader_size, "shader")],
     constants_image=read_images[(dispatch.constants_address, dispatch.constants_size, "constants")],
@@ -758,44 +784,234 @@ def _schedule_flag(instruction:A630IR3Instruction, name:str) -> int:
   assert isinstance(values[0], int)
   return values[0]
 
+def _full_gpr_writes(instruction:A630IR3Instruction) -> set[int]:
+  if instruction.dst is None or instruction.dst.kind != "gpr": return set()
+  width = 4 if instruction.opcode in {"ldg.u32x4", "ldl.u32x4", "add.f.rpt4"} else 2 if instruction.opcode == "add.u.rpt2" else 1
+  return set(range(instruction.dst.value, instruction.dst.value + width))
+
 def _full_gpr_accesses(instruction:A630IR3Instruction) -> set[int]:
   # The admitted CS_CNTL_0 mode has MERGEDREGS clear, so Mesa's full and half register files do not alias.
-  accesses:set[int] = set()
+  accesses = _full_gpr_writes(instruction)
   def add(operand:A630IR3Operand|None, width:int=1) -> None:
     if operand is not None and operand.kind == "gpr": accesses.update(range(operand.value, operand.value + width))
 
-  add(instruction.dst)
   for operand in instruction.srcs: add(operand)
   if instruction.opcode in {"ldg.u32", "ldg.u32x4", "stg.u32", "stg.u32x4", "stg.u8"}: add(instruction.srcs[0], 2)
-  if instruction.opcode in {"ldg.u32x4", "ldl.u32x4"}: add(instruction.dst, 4)
   if instruction.opcode == "stg.u32x4": add(instruction.srcs[1], 4)
   if instruction.opcode == "add.f.rpt4":
-    add(instruction.dst, 4)
     for operand in instruction.srcs: add(operand, 4)
   if instruction.opcode == "add.u.rpt2":
-    add(instruction.dst, 2)
     add(instruction.srcs[1], 2)
   return accesses
 
-def _validate_local_memory_schedule(active:Sequence[A630IR3Instruction]) -> None:
-  # Pinned ir3_legalize.c makes BAR force both scoreboards, records an LDL destination in needs_ss, and inserts
-  # an SS-carrying NOP when Cat6 cannot encode SS. Model those dependencies rather than one compiler's NOP positions.
-  force_ss = force_sy = False
-  needs_ss:set[int] = set()
-  for instruction in active:
+def _store_source_gprs(instruction:A630IR3Instruction) -> tuple[set[int], set[int]]:
+  full:set[int] = set()
+  half:set[int] = set()
+  def add(operand:A630IR3Operand, width:int=1) -> None:
+    target = full if operand.kind == "gpr" else half if operand.kind == "half" else None
+    if target is not None: target.update(range(operand.value, operand.value + width))
+
+  if instruction.opcode in {"stg.u32", "stg.u32x4", "stg.u8"}:
+    add(instruction.srcs[0], 2)
+    add(instruction.srcs[1], 4 if instruction.opcode == "stg.u32x4" else 1)
+  elif instruction.opcode == "stl.u32":
+    add(instruction.srcs[0])
+    add(instruction.srcs[1])
+  return full,half
+
+def _instruction_successors(active:Sequence[A630IR3Instruction], index:int) -> tuple[int, ...]:
+  instruction = active[index]
+  if instruction.opcode == "end": return ()
+  if instruction.opcode == "jump": return (index + instruction.srcs[0].value,)
+  if instruction.opcode == "br.p0": return tuple(dict.fromkeys((index + 1, index + instruction.srcs[1].value)))
+  return (index + 1,)
+
+def _merge_memory_schedule(left:_A630MemoryScheduleState, right:_A630MemoryScheduleState) -> _A630MemoryScheduleState:
+  return _A630MemoryScheduleState(left.force_ss or right.force_ss, left.force_sy or right.force_sy,
+    left.needs_ss | right.needs_ss, left.needs_sy | right.needs_sy,
+    left.needs_ss_war_full | right.needs_ss_war_full, left.needs_ss_war_half | right.needs_ss_war_half,
+    left.needs_ss_or_sy_war_full | right.needs_ss_or_sy_war_full)
+
+def _schedule_value(instruction:A630IR3Instruction, name:str) -> int:
+  values = _field_values(instruction.fields, name)
+  if not values: return 0
+  _require(all(isinstance(value, int) and value >= 0 and value == values[0] for value in values),
+           f"inconsistent IR3 {name} field at instruction {instruction.index}")
+  assert isinstance(values[0], int)
+  return values[0]
+
+def _is_alu_instruction(instruction:A630IR3Instruction) -> bool:
+  return instruction.category in (1, 2, 3)
+
+def _instruction_source_reads(instruction:A630IR3Instruction, component:int|None=None) -> tuple[tuple[str, int, int], ...]:
+  reads:list[tuple[str, int, int]] = []
+  for source_index,source in enumerate(instruction.srcs):
+    if component is not None:
+      advances = instruction.opcode == "add.f.rpt4" or instruction.opcode == "add.u.rpt2" and source_index == 1
+      base,width = source.value + (component if advances else 0),1
+    else:
+      base = source.value
+      if instruction.opcode == "stg.u32x4" and source_index == 1: width = 4
+      elif instruction.opcode in {"ldg.u32", "ldg.u32x4", "stg.u32", "stg.u32x4", "stg.u8"} and source_index == 0: width = 2
+      else: width = 1
+    late = 2 if instruction.opcode == "madsh.m16" and source_index == 2 else 0
+    if source.kind in {"gpr", "half", "pred"}:
+      reads.extend((source.kind, base + offset, late) for offset in range(width))
+  return tuple(reads)
+
+def _instruction_destination_writes(instruction:A630IR3Instruction, component:int|None=None) -> tuple[tuple[str, int], ...]:
+  if instruction.dst is None or instruction.dst.kind not in {"gpr", "half", "pred"}: return ()
+  if component is not None:
+    advances = instruction.opcode in {"add.f.rpt4", "add.u.rpt2"}
+    return ((instruction.dst.kind, instruction.dst.value + (component if advances else 0)),)
+  width = len(_full_gpr_writes(instruction)) if instruction.dst.kind == "gpr" else 1
+  return tuple((instruction.dst.kind, instruction.dst.value + offset) for offset in range(width))
+
+def _merge_delay_maps(left:tuple[tuple[int, int], ...], right:tuple[tuple[int, int], ...]) -> tuple[tuple[int, int], ...]:
+  merged = dict(left)
+  for register,delay in right: merged[register] = max(delay, merged.get(register, 0))
+  return tuple(sorted(merged.items()))
+
+def _merge_delay_state(left:_A630DelayState, right:_A630DelayState) -> _A630DelayState:
+  return _A630DelayState(*(_merge_delay_maps(getattr(left, field), getattr(right, field))
+                           for field in ("full_alu", "full_non_alu", "half_alu", "half_non_alu", "predicate")))
+
+def _advance_delay_map(delays:dict[int, int], cycles:int) -> dict[int, int]:
+  return {register:delay-cycles for register,delay in delays.items() if delay > cycles}
+
+def _validate_fixed_alu_delays(active:Sequence[A630IR3Instruction]) -> None:
+  # Pinned ir3_delay.c and the A630 compiler configuration require three cycles from Cat1-3 ALU writes to another
+  # ALU and six to memory/control consumers. REPEAT advances component reads/writes; Cat3 source 2 is read two cycles
+  # late. Use maximum remaining delay at CFG joins, matching ir3_legalize.c's predecessor/loop convergence.
+  incoming:dict[int, _A630DelayState] = {0:_A630DelayState()}
+  pending = [0]
+  queued = {0}
+  steps = 0
+  while pending:
+    index = pending.pop()
+    queued.remove(index)
+    steps += 1
+    _require(steps <= _MAX_SCHEDULE_VALIDATION_STEPS, "A630 schedule validation exceeds the emulator work limit")
+    instruction,state = active[index],incoming[index]
+    full_alu,full_non_alu = dict(state.full_alu),dict(state.full_non_alu)
+    half_alu,half_non_alu = dict(state.half_alu),dict(state.half_non_alu)
+    predicate = dict(state.predicate)
+    is_alu = _is_alu_instruction(instruction)
+
+    def check_reads(reads:Sequence[tuple[str, int, int]], consumer_alu:bool) -> None:
+      for kind,register,read_offset in reads:
+        if kind == "pred": delays = predicate
+        elif kind == "gpr": delays = full_alu if consumer_alu else full_non_alu
+        else: delays = half_alu if consumer_alu else half_non_alu
+        _require(delays.get(register, 0) <= read_offset,
+                 f"A630 fixed ALU dependency lacks delay slots at instruction {instruction.index}")
+
+    def record_writes(writes:Sequence[tuple[str, int]], producer_alu:bool) -> None:
+      for kind,register in writes:
+        if not producer_alu:
+          if kind == "gpr":
+            full_alu.pop(register, None)
+            full_non_alu.pop(register, None)
+          elif kind == "half":
+            half_alu.pop(register, None)
+            half_non_alu.pop(register, None)
+          else: predicate.pop(register, None)
+        elif kind == "pred": predicate[register] = max(predicate.get(register, 0), 7)
+        else:
+          alu_delays,non_alu_delays = (full_alu,full_non_alu) if kind == "gpr" else (half_alu,half_non_alu)
+          alu_delays[register] = max(alu_delays.get(register, 0), 4)
+          non_alu_delays[register] = max(non_alu_delays.get(register, 0), 7)
+
+    def advance(cycles:int) -> None:
+      nonlocal full_alu,full_non_alu,half_alu,half_non_alu,predicate
+      full_alu,full_non_alu = _advance_delay_map(full_alu, cycles),_advance_delay_map(full_non_alu, cycles)
+      half_alu,half_non_alu = _advance_delay_map(half_alu, cycles),_advance_delay_map(half_non_alu, cycles)
+      predicate = _advance_delay_map(predicate, cycles)
+
+    repeat = _schedule_value(instruction, "REPEAT")
+    if is_alu:
+      for component in range(repeat + 1):
+        check_reads(_instruction_source_reads(instruction, component), True)
+        record_writes(_instruction_destination_writes(instruction, component), True)
+        advance(1)
+      advance(_schedule_value(instruction, "NOP"))
+    else:
+      check_reads(_instruction_source_reads(instruction), False)
+      record_writes(_instruction_destination_writes(instruction), False)
+      if instruction.opcode in {"nop", "predt.p0", "prede"}: advance(1 + repeat)
+    outgoing = _A630DelayState(tuple(sorted(full_alu.items())), tuple(sorted(full_non_alu.items())),
+      tuple(sorted(half_alu.items())), tuple(sorted(half_non_alu.items())), tuple(sorted(predicate.items())))
+    for successor in _instruction_successors(active, index):
+      _require(0 <= successor < len(active), f"A630 delay successor {successor} is out of range")
+      joined = outgoing if successor not in incoming else _merge_delay_state(incoming[successor], outgoing)
+      if joined != incoming.get(successor):
+        incoming[successor] = joined
+        if successor not in queued:
+          pending.append(successor)
+          queued.add(successor)
+
+def _validate_memory_schedule(active:Sequence[A630IR3Instruction]) -> None:
+  # Pinned ir3_legalize.c makes BAR force both scoreboards, records local/global load destinations in needs_ss/needs_sy,
+  # and inserts an SS-carrying NOP when Cat6 cannot encode SS. Model dependencies rather than compiler NOP positions.
+  incoming:dict[int, _A630MemoryScheduleState] = {0:_A630MemoryScheduleState()}
+  pending = [0]
+  queued = {0}
+  steps = 0
+  while pending:
+    index = pending.pop()
+    queued.remove(index)
+    steps += 1
+    _require(steps <= _MAX_SCHEDULE_VALIDATION_STEPS, "A630 schedule validation exceeds the emulator work limit")
+    instruction,state = active[index],incoming[index]
+    force_ss,force_sy = state.force_ss,state.force_sy
+    needs_ss,needs_sy = set(state.needs_ss),set(state.needs_sy)
+    needs_ss_war_full,needs_ss_war_half = set(state.needs_ss_war_full),set(state.needs_ss_war_half)
+    needs_ss_or_sy_war_full = set(state.needs_ss_or_sy_war_full)
     if _schedule_flag(instruction, "SS"):
       force_ss = False
       needs_ss.clear()
-    if _schedule_flag(instruction, "SY"): force_sy = False
+      needs_ss_war_full.clear()
+      needs_ss_war_half.clear()
+      needs_ss_or_sy_war_full.clear()
+    if _schedule_flag(instruction, "SY"):
+      force_sy = False
+      needs_sy.clear()
+      needs_ss_or_sy_war_full.clear()
     if instruction.opcode != "nop":
       _require(not force_ss, f"A630 barrier synchronization lacks SS before instruction {instruction.index}")
       _require(not force_sy, f"A630 barrier synchronization lacks SY before instruction {instruction.index}")
     _require(not needs_ss.intersection(_full_gpr_accesses(instruction)),
              f"A630 local-load dependency lacks SS synchronization at instruction {instruction.index}")
+    _require(not needs_sy.intersection(_full_gpr_accesses(instruction)),
+             f"A630 global-load dependency lacks SY synchronization at instruction {instruction.index}")
+    _require(not needs_ss_war_full.intersection(_full_gpr_writes(instruction)) and
+             not needs_ss_war_half.intersection({instruction.dst.value} if instruction.dst is not None and
+                                                instruction.dst.kind == "half" else set()),
+             f"A630 memory-source overwrite lacks SS synchronization at instruction {instruction.index}")
+    _require(not needs_ss_or_sy_war_full.intersection(_full_gpr_writes(instruction)),
+             f"A630 global-load source overwrite lacks SS or SY synchronization at instruction {instruction.index}")
     if instruction.opcode == "bar.g": force_ss = force_sy = True
     elif instruction.opcode == "ldl.u32x4":
       assert instruction.dst is not None
       needs_ss.update(range(instruction.dst.value, instruction.dst.value + 4))
+    elif instruction.opcode in {"ldg.u32", "ldg.u32x4"}:
+      assert instruction.dst is not None
+      needs_sy.update(range(instruction.dst.value, instruction.dst.value + (4 if instruction.opcode == "ldg.u32x4" else 1)))
+      needs_ss_or_sy_war_full.update(range(instruction.srcs[0].value, instruction.srcs[0].value + 2))
+    if instruction.opcode == "ldl.u32x4": needs_ss_war_full.add(instruction.srcs[0].value)
+    store_full,store_half = _store_source_gprs(instruction)
+    needs_ss_war_full.update(store_full)
+    needs_ss_war_half.update(store_half)
+    outgoing = _A630MemoryScheduleState(force_ss, force_sy, frozenset(needs_ss), frozenset(needs_sy),
+      frozenset(needs_ss_war_full), frozenset(needs_ss_war_half), frozenset(needs_ss_or_sy_war_full))
+    for successor in _instruction_successors(active, index):
+      _require(0 <= successor < len(active), f"A630 schedule successor {successor} is out of range")
+      joined = outgoing if successor not in incoming else _merge_memory_schedule(incoming[successor], outgoing)
+      if joined != incoming.get(successor):
+        incoming[successor] = joined
+        if successor not in queued:
+          pending.append(successor)
+          queued.add(successor)
 
 def _validate_control_flow(active:Sequence[A630IR3Instruction], dispatch:A630Dispatch) -> None:
   predicated = False
@@ -833,7 +1049,8 @@ def _validate_control_flow(active:Sequence[A630IR3Instruction], dispatch:A630Dis
     _require(len(barriers) == 1 and bool(local_stores) and bool(local_loads) and
              max(local_stores) < barriers[0] < min(local_loads),
              "A630 multi-lane local memory requires one store/barrier/load phase")
-  _validate_local_memory_schedule(active)
+  _validate_memory_schedule(active)
+  _validate_fixed_alu_delays(active)
 
 def _validate_register_footprint(dispatch:A630Dispatch, active:Sequence[A630IR3Instruction], wgid:int, lid:int) -> None:
   registers = dict(dispatch.registers)

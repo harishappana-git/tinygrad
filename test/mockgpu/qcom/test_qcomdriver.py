@@ -1,4 +1,4 @@
-import contextlib, ctypes, functools, mmap, os, unittest
+import contextlib, ctypes, functools, mmap, os, subprocess, sys, unittest
 from typing import Any, cast
 from unittest import mock
 from tinygrad.helpers import DEV, mv_address
@@ -128,6 +128,21 @@ class TestQCOMDriver(unittest.TestCase):
     for buffer in (self.device.cmd_buf, self.device.border_color_buf, self.device.kernargs_buf, self.device.timeline_signal.base_buf):
       self.assertIsNotNone(self.allocation_for(int(buffer.va_addr), buffer.size))
     self.assertIsNotNone(self.allocation_for(self.device.dummy_addr, 0x1000))
+
+  def test_unselected_qcom_driver_does_not_require_mesa(self):
+    code = """
+import importlib.abc, sys
+class BlockMesa(importlib.abc.MetaPathFinder):
+  def find_spec(self, fullname, path=None, target=None):
+    if fullname == 'tinygrad.runtime.autogen.mesa': raise ImportError('tinymesa intentionally unavailable')
+    return None
+sys.meta_path.insert(0, BlockMesa())
+import tinygrad.runtime.support.hcq
+assert 'test.mockgpu.qcom.qcomdriver' not in sys.modules
+"""
+    result = subprocess.run([sys.executable, "-c", code], env={**os.environ, "DEV":"MOCK+AMD", "PYTHONDONTWRITEBYTECODE":"1"},
+                            capture_output=True, text=True, timeout=10)
+    self.assertEqual(result.returncode, 0, result.stderr)
 
   def test_mock_qcom_jit_falls_back_to_individual_submissions(self):
     from tinygrad import Tensor, TinyJit
@@ -668,8 +683,11 @@ class TestQCOMDriver(unittest.TestCase):
       .exec(runtime, a_args, program_spec.arg.global_size, program_spec.arg.local_size) \
       .signal(self.device.timeline_signal, self.device.timeline_value)
     words = tuple(queue._q)
-    submission = stage_a630(parse_pm4(words), self._resolve_owned)
+    with mock.patch.object(a630_module, "decode_a630_ir3", wraps=a630_module.decode_a630_ir3) as decode:
+      submission = stage_a630(parse_pm4(words), self._resolve_owned)
     self.assertEqual(len(submission.dispatches), 2)
+    self.assertEqual(decode.call_count, 1)
+    self.assertIs(submission.dispatches[0].instructions, submission.dispatches[1].instructions)
     self.assertLess(submission.dispatches[0].word_offset, submission.dispatches[1].word_offset)
     self.assertEqual(tuple(struct.unpack("<2Q", dispatch.constants_image[:16]) for dispatch in submission.dispatches),
                      ((b_address, a_address), (a_address, b_address)))
@@ -889,15 +907,18 @@ class TestQCOMDriver(unittest.TestCase):
       stage_a630(unique, resolver)
     self.assertEqual(resolver.call_count, 16)
 
-  def test_local_load_scoreboard_tracks_full_register_dependencies(self):
+  def test_memory_and_fixed_delay_scoreboards_track_register_dependencies(self):
     from dataclasses import replace
+    from test.mockgpu.qcom import a630 as a630_module
     from test.mockgpu.qcom.a630 import A630Dispatch, A630IR3Instruction, A630IR3Operand, _validate_control_flow
 
     def gpr(value): return A630IR3Operand("gpr", value)
     def half(value): return A630IR3Operand("half", value)
     def iim(value): return A630IR3Operand("iim", value)
-    def instruction(index, opcode, dst=None, srcs=(), *, ss=0, sy=0):
-      return A630IR3Instruction(index, 0, 0, opcode, (("SS", ss), ("SY", sy)), opcode, dst, srcs)
+    def pred(value): return A630IR3Operand("pred", value)
+    def instruction(index, opcode, dst=None, srcs=(), *, category=0, ss=0, sy=0, repeat=0, nop=0):
+      fields = (("SS", ss), ("SY", sy), ("REPEAT", repeat), ("NOP", nop))
+      return A630IR3Instruction(index, category, 0, opcode, fields, opcode, dst, srcs)
     dispatch = A630Dispatch(0, (), (), 0, 0, b"", 0, 0, b"", 0, 0, (1, 1, 1), (1, 1, 1), (1, 1, 1))
     load = instruction(0, "ldl.u32x4", gpr(8), (gpr(0),))
     end = instruction(2, "end")
@@ -935,6 +956,73 @@ class TestQCOMDriver(unittest.TestCase):
     synchronized_load = replace(unsynchronized_load, fields=(("SS", 0), ("SY", 1)))
     _validate_control_flow((barrier, ss_nop, synchronized_load, instruction(3, "nop", ss=1),
                             instruction(4, "add.u", gpr(30), (gpr(8), gpr(1))), instruction(5, "end")), dispatch)
+
+    global_load = instruction(0, "ldg.u32x4", gpr(8), (gpr(0),))
+    for consumer in (instruction(1, "add.u", gpr(30), (gpr(11), gpr(1))), instruction(1, "add.u", gpr(11), (gpr(30), gpr(1)))):
+      with self.subTest(global_load_hazard=consumer.dst), self.assertRaisesRegex(ValueError, "global-load dependency lacks SY"):
+        _validate_control_flow((global_load, consumer, end), dispatch)
+      _validate_control_flow((global_load, replace(consumer, fields=(("SS", 0), ("SY", 1))), end), dispatch)
+
+    global_address_overwrite = instruction(1, "add.u", gpr(1), (gpr(30), gpr(31)))
+    with self.assertRaisesRegex(ValueError, "global-load source overwrite lacks SS or SY"):
+      _validate_control_flow((global_load, global_address_overwrite, end), dispatch)
+    for ss,sy in ((1, 0), (0, 1)):
+      _validate_control_flow((global_load, replace(global_address_overwrite, fields=(("SS", ss), ("SY", sy))), end), dispatch)
+
+    local_address_overwrite = instruction(1, "add.u", gpr(0), (gpr(30), gpr(31)))
+    with self.assertRaisesRegex(ValueError, "memory-source overwrite lacks SS"):
+      _validate_control_flow((load, local_address_overwrite, end), dispatch)
+    _validate_control_flow((load, replace(local_address_overwrite, fields=(("SS", 1), ("SY", 0))), end), dispatch)
+    with self.assertRaisesRegex(ValueError, "memory-source overwrite lacks SS"):
+      _validate_control_flow((load, replace(local_address_overwrite, fields=(("SS", 0), ("SY", 1))), end), dispatch)
+
+    skipped_sy = (instruction(0, "ldg.u32", gpr(8), (gpr(0),)),
+                  instruction(1, "br.p0", srcs=(pred(0), iim(2))), instruction(2, "nop", sy=1),
+                  instruction(3, "add.u", gpr(30), (gpr(8), gpr(1))), instruction(4, "end"))
+    with self.assertRaisesRegex(ValueError, "global-load dependency lacks SY"): _validate_control_flow(skipped_sy, dispatch)
+    backedge = (instruction(0, "add.u", gpr(0), (gpr(30), gpr(31))), instruction(1, "ldg.u32", gpr(8), (gpr(0),)),
+                instruction(2, "jump", srcs=(iim(-2),)), instruction(3, "end"))
+    with self.assertRaisesRegex(ValueError, "global-load source overwrite lacks SS or SY"):
+      _validate_control_flow(backedge, dispatch)
+
+    byte_store = instruction(0, "stg.u8", srcs=(gpr(4), half(6)))
+    store_overwrites = (instruction(1, "add.u", gpr(5), (gpr(30), gpr(31))),
+                        instruction(1, "cmps.s.lt", half(6), (gpr(30), gpr(31))))
+    for overwrite in store_overwrites:
+      with self.subTest(store_war=overwrite.dst), self.assertRaisesRegex(ValueError, "memory-source overwrite lacks SS"):
+        _validate_control_flow((byte_store, overwrite, end), dispatch)
+      _validate_control_flow((byte_store, replace(overwrite, fields=(("SS", 1), ("SY", 0))), end), dispatch)
+
+    # A branch lattice can grow a different store-source mask at every merge. The emulator rejects boundedly instead
+    # of allowing a maximum-size adversarial shader to monopolize validation before any execution budget applies.
+    complex_cfg = tuple(item for pair in ((instruction(2*index, "br.p0", srcs=(pred(0), iim(2))),
+                                           instruction(2*index+1, "stg.u8", srcs=(gpr(4), half(index % 0xc0))))
+                                          for index in range(32)) for item in pair) + (instruction(64, "end"),)
+    with mock.patch.object(a630_module, "_MAX_SCHEDULE_VALIDATION_STEPS", 32), \
+         self.assertRaisesRegex(ValueError, "schedule validation exceeds the emulator work limit"):
+      _validate_control_flow(complex_cfg, dispatch)
+
+    rpt4_overlap = (instruction(0, "add.f.rpt4", gpr(20), (gpr(19), gpr(40)), category=2, repeat=3, nop=3),
+                    instruction(1, "end"))
+    rpt2_overlap = (instruction(0, "add.u.rpt2", gpr(20), (gpr(40), gpr(19)), category=2, repeat=1, nop=3),
+                    instruction(1, "end"))
+    for program in (rpt4_overlap, rpt2_overlap):
+      with self.subTest(intra_repeat=program[0].opcode), \
+           self.assertRaisesRegex(ValueError, "fixed ALU dependency lacks delay slots"):
+        _validate_control_flow(program, dispatch)
+
+    aligned_repeats = (instruction(0, "add.f.rpt4", gpr(20), (gpr(0), gpr(4)), category=2, repeat=3),
+                       instruction(1, "add.f.rpt4", gpr(40), (gpr(20), gpr(24)), category=2, repeat=3, nop=3),
+                       instruction(2, "end"))
+    _validate_control_flow(aligned_repeats, dispatch)
+    immediate_late_read = (instruction(0, "add.u", gpr(20), (gpr(0), gpr(1)), category=2),
+                           instruction(1, "madsh.m16", gpr(21), (gpr(30), gpr(31), gpr(20)), category=3),
+                           instruction(2, "end"))
+    with self.assertRaisesRegex(ValueError, "fixed ALU dependency lacks delay slots"):
+      _validate_control_flow(immediate_late_read, dispatch)
+    delayed_late_read = (immediate_late_read[0], instruction(1, "nop"),
+                         replace(immediate_late_read[1], index=2), instruction(3, "end"))
+    _validate_control_flow(delayed_late_read, dispatch)
 
   def test_max_group_memory_free_dispatch_uses_no_dense_local_backing(self):
     from tinygrad.runtime.autogen import mesa
@@ -1276,6 +1364,51 @@ class TestQCOMDriver(unittest.TestCase):
       self.device._gpu_free(alias_input_buffer)
     finally: constants_view[:8] = original_output_pointer
 
+    # Pinned ir3_legalize.c records a non-local load destination in needs_sy and requires a consuming instruction to carry SY.
+    self.assertEqual(tuple(value for field,value in float_add.fields if field == "SY"), (1,))
+    missing_sy_raw = float_add.raw & ~(1 << 60)
+    def schedule_state():
+      return (bytes(result_view), bytes(input_view), bytes(constants_view), bytes(shader_view),
+              bytes(self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)), self.device.timeline_value,
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
+              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
+    with self._mutate_a630_replay(submission, words, ((float_add, missing_sy_raw),), timestamp=0x53594c44) as \
+         (missing_sy_submission,missing_sy_dispatch,missing_sy_request):
+      missing_sy = missing_sy_dispatch.instructions[float_add.index]
+      self.assertEqual((missing_sy.opcode, missing_sy.dst, missing_sy.srcs), (float_add.opcode, float_add.dst, float_add.srcs))
+      self.assertEqual(tuple(value for field,value in missing_sy.fields if field == "SY"), (0,))
+      self._assert_a630_transactional_rejection(execute=execute_a630, submission=missing_sy_submission,
+        request=missing_sy_request, message="global-load dependency lacks SY", marker=0x53594c44, state=schedule_state)
+
+    store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
+    pointer_write = next(instruction for instruction in active if instruction.dst == store.srcs[0])
+    padding = dispatch.instructions[end.index + 1]
+    self.assertEqual((padding.opcode, padding.raw), ("nop", 0))
+    with self._mutate_a630_replay(submission, words, ((end, pointer_write.raw), (padding, end.raw)), timestamp=0x53535752) as \
+         (missing_ss_submission,missing_ss_dispatch,missing_ss_request):
+      overwrite,moved_end = missing_ss_dispatch.instructions[end.index:end.index+2]
+      self.assertEqual((overwrite.opcode, overwrite.dst, overwrite.srcs),
+                       (pointer_write.opcode, pointer_write.dst, pointer_write.srcs))
+      self.assertEqual(moved_end.opcode, "end")
+      self._assert_a630_transactional_rejection(execute=execute_a630, submission=missing_ss_submission,
+        request=missing_ss_request, message="memory-source overwrite lacks SS", marker=0x53535752, state=schedule_state)
+
+    # A630's pinned compiler configuration requires six cycles from an ALU destination to a Cat6 store source.
+    # The ADD.F NOP field contributes three cycles and the following repeated Cat0 NOP contributes the other three.
+    delay_nop = active[float_add.index + 1]
+    self.assertEqual((tuple(value for field,value in float_add.fields if field == "NOP"),
+                      delay_nop.opcode, tuple(value for field,value in delay_nop.fields if field == "REPEAT")),
+                     ((3,), "nop", (2,)))
+    missing_delay_raw = float_add.raw & ~((1 << 43) | (1 << 51))
+    with self._mutate_a630_replay(submission, words, ((float_add, missing_delay_raw),), timestamp=0x444c4159) as \
+         (missing_delay_submission,missing_delay_dispatch,missing_delay_request):
+      missing_delay = missing_delay_dispatch.instructions[float_add.index]
+      self.assertEqual((missing_delay.opcode, missing_delay.dst, missing_delay.srcs),
+                       (float_add.opcode, float_add.dst, float_add.srcs))
+      self.assertEqual(tuple(value for field,value in missing_delay.fields if field == "NOP"), ())
+      self._assert_a630_transactional_rejection(execute=execute_a630, submission=missing_delay_submission,
+        request=missing_delay_request, message="fixed ALU dependency lacks delay slots", marker=0x444c4159, state=schedule_state)
+
     with self._edit_a630_shader(submission, ((float_add, flut3_raw),)):
       self.assertNotEqual(bytes(shader_view), dispatch.shader_image)
     # END's raw bit 32 is reserved by pinned ir3-cat0.xml and has no structured callback field.
@@ -1513,32 +1646,27 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(list(struct.unpack("<4f", constant_output)), constant_python)
 
     constant_words = struct.unpack(f"<{len(constant_commands[0]) // 4}I", constant_commands[0])
-    # Pinned ir3_legalize executes RPT component cycles in order. Shift the decoded ADD.F first source to one register
-    # below its destination: each later component must observe the preceding component's mapped destination write.
+    # Pinned ir3_delay.c treats RPT as sequential component cycles. Shifting an advancing source one register below
+    # the destination makes component 1 read component 0's result after one cycle, before its three-cycle ALU latency.
     repeated_add = next(instruction for instruction in constant_dispatch.instructions if instruction.opcode == "add.f.rpt4")
     assert repeated_add.dst is not None and repeated_add.srcs[0].kind == "gpr"
     overlap_source = repeated_add.dst.value - 1
     overlap_add_raw = repeated_add.raw & ~0xffff | overlap_source
-    overlap_values = (1.0, 3.0, 7.0, 15.0)
-    overlap_expected = (16.0, 19.0, 26.0, 41.0)
     constant_input_bases = struct.unpack_from("<2Q", constant_dispatch.constants_image, 8)
     constant_inputs = tuple(self._resolve_owned(base, 16) for base in constant_input_bases)
-    constant_input_originals = tuple(bytes(view) for view in constant_inputs)
-    constant_output_original = bytes(constant_output)
-    try:
-      for view in constant_inputs: view[:] = struct.pack("<4f", *overlap_values)
-      constant_output[:] = bytes([0x9b]) * 16
-      with self._mutate_a630_replay(constant_submission, constant_words, ((repeated_add, overlap_add_raw),)) as \
-           (overlap_submission,overlap_dispatch,_):
-        mutated_add = overlap_dispatch.instructions[repeated_add.index]
-        self.assertEqual((mutated_add.srcs[0].value, mutated_add.dst), (overlap_source, repeated_add.dst))
-        overlap_journal = constant_real_execute(overlap_submission, self._resolve_owned)
-        self.assertEqual(bytes(constant_output), bytes([0x9b]) * 16)
-        self.assertEqual((len(overlap_journal), struct.unpack("<4f", overlap_journal[0].data)),
-                         (1, overlap_expected))
-    finally:
-      for view,original in zip(constant_inputs, constant_input_originals): view[:] = original
-      constant_output[:] = constant_output_original
+    constant_shader = self._resolve_owned(constant_dispatch.shader_address, constant_dispatch.shader_size)
+    constant_constants = self._resolve_owned(constant_dispatch.constants_address, constant_dispatch.constants_size)
+    def repeat_state():
+      return (bytes(constant_output), tuple(bytes(view) for view in constant_inputs), bytes(constant_shader), bytes(constant_constants),
+              bytes(self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)), self.device.timeline_value,
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
+              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
+    with self._mutate_a630_replay(constant_submission, constant_words, ((repeated_add, overlap_add_raw),), timestamp=0x52505434) as \
+         (overlap_submission,overlap_dispatch,overlap_request):
+      mutated_add = overlap_dispatch.instructions[repeated_add.index]
+      self.assertEqual((mutated_add.srcs[0].value, mutated_add.dst), (overlap_source, repeated_add.dst))
+      self._assert_a630_transactional_rejection(execute=constant_real_execute, submission=overlap_submission,
+        request=overlap_request, message="fixed ALU dependency lacks delay slots", marker=0x52505434, state=repeat_state)
 
   def test_repeated_integer_vector_add_remains_fail_closed(self):
     from tinygrad import Device, Tensor, dtypes

@@ -5,11 +5,13 @@ from tinygrad.runtime.autogen import libc
 from test.mockgpu.nv.nvdriver import NVDriver
 from test.mockgpu.amd.amddriver import AMDDriver
 from test.mockgpu.am.amdriver import AMDriver, AMUSBDriver
-from test.mockgpu.qcom.qcomdriver import QCOMDriver
 start = time.perf_counter()
 
-drivers = [cls() for t in DEV.value if (cls:={"MOCKPCI+AMD": AMDriver, "MOCKKFD+AMD": AMDDriver, "MOCK+AMD": AMDDriver, "MOCKUSB+AMD": AMUSBDriver,
-                                              "MOCK+NV": NVDriver, "MOCK+QCOM": QCOMDriver}.get(f"{t.interface}+{t.device}"))]
+_driver_classes = {"MOCKPCI+AMD": AMDriver, "MOCKKFD+AMD": AMDDriver, "MOCK+AMD": AMDDriver, "MOCKUSB+AMD": AMUSBDriver, "MOCK+NV": NVDriver}
+if any(t.interface == "MOCK" and t.device == "QCOM" for t in DEV.value):
+  from test.mockgpu.qcom.qcomdriver import QCOMDriver
+  _driver_classes["MOCK+QCOM"] = QCOMDriver
+drivers = [cls() for t in DEV.value if (cls:=_driver_classes.get(f"{t.interface}+{t.device}"))]
 tracked_fds: dict[int, typing.Any] = {}
 
 original_memoryview = builtins.memoryview
