@@ -1701,7 +1701,7 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl, mesa
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
-    from test.mockgpu.qcom.a630 import A630Resource, decode_a630_ir3, stage_a630
+    from test.mockgpu.qcom.a630 import A630IR3Operand, A630Resource, decode_a630_ir3, stage_a630
     from test.mockgpu.qcom.pm4 import parse_pm4
 
     self.assertEqual((Device.DEFAULT, DEV.interface, DEV.device, DEV.renderer, DEV.arch),
@@ -1803,6 +1803,98 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(list(struct.unpack(f"<{indexed_fill_size}f", indexed_fill_output)), [1.0] * indexed_fill_size)
     self.assertEqual((bytes(indexed_fill_shader), indexed_fill_tensor.tolist()),
                      (indexed_fill_dispatch.shader_image, [1.0] * indexed_fill_size))
+
+    # A fresh grouped fill makes WGID part of the mapped address chain: WGID*32 lanes*4 components + LID*4.
+    grouped_fill_size = 256
+    with self._capture_a630_execution() as (grouped_fill_submissions,grouped_fill_commands,grouped_fill_real_execute):
+      grouped_fill_tensor = Tensor.ones(grouped_fill_size, device=Device.DEFAULT).contiguous().realize()
+    self.assertEqual((len(grouped_fill_submissions), len(grouped_fill_commands)), (1, 1))
+    grouped_fill_submission = grouped_fill_submissions[0]
+    grouped_fill_dispatch = grouped_fill_submission.dispatches[0]
+    self.assertEqual((grouped_fill_dispatch.local_size, grouped_fill_dispatch.groups, grouped_fill_dispatch.global_size),
+                     ((32, 1, 1), (2, 1, 1), (64, 1, 1)))
+    grouped_fill_system = dict(grouped_fill_dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+    grouped_fill_wgid,grouped_fill_lid = grouped_fill_system & 0xff,grouped_fill_system >> 24 & 0xff
+    self.assertEqual((grouped_fill_system, grouped_fill_wgid, grouped_fill_lid), (0xfcfcc0, 0xc0, 0))
+    grouped_fill_group_shift = next(instruction for instruction in grouped_fill_dispatch.instructions
+                                    if instruction.opcode == "shl.b" and instruction.srcs[0].kind == "shared")
+    grouped_fill_local_shift = next(instruction for instruction in grouped_fill_dispatch.instructions
+                                    if instruction.opcode == "shl.b" and
+                                    instruction.srcs == (A630IR3Operand("gpr", grouped_fill_lid), A630IR3Operand("iim", 2)))
+    assert grouped_fill_group_shift.dst is not None and grouped_fill_local_shift.dst is not None
+    self.assertEqual(grouped_fill_group_shift.srcs,
+                     (A630IR3Operand("shared", grouped_fill_wgid), A630IR3Operand("iim", 7)))
+    grouped_fill_global_add = next(instruction for instruction in grouped_fill_dispatch.instructions
+                                   if instruction.opcode == "add.u" and instruction.dst is not None and
+                                   frozenset(instruction.srcs) ==
+                                   frozenset((grouped_fill_group_shift.dst, grouped_fill_local_shift.dst)))
+    self.assertLess(max(grouped_fill_group_shift.index, grouped_fill_local_shift.index), grouped_fill_global_add.index)
+    grouped_fill_base = struct.unpack_from("<Q", grouped_fill_dispatch.constants_image)[0]
+    grouped_fill_output = self._resolve_owned(grouped_fill_base, grouped_fill_size * 4)
+    grouped_fill_python = Tensor.ones(grouped_fill_size, device="PYTHON").tolist()
+    grouped_fill_cpu = Tensor.ones(grouped_fill_size, device="CPU").tolist()
+    self.assertEqual(grouped_fill_tensor.tolist(), grouped_fill_python)
+    self.assertEqual(grouped_fill_tensor.tolist(), grouped_fill_cpu)
+    self.assertEqual(list(struct.unpack(f"<{grouped_fill_size}f", grouped_fill_output)), grouped_fill_python)
+    grouped_fill_original = bytes(grouped_fill_output)
+    grouped_fill_output[:] = bytes([0xa7]) * len(grouped_fill_output)
+    try:
+      grouped_fill_journal = grouped_fill_real_execute(grouped_fill_submission, self._resolve_owned)
+      self.assertEqual(bytes(grouped_fill_output), bytes([0xa7]) * len(grouped_fill_output))
+      self.assertEqual((len(grouped_fill_journal), tuple(len(write.data) for write in grouped_fill_journal)),
+                       (64, (16,) * 64))
+      self.assertEqual(b"".join(write.data for write in sorted(grouped_fill_journal, key=lambda write: write.address)),
+                       struct.pack(f"<{grouped_fill_size}f", *([1.0] * grouped_fill_size)))
+    finally: grouped_fill_output[:] = grouped_fill_original
+
+    grouped_fill_constants = self._resolve_owned(grouped_fill_dispatch.constants_address, grouped_fill_dispatch.constants_size)
+    grouped_fill_words = struct.unpack(f"<{len(grouped_fill_commands[0]) // 4}I", grouped_fill_commands[0])
+    grouped_fill_moves = sorted((instruction for instruction in grouped_fill_dispatch.instructions
+                                 if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim"),
+                                key=lambda instruction: instruction.dst.value if instruction.dst is not None else -1)
+    grouped_fill_literal = grouped_fill_moves[2]
+    grouped_fill_shader = self._resolve_owned(grouped_fill_dispatch.shader_address, grouped_fill_dispatch.shader_size)
+    grouped_fill_literal_original = bytes(grouped_fill_shader[grouped_fill_literal.index*8:(grouped_fill_literal.index+1)*8])
+    grouped_fill_literal_buffer,_,grouped_fill_literal_request = self.gpu_command(grouped_fill_words)
+    try:
+      struct.pack_into("<I", grouped_fill_shader, grouped_fill_literal.index * 8, 0x40000000)
+      grouped_fill_decoded = decode_a630_ir3(bytes(grouped_fill_shader))[grouped_fill_literal.index]
+      self.assertEqual((grouped_fill_decoded.opcode, grouped_fill_decoded.srcs[0].kind, grouped_fill_decoded.srcs[0].value),
+                       ("mov.u32", "uim", 0x40000000))
+      grouped_fill_output[:] = bytes([0xb6]) * len(grouped_fill_output)
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=grouped_fill_literal_request)
+      self.assertEqual(list(struct.unpack(f"<{grouped_fill_size}f", grouped_fill_output)),
+                       [1.0, 1.0, 2.0, 1.0] * (grouped_fill_size // 4))
+    finally:
+      grouped_fill_shader[grouped_fill_literal.index*8:(grouped_fill_literal.index+1)*8] = grouped_fill_literal_original
+      self.device._gpu_free(grouped_fill_literal_buffer)
+    self.assertEqual(bytes(grouped_fill_shader), grouped_fill_dispatch.shader_image)
+
+    def grouped_fill_state():
+      signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+      return (bytes(grouped_fill_output), bytes(grouped_fill_constants), bytes(signal), self.device.timeline_value,
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
+              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
+    grouped_fill_mutations = (
+      (grouped_fill_group_shift, grouped_fill_group_shift.raw & ~0xff | grouped_fill_wgid + 1, "workgroup-id scaling"),
+      (grouped_fill_global_add, grouped_fill_global_add.raw & ~0xffff | grouped_fill_local_shift.dst.value, "global-id add"),
+    )
+    for case,(instruction,mutated_raw,message) in enumerate(grouped_fill_mutations):
+      grouped_fill_output[:] = bytes([0xb7 + case]) * len(grouped_fill_output)
+      marker = 0x24680100 + case
+      with self._mutate_a630_replay(grouped_fill_submission, grouped_fill_words, ((instruction, mutated_raw),),
+                                    timestamp=marker) as (mutated_submission,mutated_dispatch,request):
+        self.assertEqual(mutated_dispatch.instructions[instruction.index].opcode, instruction.opcode)
+        self._assert_a630_transactional_rejection(execute=grouped_fill_real_execute, submission=mutated_submission,
+                                                   request=request, message=message, marker=marker, state=grouped_fill_state)
+
+    grouped_fill_output[:] = bytes([0xc7]) * len(grouped_fill_output)
+    grouped_fill_recovery_buffer,_,grouped_fill_recovery_request = self.gpu_command(grouped_fill_words)
+    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=grouped_fill_recovery_request)
+    finally:
+      self.device._gpu_free(grouped_fill_recovery_buffer)
+      self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
+    self.assertEqual(list(struct.unpack(f"<{grouped_fill_size}f", grouped_fill_output)), [1.0] * grouped_fill_size)
 
     prepared = []
     for size in (8, 16, 64, 128):
@@ -1965,7 +2057,7 @@ class TestQCOMDriver(unittest.TestCase):
     multi_left = Tensor([float(index) for index in range(192)], device=Device.DEFAULT).realize()
     multi_right = Tensor([float(191-index) for index in range(192)], device=Device.DEFAULT).realize()
     with self._capture_a630_execution() as (multi_submissions,multi_commands,_), \
-         self.assertRaisesRegex(HCQSubmissionRejected, "requires one workgroup or the exact local-32 two-workgroup add"):
+         self.assertRaisesRegex(HCQSubmissionRejected, "requires one workgroup or the exact local-32 two-workgroup fill/add"):
       (multi_left + multi_right).realize()
     self.assertEqual((len(multi_submissions), len(multi_commands)), (1, 1))
     multi_dispatch = multi_submissions[0].dispatches[0]
@@ -2212,7 +2304,7 @@ class TestQCOMDriver(unittest.TestCase):
     unsupported_before,prof_exec_before = unsupported_state(),self.device.prof_exec_counter
     try:
       with self._capture_a630_execution() as (unsupported_submissions,unsupported_commands,_), \
-           self.assertRaisesRegex(HCQSubmissionRejected, "requires one workgroup or the exact local-32 two-workgroup add"):
+           self.assertRaisesRegex(HCQSubmissionRejected, "requires one workgroup or the exact local-32 two-workgroup fill/add"):
         (unsupported_left + unsupported_right).realize()
       self.assertEqual((len(unsupported_submissions), len(unsupported_commands), unsupported_state()),
                        (1, 1, unsupported_before))

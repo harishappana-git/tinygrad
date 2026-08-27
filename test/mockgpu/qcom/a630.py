@@ -807,18 +807,19 @@ def _validate_vector_u32_dispatch(dispatch:A630Dispatch, active:Sequence[A630IR3
   constant_pointer_x4 = uses_constant_pointers and dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1)
   one_workgroup = dispatch.groups == (1, 1, 1) and dispatch.global_size == dispatch.local_size and \
     dispatch.local_size[1:] == (1, 1) and 2 <= dispatch.local_size[0] <= 32
-  local32_workgroups = add and dispatch.groups == (2, 1, 1) and dispatch.local_size == (32, 1, 1) and \
+  local32_workgroups = (fill or add) and dispatch.groups == (2, 1, 1) and dispatch.local_size == (32, 1, 1) and \
     dispatch.global_size == (64, 1, 1)
   _require(constant_pointer_x4 or one_workgroup or local32_workgroups,
-           "A630 four-component execution requires one workgroup or the exact local-32 two-workgroup add")
+           "A630 four-component execution requires one workgroup or the exact local-32 two-workgroup fill/add")
   _require((constant_pointer_x4 and (wgid, lid) == (0xfc, 0xfc)) or
            (one_workgroup and wgid == 0xfc and lid != 0xfc) or (local32_workgroups and (wgid, lid) == (0xc0, 0)),
            "unsupported A630 four-component system-value mapping")
   expected_counts = ({"mov.u32":6, "nop":1, "stg.u32x4":1, "end":1} if constant_pointer_x4 and fill else
                      {"mov.u32":6, "nop":3, "ldg.u32x4":2, "add.f.rpt4":1, "stg.u32x4":1, "end":1}
                      if constant_pointer_x4 else
-                     {"shl.b":3, "mov.u32":4, "ashr.b":1, "add.u":3, "cmps.u.lt":1, "shrg":1,
-                      "cov.u16s32":1, "nop":2, "stg.u32x4":1, "end":1} if fill else
+                     {"shl.b":3 + int(local32_workgroups), "mov.u32":4, "ashr.b":1,
+                      "add.u":3 + int(local32_workgroups), "cmps.u.lt":1, "shrg":1,
+                      "cov.u16s32":1, "nop":2 + int(local32_workgroups), "stg.u32x4":1, "end":1} if fill else
                      {"shl.b":3 + int(local32_workgroups), "ashr.b":1, "add.u":9 + int(local32_workgroups),
                       "cmps.u.lt":3, "shrg":1, "cov.u16s32":3,
                       "nop":3, "ldg.u32x4":2, "add.f.rpt4":1, "stg.u32x4":1, "end":1})
