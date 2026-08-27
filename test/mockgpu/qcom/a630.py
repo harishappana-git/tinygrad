@@ -1274,7 +1274,10 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     integer_kind = "add"
   has_integer_add = integer_instruction is not None and integer_instruction.opcode == "add.u"
   shared_uses = tuple(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "shared")
+  _require(dispatch.groups[0] == 1 or bool(shared_uses), "multi-workgroup A630 scalar execution does not consume a workgroup id")
   uses_constant_pointers = _validate_constant_pointer_moves(active)
+  grouped_lane_add = input_count == 2 and has_integer_add and bool(shared_uses) and \
+    dispatch.groups[0] > 1 and dispatch.local_size == (2, 1, 1)
   if input_count == 0:
     expected_counts = {"shl.b":3, "mov.u32":1, "nop":3, "add.u":4, "ashr.b":1, "shrg":1,
                        "cmps.u.lt":1, "cov.u16s32":1, "stg.u32":1, "end":1}
@@ -1298,15 +1301,22 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     _require(comparison_instruction is None, "u32 comparison requires the scalar constant-pointer ABI")
     _require(integer_kind in (None, "add"),
              "32-bit subtraction, multiplication, logical shift, bitwise, and maximum operations currently require the scalar constant-pointer ABI")
-    uses_workgroup_id = bool(shared_uses)
     expected_counts = {"ashr.b":1, "shl.b":2, "shrg":1, "add.u":3 * (input_count + 1) + int(has_integer_add),
-                       "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3 + int(uses_workgroup_id),
+                       "cmps.u.lt":input_count + 1, "cov.u16s32":input_count + 1, "nop":3,
                        "ldg.u32":input_count, "stg.u32":1, "end":1}
     if float_add_count: expected_counts["add.f"] = 1
     if conversion_instruction is not None:
       assert conversion_instruction.opcode is not None
       expected_counts[conversion_instruction.opcode] = 1
-    if uses_workgroup_id: expected_counts["mov.u32"] = 1
+    if shared_uses:
+      _require(grouped_lane_add or dispatch.local_size == (1, 1, 1),
+               "unsupported A630 scalar multi-workgroup shape")
+      if grouped_lane_add:
+        expected_counts["shl.b"] += 1
+        expected_counts["add.u"] += 1
+      else:
+        expected_counts["nop"] += 1
+        expected_counts["mov.u32"] = 1
   _require(len(opcodes) == sum(expected_counts.values()) and
            all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
            "unsupported A630 scalar instruction inventory")
@@ -1368,11 +1378,31 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
     _require(len(moves) == 2 * (input_count + 1) and all(move.srcs[0].kind == "const" for move in moves),
              "unsupported A630 constant-pointer moves")
   else:
-    _require((not shared_uses and not moves) or
+    _require((grouped_lane_add and not moves) or (not shared_uses and not moves) or
              (len(moves) == 1 and moves[0].srcs[0].kind == "shared"), "unsupported A630 scalar move contract")
   if shared_uses:
     _require(wgid != 0xfc and all(wgid <= register <= wgid + 2 for register in shared_uses),
              "A630 shared operand is outside the workgroup-id vector")
+  if grouped_lane_add:
+    # Pinned nir_lower_system_values.c forms global_id = workgroup_id * workgroup_size + local_id. The observed
+    # local-two compiler image realizes that formula as SHL.B(WGID, 1), then ADD.U with the local-id register.
+    _require(lid != 0xfc and shared_uses == (wgid,), "unsupported A630 grouped-lane system-value use")
+    local_id = A630IR3Operand("gpr", lid)
+    group_shifts = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                         instruction.srcs == (A630IR3Operand("shared", wgid), A630IR3Operand("iim", 1)))
+    _require(len(group_shifts) == 1 and group_shifts[0].dst is not None and group_shifts[0].dst != local_id,
+             "A630 scalar workgroup-id scaling is not the compiler global-id chain")
+    global_adds = tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                        instruction.dst == local_id and instruction.srcs == (local_id, group_shifts[0].dst))
+    _require(len(global_adds) == 1 and group_shifts[0].index < global_adds[0].index,
+             "A630 scalar global-id add is not the compiler global-id chain")
+    sign_extends = tuple(instruction for instruction in active if instruction.opcode == "ashr.b" and
+                         instruction.srcs == (local_id, A630IR3Operand("iim", 31)))
+    byte_shifts = tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                        instruction.srcs == (local_id, A630IR3Operand("iim", 2)))
+    _require(len(sign_extends) == len(byte_shifts) == 1 and
+             global_adds[0].index < min(sign_extends[0].index, byte_shifts[0].index),
+             "A630 scalar global-id add does not dominate its offset consumers")
   full_registers = [] if lid == 0xfc else [lid, lid + 1, lid + 2]
   half_registers:list[int] = []
   for instruction in active:

@@ -3020,6 +3020,86 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT) ==
                       Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [True])
 
+  def test_production_grouped_lane_u32_add_uses_mapped_system_values(self):
+    import struct
+    from tinygrad import Device, Tensor, dtypes
+    from tinygrad.runtime.autogen import mesa
+    from test.mockgpu.qcom.a630 import A630IR3Operand
+
+    left_values = [0, 1, 17, 0x7fffffff, 0x80000000, 99, 700, 0xffffffff, 123456789, 4000000000]
+    right_values = [9, 2, 30, 1, 0x80000000, 4, 70, 1, 987654321, 500000000]
+    left = Tensor(left_values, dtype=dtypes.uint, device=Device.DEFAULT).realize()
+    right = Tensor(right_values, dtype=dtypes.uint, device=Device.DEFAULT).realize()
+    python_reference = cast(list[int], (Tensor(left_values, dtype=dtypes.uint, device="PYTHON") +
+                                        Tensor(right_values, dtype=dtypes.uint, device="PYTHON")).tolist())
+    cpu_reference = cast(list[int], (Tensor(left_values, dtype=dtypes.uint, device="CPU") +
+                                     Tensor(right_values, dtype=dtypes.uint, device="CPU")).tolist())
+    with self._capture_a630_execution() as (submissions,command_images,real_execute):
+      result = (left + right).realize()
+
+    self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
+                     ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
+    self.assertEqual(result.tolist(), python_reference)
+    self.assertEqual(result.tolist(), cpu_reference)
+    self.assertEqual((len(submissions), len(command_images)), (1, 1))
+    submission,dispatch = submissions[0],submissions[0].dispatches[0]
+    self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size),
+                     ((2, 1, 1), (5, 1, 1), (10, 1, 1)))
+    system = dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+    wgid,lid = system & 0xff,system >> 24 & 0xff
+    self.assertEqual((wgid, lid), (0xc0, 0))
+    self.assertEqual(bytes(self._resolve_owned(dispatch.shader_address, dispatch.shader_size)), dispatch.shader_image)
+
+    group_shift = next(instruction for instruction in dispatch.instructions if instruction.opcode == "shl.b" and
+                       instruction.srcs[0].kind == "shared")
+    assert group_shift.dst is not None
+    self.assertEqual(group_shift.srcs, (A630IR3Operand("shared", wgid), A630IR3Operand("iim", 1)))
+    global_adds = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                        instruction.dst == A630IR3Operand("gpr", lid) and
+                        instruction.srcs == (A630IR3Operand("gpr", lid), group_shift.dst))
+    self.assertEqual(len(global_adds), 1)
+    global_add = global_adds[0]
+    self.assertLess(group_shift.index, global_add.index)
+    loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldg.u32")
+    data_adds = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "add.u" and
+                      frozenset(instruction.srcs) == frozenset(load.dst for load in loads))
+    stores = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32")
+    self.assertEqual((len(loads), len(data_adds), len(stores)), (2, 1, 1))
+    self.assertEqual(stores[0].srcs[1], data_adds[0].dst)
+
+    output_base,input0_base,input1_base = struct.unpack_from("<3Q", dispatch.constants_image)
+    output = self._resolve_owned(output_base, 40)
+    inputs = (self._resolve_owned(input0_base, 40), self._resolve_owned(input1_base, 40))
+    output_original = bytes(output)
+    output[:] = bytes([0xa6]) * 40
+    try:
+      journal = real_execute(submission, self._resolve_owned)
+      self.assertEqual(bytes(output), bytes([0xa6]) * 40)
+      self.assertEqual((len(journal), b"".join(write.data for write in sorted(journal, key=lambda write: write.address))),
+                       (10, struct.pack("<10I", *python_reference)))
+    finally: output[:] = output_original
+
+    constants = self._resolve_owned(dispatch.constants_address, dispatch.constants_size)
+    command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
+    def retirement_state():
+      signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+      return (bytes(output), bytes(inputs[0]), bytes(inputs[1]), bytes(constants), bytes(signal), self.device.timeline_value,
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
+              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
+
+    mutations = (
+      (group_shift, group_shift.raw & ~0xffff | wgid + 1, "unsupported A630 grouped-lane system-value use"),
+      (group_shift, group_shift.raw & ~(0xffff << 16) | 0x2002 << 16, "workgroup-id scaling"),
+      (global_add, global_add.raw & ~(0xffff << 16) | lid << 16, "global-id add"),
+    )
+    for case,(instruction,raw,message) in enumerate(mutations):
+      marker = 0x51495400 + case
+      with self._mutate_a630_replay(submission, command_words, ((instruction, raw),), timestamp=marker) as \
+           (mutated_submission,_,request):
+        self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission, request=request,
+                                                   message=message, marker=marker, state=retirement_state)
+    self.assertEqual((bytes(output), bytes(constants)), (output_original, dispatch.constants_image))
+
   def test_production_symbolic_workgroups_execute_mapped_system_values(self):
     import struct
     from dataclasses import replace
