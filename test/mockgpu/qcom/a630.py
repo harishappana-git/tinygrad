@@ -7,7 +7,7 @@ from test.mockgpu.qcom.pm4 import PM4Packet, PM4Type4Packet, PM4Type7Packet
 
 # Payload fields and units follow Mesa 25.2.7 at 461196a1c827769168304ff3f5b36360f16618ca:
 # adreno_pm4.xml, a6xx.xml, a6xx_descriptors.xml, tu_shader.cc, tu_cmd_buffer.cc, ir3_shader.h,
-# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3.c, ir3_a6xx.c, ir3_compiler_nir.c,
+# ir3.xml, ir3-common.xml, ir3-cat[0-7].xml, ir3.h, ir3.c, ir3_a6xx.c, ir3_compiler_nir.c, ir3_legalize.c,
 # ir3_nir_analyze_ubo_ranges.c, ir3_nir_imul.py, ir3_nir_lower_64b.c, ir3_rpt.c, nir_lower_int64.c,
 # nir_lower_system_values.c, nir_opcodes.py, isaspec.h, and isaspec_decode_impl.c.
 
@@ -105,7 +105,9 @@ class A630Submission:
   writes:tuple[A630Write, ...]
 
 Resolver = Callable[[int, int], memoryview]
+ReadObserver = Callable[[int, int, str], None]
 _MAX_INVOCATIONS = 0x10000
+_MAX_SCALAR_REDUCTION_ITEMS = 0x1000
 
 # These labels bind scalar admission, producer provenance, and store validation; arithmetic remains explicit in execute_a630.
 _SIMPLE_CAT2_INTEGER:dict[str, tuple[str, str]] = {
@@ -158,6 +160,17 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
      _int_field_is(fields, "REPEAT", *range(8)) and all(_int_field_is(fields, field, 0) for field in ("EQ", "JP")):
     return "nop", None, ()
   if category == 0 and name == "end" and raw == 6 << 55: return "end", None, ()
+  if category == 0 and name == "br" and raw & ~0xffffffff == 0x0080000000000000 and \
+     all(_int_field_is(fields, field, 0) for field in ("SY", "SS", "EQ", "JP", "INV1", "COMP1")):
+    immediate = _same_int_field(fields, "IMMED")
+    _require(0 <= immediate < 1 << 32, "invalid Cat0 branch immediate")
+    return "br.p0", None, (A630IR3Operand("pred", 0),
+                            A630IR3Operand("iim", immediate - (1 << 32) if immediate & 0x80000000 else immediate))
+  if category == 0 and name == "jump" and raw & ~0xffffffff == 0x0100000000000000 and \
+     all(_int_field_is(fields, field, 0) for field in ("SY", "SS", "JP")):
+    immediate = _same_int_field(fields, "IMMED")
+    _require(0 <= immediate < 1 << 32, "invalid Cat0 jump immediate")
+    return "jump", None, (A630IR3Operand("iim", immediate - (1 << 32) if immediate & 0x80000000 else immediate),)
   # These cat1 leaves have no NAME callback, so fixed leaf bits and typed callback fields identify them without parsing text.
   cat1_schedule = (1 << 44) | (1 << 60)
   mov_gpr_variable = (0xff << 32) | 0xff | cat1_schedule
@@ -211,6 +224,14 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(src is not None and src.kind == "gpr" and src.value + 3 < 0xc0 for src in srcs):
       assert srcs[0] is not None and srcs[1] is not None
       return "add.f.rpt4", dst, (srcs[0], srcs[1])
+  if category == 2 and name == "cmps.s" and _same_int_field(fields, "COND") == 3 and \
+     (_same_int_field(fields, "DST_HALF"), _same_int_field(fields, "DST")) == (0, 0xf8) and _has_no_repeat(fields) and \
+     all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG", "SRC_R", "SY", "SS")) and \
+     (raw >> 52 & 1, raw >> 46 & 1) == (1, 0) and all(value == 0 for value in _field_values(fields, "HALF")):
+    srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), True),
+            _multisrc_operand(_same_int_field(fields, "SRC2"), True))
+    if srcs[0] is not None and srcs[1] is not None:
+      return "cmps.s.ge.p0", A630IR3Operand("pred", 0), (srcs[0], srcs[1])
   cat2_compare = name in {"cmps.u", "cmps.s"}
   if category == 2 and name in {"ashr.b", "shl.b", "shr.b", "add.u", "sub.u", "max.s", "max.u", "xor.b", "and.b", "or.b",
                                 "mull.u", "cmps.u", "cmps.s", "add.f"} and \
@@ -1207,6 +1228,161 @@ def _validate_two_segment_u32_copy(dispatch:A630Dispatch, active:Sequence[A630IR
                                "A630 register footprints do not match decoded two-segment u32 copy operands")
   return (input_loads[0], input_loads[1]), (output_stores[0], output_stores[1])
 
+def _supported_f32_word(value:int) -> bool:
+  exponent = value >> 23 & 0xff
+  return exponent != 0xff and (exponent != 0 or value & 0x7fffff == 0)
+
+def _validate_scalar_reduction_dispatch(dispatch:A630Dispatch, active:Sequence[A630IR3Instruction],
+                                        registers:dict[int, int], wgid:int, lid:int) -> None:
+  # Pinned ir3-cat0.xml defines the 32-bit immediate field; ir3.h types it as int, and ir3_legalize.c emits target-IP minus
+  # current-IP. Restrict this first control-flow slice to those signed current-IP-relative BR/JUMP transfers and the
+  # compiler's one-fiber reduction loop: no branch stack, reconvergence, predicated region,
+  # shared system value, or multi-lane mask semantics are admitted here.
+  _require(dispatch.local_size == dispatch.groups == dispatch.global_size == (1, 1, 1),
+           "A630 scalar reduction requires exactly one invocation")
+  _require((wgid, lid) == (0xfc, 0xfc), "A630 scalar reduction does not use system-value registers")
+  _require(not any(operand.kind == "shared" for instruction in active for operand in instruction.srcs),
+           "A630 scalar reduction uses a shared system value")
+  opcodes = tuple(instruction.opcode for instruction in active)
+  expected_counts = {"mov.u32":4, "nop":4, "cmps.s.ge.p0":2, "br.p0":2, "jump":1, "ashr.b":1, "shl.b":2,
+                     "add.u":4, "shrg":1, "cmps.u.lt":1, "cov.u16s32":1, "ldg.u32":1, "add.f":1,
+                     "stg.u32":1, "end":1}
+  _require(len(opcodes) == sum(expected_counts.values()) and
+           all(opcodes.count(opcode) == count for opcode,count in expected_counts.items()),
+           "unsupported A630 scalar reduction instruction inventory")
+
+  def one(matches:Sequence[A630IR3Instruction], message:str) -> A630IR3Instruction:
+    _require(len(matches) == 1, message)
+    return matches[0]
+
+  compares = tuple(instruction for instruction in active if instruction.opcode == "cmps.s.ge.p0")
+  branches = tuple(instruction for instruction in active if instruction.opcode == "br.p0")
+  jump = one(tuple(instruction for instruction in active if instruction.opcode == "jump"),
+             "A630 scalar reduction lacks one backward jump")
+  load = one(tuple(instruction for instruction in active if instruction.opcode == "ldg.u32"),
+             "A630 scalar reduction lacks one global load")
+  store = one(tuple(instruction for instruction in active if instruction.opcode == "stg.u32"),
+              "A630 scalar reduction lacks one global store")
+  accumulator_add = one(tuple(instruction for instruction in active if instruction.opcode == "add.f"),
+                        "A630 scalar reduction lacks one f32 accumulator recurrence")
+  _require(all(instruction.dst == A630IR3Operand("pred", 0) and
+               tuple(operand.kind for operand in instruction.srcs) == ("gpr", "const") for instruction in compares),
+           "A630 scalar reduction comparison is not signed GE into p0.x")
+  induction,bound = compares[0].srcs
+  _require(compares[1].srcs == (induction, bound) and bound == A630IR3Operand("const", 4),
+           "A630 scalar reduction comparisons do not share the mapped induction bound")
+  _require(all(instruction.dst is None and instruction.srcs[0] == A630IR3Operand("pred", 0) and
+               instruction.srcs[1].kind == "iim" for instruction in branches) and
+           jump.dst is None and len(jump.srcs) == 1 and jump.srcs[0].kind == "iim",
+           "A630 scalar reduction has an unsupported branch operand")
+  branch_targets = tuple(instruction.index + instruction.srcs[1].value for instruction in branches)
+  jump_target = jump.index + jump.srcs[0].value
+  _require(branch_targets[0] == branch_targets[1] and 0 <= branch_targets[0] < len(active) and
+           0 <= jump_target < len(active), "A630 scalar reduction has an out-of-range control-flow target")
+  exit_target = branch_targets[0]
+  _require(active[exit_target].opcode == active[jump_target].opcode == "nop" and
+           tuple(instruction.opcode for instruction in active[exit_target:]) == ("nop", "stg.u32", "end"),
+           "A630 scalar reduction control flow does not converge on its final store")
+  _require(jump_target < compares[0].index < branches[0].index < compares[1].index < load.index <
+           accumulator_add.index < branches[1].index < jump.index < exit_target < store.index,
+           "A630 scalar reduction control-flow roles are not ordered")
+
+  _require(load.dst is not None and load.dst.kind == "gpr" and load.srcs[0].kind == "gpr" and
+           tuple(operand.kind for operand in store.srcs) == ("gpr", "gpr") and accumulator_add.dst is not None and
+           accumulator_add.dst.kind == "gpr" and accumulator_add.dst == store.srcs[1] and
+           accumulator_add.dst in accumulator_add.srcs and load.dst in accumulator_add.srcs and
+           len(set(accumulator_add.srcs)) == 2,
+           "A630 scalar reduction store does not consume the mapped f32 accumulator recurrence")
+  accumulator = accumulator_add.dst
+  assert accumulator is not None
+
+  moves = tuple(instruction for instruction in active if instruction.opcode == "mov.u32")
+  constant_moves = tuple(instruction for instruction in moves if instruction.srcs[0].kind == "const")
+  immediate_moves = tuple(instruction for instruction in moves if instruction.srcs[0].kind == "uim")
+  output_address = store.srcs[0]
+  _require(len(constant_moves) == len(immediate_moves) == 2 and
+           {(instruction.dst, instruction.srcs[0]) for instruction in constant_moves} ==
+           {(output_address, A630IR3Operand("const", 0)),
+            (A630IR3Operand("gpr", output_address.value + 1), A630IR3Operand("const", 1))},
+           "A630 scalar reduction output pointer does not use the constant ABI")
+  induction_init = one(tuple(instruction for instruction in immediate_moves if instruction.dst == induction),
+                       "A630 scalar reduction induction variable lacks an initialization")
+  accumulator_init = one(tuple(instruction for instruction in immediate_moves if instruction.dst == accumulator),
+                         "A630 scalar reduction accumulator lacks an initialization")
+  _require(induction_init.srcs == (A630IR3Operand("uim", 0),) and
+           _supported_f32_word(accumulator_init.srcs[0].value),
+           "A630 scalar reduction has an unsupported induction or accumulator seed")
+  _require(max(instruction.index for instruction in moves) < jump_target,
+           "A630 scalar reduction initialization does not dominate the loop")
+
+  updates = tuple(instruction for instruction in active if instruction.opcode == "add.u" and instruction.dst == induction and
+                  instruction.srcs == (induction, A630IR3Operand("iim", 1)))
+  update = one(updates, "A630 scalar reduction lacks one unit induction step")
+  _require(branches[0].index < update.index < compares[1].index,
+           "A630 scalar reduction induction update is outside the loop body")
+
+  sign = one(tuple(instruction for instruction in active if instruction.opcode == "ashr.b" and
+                   instruction.srcs == (induction, A630IR3Operand("iim", 31))),
+             "A630 scalar reduction lacks the signed high offset")
+  byte_offset = one(tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                          instruction.srcs == (induction, A630IR3Operand("iim", 2))),
+                    "A630 scalar reduction lacks the low byte offset")
+  _require(sign.dst is not None and byte_offset.dst is not None, "A630 scalar reduction offset lacks a destination")
+  sign_bytes = one(tuple(instruction for instruction in active if instruction.opcode == "shl.b" and
+                         instruction.dst == sign.dst and
+                         instruction.srcs == (sign.dst, A630IR3Operand("iim", 2))),
+                   "A630 scalar reduction lacks the high byte offset")
+  low_address = load.srcs[0]
+  low_add = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                      instruction.dst == low_address and
+                      frozenset(instruction.srcs) == frozenset((A630IR3Operand("const", 2), byte_offset.dst))),
+                "A630 scalar reduction low address is not the compiler pointer chain")
+  high_offset = one(tuple(instruction for instruction in active if instruction.opcode == "shrg" and
+                          instruction.dst == sign.dst and
+                          instruction.srcs == (A630IR3Operand("iim", 30), induction, sign_bytes.dst)),
+                    "A630 scalar reduction high offset is not the compiler pointer chain")
+  carry = one(tuple(instruction for instruction in active if instruction.opcode == "cmps.u.lt" and
+                    instruction.srcs == (low_address, A630IR3Operand("const", 2))),
+              "A630 scalar reduction pointer carry is not the compiler pointer chain")
+  _require(carry.dst is not None and carry.dst.kind == "half", "A630 scalar reduction pointer carry lacks a half destination")
+  high_add = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                       instruction.dst == sign.dst and
+                       frozenset(instruction.srcs) == frozenset((A630IR3Operand("const", 3), high_offset.dst))),
+                 "A630 scalar reduction high address is not the compiler pointer chain")
+  carry_conversion = one(tuple(instruction for instruction in active if instruction.opcode == "cov.u16s32" and
+                                instruction.srcs == (carry.dst,)),
+                          "A630 scalar reduction pointer carry lacks a conversion")
+  _require(carry_conversion.dst is not None and carry_conversion.dst.kind == "gpr",
+           "A630 scalar reduction pointer carry conversion lacks a full destination")
+  final_high = one(tuple(instruction for instruction in active if instruction.opcode == "add.u" and
+                         instruction.dst == A630IR3Operand("gpr", low_address.value + 1) and
+                         frozenset(instruction.srcs) == frozenset((carry_conversion.dst, high_add.dst))),
+                   "A630 scalar reduction final high address is not the compiler pointer chain")
+  assert sign.dst is not None and byte_offset.dst is not None and carry_conversion.dst is not None and load.dst is not None
+  role_adds = {low_add.index, update.index, high_add.index, final_high.index}
+  full_roles = (output_address.value, output_address.value + 1, induction.value, accumulator.value, sign.dst.value,
+                byte_offset.dst.value, low_address.value, low_address.value + 1, carry_conversion.dst.value, load.dst.value)
+  _require(len(set(full_roles)) == len(full_roles), "A630 scalar reduction semantic register roles overlap")
+  _require(len(role_adds) == 4 and branches[0].index < min(sign.index, byte_offset.index) and
+           sign.index < sign_bytes.index < high_offset.index < update.index and
+           byte_offset.index < low_add.index < carry.index < update.index < min(high_add.index, carry_conversion.index, compares[1].index) and
+           max(high_add.index, carry_conversion.index, compares[1].index) < final_high.index < load.index,
+           "A630 scalar reduction pointer producers do not dominate the load")
+
+  constant_uses = sorted(operand.value for instruction in active for operand in instruction.srcs if operand.kind == "const")
+  _require(constant_uses == [0, 1, 2, 2, 3, 4, 4],
+           "A630 scalar reduction constants do not match the mapped buffer and bound ABI")
+  full_registers:list[int] = []
+  half_registers:list[int] = []
+  for instruction in active:
+    operands = ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs
+    for operand in operands:
+      if operand.kind == "gpr": full_registers.append(operand.value)
+      elif operand.kind == "half": half_registers.append(operand.value)
+    if instruction.opcode in {"ldg.u32", "stg.u32"}: full_registers.append(instruction.srcs[0].value + 1)
+  _validate_register_footprint(registers, full_registers, half_registers,
+                               "A630 scalar reduction register footprint does not match decoded operands")
+
 def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _require(len(submission.dispatches) == 1, "A630 execution requires exactly one dispatch")
   dispatch = submission.dispatches[0]
@@ -1224,6 +1400,9 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   unsupported = next((instruction for instruction in active if instruction.opcode is None), None)
   _require(unsupported is None, f"unsupported A630 semantic at instruction {unsupported.index if unsupported else -1}")
   opcodes = tuple(instruction.opcode for instruction in active)
+  if any(opcode in {"cmps.s.ge.p0", "br.p0", "jump"} for opcode in opcodes):
+    _validate_scalar_reduction_dispatch(dispatch, active, registers, wgid, lid)
+    return dispatch
   if any(opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for opcode in opcodes):
     _validate_vector_u32_dispatch(dispatch, active, registers, wgid, lid)
     return dispatch
@@ -1416,8 +1595,99 @@ def _execution_dispatch(submission:A630Submission) -> A630Dispatch:
   _validate_register_footprint(registers, full_registers, half_registers, "A630 register footprints do not match decoded operands")
   return dispatch
 
-def _execute_vector_u32(dispatch:A630Dispatch, resolver:Resolver,
-                        active:Sequence[A630IR3Instruction]) -> tuple[A630ExecutionWrite, ...]:
+def _execute_scalar_reduction(dispatch:A630Dispatch, resolver:Resolver, active:Sequence[A630IR3Instruction],
+                              read_observer:ReadObserver|None) -> tuple[A630ExecutionWrite, ...]:
+  constants = struct.unpack("<1024I", dispatch.constants_image)
+  output_base = constants[0] | constants[1] << 32
+  input_base = constants[2] | constants[3] << 32
+  # _execution_dispatch validated the scalar reduction's bound operand as constant-file word c4.
+  bound = constants[4]
+  _require(1 <= bound <= _MAX_SCALAR_REDUCTION_ITEMS,
+           f"A630 scalar reduction bound {bound} is outside 1..{_MAX_SCALAR_REDUCTION_ITEMS}")
+  _require(output_base != 0 and output_base % 4 == 0 and output_base + 4 <= 1 << 64 and
+           input_base != 0 and input_base % 4 == 0 and input_base + bound * 4 <= 1 << 64,
+           "invalid A630 scalar reduction argument range")
+
+  full:dict[int, int] = {}
+  half:dict[int, int] = {}
+  predicates:dict[int, bool] = {}
+  writes:list[A630ExecutionWrite] = []
+  pc,steps = 0,0
+  max_steps = (len(active) + 1) * (bound + 2)
+  while True:
+    _require(0 <= pc < len(active), f"A630 scalar reduction program counter {pc} is out of range")
+    steps += 1
+    _require(steps <= max_steps, "A630 scalar reduction exceeded its deterministic instruction limit")
+    instruction = active[pc]
+    opcode = instruction.opcode
+    try:
+      if opcode == "end": break
+      if opcode == "nop":
+        pc += 1
+        continue
+      if opcode == "br.p0":
+        predicate = instruction.srcs[0]
+        _require(predicate.kind == "pred" and predicate.value in predicates,
+                 "A630 scalar reduction reads an uninitialized predicate")
+        pc = instruction.index + instruction.srcs[1].value if predicates[predicate.value] else pc + 1
+        continue
+      if opcode == "jump":
+        pc = instruction.index + instruction.srcs[0].value
+        continue
+      if opcode == "cmps.s.ge.p0":
+        left,right = (_read_ir3_operand(operand, full, half, {}, constants) for operand in instruction.srcs)
+        left = left - (1 << 32) if left & 0x80000000 else left
+        right = right - (1 << 32) if right & 0x80000000 else right
+        assert instruction.dst is not None
+        predicates[instruction.dst.value] = left >= right
+        pc += 1
+        continue
+      if opcode == "ldg.u32":
+        assert instruction.dst is not None
+        address = _gpr_address(full, instruction.srcs[0])
+        _require(address % 4 == 0 and address + 4 <= 1 << 64, "invalid A630 scalar reduction global-load address")
+        view = resolver(address, 4)
+        _require(len(view) == 4, "short A630 scalar reduction global-load range")
+        image = bytes(view)
+        if read_observer is not None: read_observer(address, 4, "A630 global input 0")
+        _write_ir3_operand(instruction.dst, struct.unpack("<I", image)[0], full, half)
+        pc += 1
+        continue
+      if opcode == "stg.u32":
+        address = _gpr_address(full, instruction.srcs[0])
+        _require(address == output_base and address % 4 == 0 and address + 4 <= 1 << 64,
+                 "A630 scalar reduction store does not address its scalar output")
+        view = resolver(address, 4)
+        _require(len(view) == 4, "short A630 scalar reduction global-store range")
+        data = _read_ir3_operand(instruction.srcs[1], full, half, {}, constants)
+        writes.append(A630ExecutionWrite(address, struct.pack("<I", data)))
+        pc += 1
+        continue
+
+      src = tuple(_read_ir3_operand(operand, full, half, {}, constants) for operand in instruction.srcs)
+      _require(instruction.dst is not None, f"unsupported A630 scalar reduction semantic {opcode}")
+      assert instruction.dst is not None
+      if opcode == "mov.u32": value = src[0]
+      elif opcode == "add.u": value = src[0] + src[1]
+      elif opcode == "shl.b": value = src[0] << (src[1] & 31)
+      elif opcode == "ashr.b":
+        signed = src[0] - (1 << 32) if src[0] & 0x80000000 else src[0]
+        value = signed >> (src[1] & 31)
+      elif opcode == "shrg": value = (src[1] >> (src[0] & 31)) | src[2]
+      elif opcode == "cmps.u.lt": value = int(src[0] < src[1])
+      elif opcode == "cov.u16s32": value = src[0] & 0xffff
+      elif opcode == "add.f": value = _f32_add_bits(src[0], src[1])
+      else: raise ValueError(f"unsupported A630 scalar reduction opcode {opcode}")
+      _write_ir3_operand(instruction.dst, value, full, half)
+      pc += 1
+    except (KeyError, ValueError, RuntimeError) as error:
+      raise ValueError(f"A630 scalar reduction instruction {instruction.index}: {error}") from error
+  _require(len(writes) == 1 and writes[0].address == output_base,
+           "A630 scalar reduction did not produce exactly one output journal entry")
+  return tuple(writes)
+
+def _execute_vector_u32(dispatch:A630Dispatch, resolver:Resolver, active:Sequence[A630IR3Instruction],
+                        read_observer:ReadObserver|None) -> tuple[A630ExecutionWrite, ...]:
   constants = struct.unpack("<1024I", dispatch.constants_image)
   lane_count = dispatch.local_size[0]
   invocation_count = dispatch.global_size[0]
@@ -1456,7 +1726,9 @@ def _execute_vector_u32(dispatch:A630Dispatch, resolver:Resolver,
             _require(address % 4 == 0 and address + 16 <= 1 << 64, "invalid A630 four-component global-load address")
             view = resolver(address, 16)
             _require(len(view) == 16, "short A630 four-component global-load range")
-            for component,value in enumerate(struct.unpack("<4I", bytes(view))):
+            image = bytes(view)
+            if read_observer is not None: read_observer(address, 16, f"A630 global input {ordinal}")
+            for component,value in enumerate(struct.unpack("<4I", image)):
               full[lane][instruction.dst.value + component] = value
               origins[lane][instruction.dst.value + component] = ("load", ordinal * 4 + component)
             continue
@@ -1511,12 +1783,15 @@ def _execute_vector_u32(dispatch:A630Dispatch, resolver:Resolver,
 
   return _finish_writes(writes)
 
-def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630ExecutionWrite, ...]:
+def execute_a630(submission:A630Submission, resolver:Resolver, *,
+                 read_observer:ReadObserver|None=None) -> tuple[A630ExecutionWrite, ...]:
   """Execute supported A630 images into an immutable write journal; this does not retire the KGSL submission."""
   dispatch = _execution_dispatch(submission)
   active = dispatch.instructions[:next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end") + 1]
+  if any(instruction.opcode in {"cmps.s.ge.p0", "br.p0", "jump"} for instruction in active):
+    return _execute_scalar_reduction(dispatch, resolver, active, read_observer)
   if any(instruction.opcode in {"ldg.u32x4", "stg.u32x4", "add.f.rpt4"} for instruction in active):
-    return _execute_vector_u32(dispatch, resolver, active)
+    return _execute_vector_u32(dispatch, resolver, active, read_observer)
   constants = struct.unpack("<1024I", dispatch.constants_image)
   lane_count = dispatch.local_size[0]
   invocation_count = dispatch.global_size[0]
@@ -1655,7 +1930,9 @@ def execute_a630(submission:A630Submission, resolver:Resolver) -> tuple[A630Exec
             _require(address % 4 == 0 and address + 4 <= 1 << 64, "invalid A630 global-load address")
             view = resolver(address, 4)
             _require(len(view) == 4, "short A630 global-load range")
-            value = struct.unpack("<I", bytes(view))[0]
+            image = bytes(view)
+            if read_observer is not None: read_observer(address, 4, f"A630 global input {ordinal}")
+            value = struct.unpack("<I", image)[0]
             origin = ("load", ordinal)
           elif opcode == "stg.u32":
             address = _gpr_address(full[lane], instruction.srcs[0])

@@ -290,12 +290,15 @@ class QCOMDriver(VirtDriver):
                     f"unsatisfied memory wait at {wait.address:#x}: {current & wait.mask:#x} < {wait.reference & wait.mask:#x}")
 
     journal:list[KGSLJournalWrite] = []
+    execution_reads:list[tuple[int, int, str]] = []
     planned_counter = self.always_on_counter
     ordered_effects = [(write.word_offset, False, index) for index,write in enumerate(submission.writes)]
     if submission.dispatches: ordered_effects.append((submission.dispatches[0].word_offset, True, 0))
     for word_offset,is_dispatch,index in sorted(ordered_effects):
       if is_dispatch:
-        for ordinal,execution_write in enumerate(execute_a630(submission, lambda address,size: self.resolve_owned(fd, address, size))):
+        for ordinal,execution_write in enumerate(execute_a630(
+            submission, lambda address,size: self.resolve_owned(fd, address, size),
+            read_observer=lambda address,size,purpose: execution_reads.append((address, size, purpose)))):
           journal.append(KGSLJournalWrite(word_offset, ordinal, execution_write.address,
                                           execution_write.data, "A630 global store", True))
         continue
@@ -320,18 +323,17 @@ class QCOMDriver(VirtDriver):
         self._require(repeated_pm4_target, f"overlapping {left.purpose} and {right.purpose}")
 
     if submission.dispatches:
-      dispatch = submission.dispatches[0]
       immutable_reads = [(memory_range.address, memory_range.size, memory_range.purpose)
                          for memory_range in submission.memory_ranges if memory_range.read and memory_range.purpose != "wait value"]
-      # Each supported load has one ordered buffer-pointer constant; preserve its complete scalar or four-component range until commit.
-      scalar_inputs = sum(instruction.opcode == "ldg.u32" for instruction in dispatch.instructions)
-      vector_inputs = sum(instruction.opcode == "ldg.u32x4" for instruction in dispatch.instructions)
-      self._require(not (scalar_inputs and vector_inputs), "mixed A630 scalar and four-component global loads")
-      input_count = scalar_inputs + vector_inputs
-      self._require(input_count in (0, 1, 2), f"unsupported A630 global input count {input_count}")
-      input_stride = 16 if vector_inputs else 4
-      immutable_reads.extend((struct.unpack_from("<Q", dispatch.constants_image, 8 * (index + 1))[0], dispatch.global_size[0] * input_stride,
-                              f"A630 global input {index}") for index in range(input_count))
+      # Actual machine execution is the source of truth for dynamic loads. Coalesce the exact observed union by purpose so
+      # maximum-sized vector dispatches do not turn the subsequent journal/read overlap audit into a quadratic operation.
+      coalesced_reads:list[tuple[int, int, str]] = []
+      for address,size,purpose in sorted(execution_reads, key=lambda read: (read[2], read[0], read[1])):
+        if coalesced_reads and coalesced_reads[-1][2] == purpose and address <= coalesced_reads[-1][0] + coalesced_reads[-1][1]:
+          previous_address,previous_size,_ = coalesced_reads[-1]
+          coalesced_reads[-1] = (previous_address, max(previous_address + previous_size, address + size) - previous_address, purpose)
+        else: coalesced_reads.append((address, size, purpose))
+      immutable_reads.extend(coalesced_reads)
       for journal_write in journal:
         for address,size,purpose in immutable_reads:
           self._require(not self._overlaps(journal_write.address, len(journal_write.data), address, size),
