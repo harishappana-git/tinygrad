@@ -64,6 +64,11 @@ class A630ExecutionWrite:
   data:bytes
 
 @dataclass
+class A630ExecutionBudget:
+  lane_instruction_steps:int = 0
+  memory_events:int = 0
+
+@dataclass
 class _A630LaneState:
   full:dict[int, int]
   half:dict[int, int]
@@ -127,13 +132,14 @@ _OPERAND_CONTRACTS:dict[str, tuple[str|None, tuple[tuple[str, ...], ...]]] = {
   "sub.u":("gpr", (("gpr", "gpr"),)), "shr.b":("gpr", (("gpr", "gpr"),)),
   "max.s":("gpr", (("gpr", "gpr"),)), "max.u":("gpr", (("gpr", "gpr"),)),
   "xor.b":("gpr", (("gpr", "gpr"),)), "and.b":("gpr", (("gpr", "gpr"),)),
-  "or.b":("gpr", (("gpr", "gpr"),)), "mull.u":("gpr", (("gpr", "gpr"),)),
-  "madsh.m16":("gpr", (("gpr", "gpr", "gpr"),)),
+  "or.b":("gpr", (("gpr", "gpr"),)),
+  "mull.u":("gpr", (("gpr", "gpr"), ("shared", "iim"), ("gpr", "iim"))),
+  "madsh.m16":("gpr", (("gpr", "gpr", "gpr"), ("const", "gpr", "gpr"))),
   "cmps.s.lt":("half", (("gpr", "gpr"),)), "cmps.s.eq":("half", (("gpr", "gpr"),)),
   "cmps.u.lt":("half", (("gpr", "gpr"), ("gpr", "const"))),
   "cov.u16s32":("gpr", (("half",),)),
   "add.f":("gpr", (("gpr", "gpr"), ("gpr", "flut"), ("flut", "gpr"))),
-  "add.f.rpt4":("gpr", (("gpr", "gpr"),)),
+  "add.f.rpt4":("gpr", (("gpr", "gpr"),)), "add.u.rpt2":("gpr", (("const", "gpr"),)),
   "cmps.s.ge.p0":("pred", (("gpr", "const"),)), "cmps.s.eq.p0":("pred", (("gpr", "iim"),)),
   "ldg.u32":("gpr", (("gpr",),)), "ldg.u32x4":("gpr", (("gpr",),)),
   "stg.u32":(None, (("gpr", "gpr"),)), "stg.u32x4":(None, (("gpr", "gpr"),)),
@@ -242,6 +248,20 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
        all(src is not None and src.kind == "gpr" and src.value + 3 < 0xc0 for src in srcs):
       assert srcs[0] is not None and srcs[1] is not None
       return "add.f.rpt4", dst, (srcs[0], srcs[1])
+  # ir3_rpt.c advances a consecutive destination and only sources carrying IR3_REG_R. This exact two-component
+  # addressing form therefore keeps the constant fixed while advancing the GPR source and destination once.
+  if category == 2 and name == "add.u" and _field_values(fields, "REPEAT") == (1,) and \
+     _same_int_field(fields, "DST_HALF") == 0 and \
+     tuple(_field_values(fields, "SRC_R")) == (0, 1) and \
+     all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG")) and \
+     (raw >> 52 & 1, raw >> 46 & 1) == (1, 0):
+    dst = _register_operand(_same_int_field(fields, "DST"), True)
+    srcs = (_multisrc_operand(_same_int_field(fields, "SRC1"), True),
+            _multisrc_operand(_same_int_field(fields, "SRC2"), True))
+    if dst is not None and dst.kind == "gpr" and dst.value + 1 < 0xc0 and \
+       srcs[0] is not None and srcs[0].kind == "const" and \
+       srcs[1] is not None and srcs[1].kind == "gpr" and srcs[1].value + 1 < 0xc0:
+      return "add.u.rpt2", dst, (srcs[0], srcs[1])
   if category == 2 and name == "cmps.s" and _same_int_field(fields, "COND") in (3, 4) and \
      (_same_int_field(fields, "DST_HALF"), _same_int_field(fields, "DST")) == (0, 0xf8) and _has_no_repeat(fields) and \
      all(_int_field_is(fields, field, 0) for field in ("JP", "SAT", "UL", "EI", "LAST", "ABSNEG", "SRC_R", "SY", "SS")) and \
@@ -280,10 +300,11 @@ def _normalize_ir3(raw:int, category:int, name:str|None,
      _same_int_field(fields, "DST_HALF") == 0 and all(value == 0 for value in _field_values(fields, "HALF")):
     dst = _register_operand(_same_int_field(fields, "DST"), True)
     src1,src2,src3 = (_same_int_field(fields, field) for field in ("SRC1", "SRC2", "SRC3"))
-    src1_op = _register_operand(src1, True) if src1 == src1 & 0xff else None
+    src1_op = _multisrc_operand(src1, True)
     src2_op = _register_operand(src2, True) if src2 == src2 & 0xff else None
-    src3_op = _register_operand(src3, True) if src3 == src3 & 0xff else None
-    if dst is not None and dst.kind == "gpr" and all(src is not None and src.kind == "gpr" for src in (src1_op, src2_op, src3_op)):
+    src3_op = _multisrc_operand(src3, True)
+    if dst is not None and dst.kind == "gpr" and src1_op is not None and src1_op.kind in {"gpr", "const"} and \
+       src2_op is not None and src2_op.kind == "gpr" and src3_op is not None and src3_op.kind == "gpr":
       assert src1_op is not None and src2_op is not None and src3_op is not None
       return "madsh.m16", dst, (src1_op, src2_op, src3_op)
   if category == 3 and name == "shrg" and _has_no_repeat(fields) and \
@@ -742,6 +763,9 @@ def _full_gpr_accesses(instruction:A630IR3Instruction) -> set[int]:
   if instruction.opcode == "add.f.rpt4":
     add(instruction.dst, 4)
     for operand in instruction.srcs: add(operand, 4)
+  if instruction.opcode == "add.u.rpt2":
+    add(instruction.dst, 2)
+    add(instruction.srcs[1], 2)
   return accesses
 
 def _validate_local_memory_schedule(active:Sequence[A630IR3Instruction]) -> None:
@@ -837,6 +861,10 @@ def _validate_register_footprint(dispatch:A630Dispatch, active:Sequence[A630IR3I
       assert instruction.dst is not None
       add_full(instruction.dst.value, 4)
       for operand in instruction.srcs: add_full(operand.value, 4)
+    if instruction.opcode == "add.u.rpt2":
+      assert instruction.dst is not None
+      add_full(instruction.dst.value, 2)
+      add_full(instruction.srcs[1].value, 2)
 
   control = registers[mesa.REG_A6XX_SP_CS_CNTL_0]
   half_footprint = (control & mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__SHIFT
@@ -917,7 +945,7 @@ def _execute_alu(opcode:str|None, src:tuple[int, ...]) -> int:
   raise ValueError(f"unsupported A630 opcode {opcode}")
 
 def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequence[A630IR3Instruction], *,
-                           read_observer:ReadObserver|None) -> tuple[A630ExecutionWrite, ...]:
+                           read_observer:ReadObserver|None, budget:A630ExecutionBudget) -> tuple[A630ExecutionWrite, ...]:
   constants = struct.unpack("<1024I", dispatch.constants_image)
   registers = dict(dispatch.registers)
   wgid,lid = _system_registers(dispatch)
@@ -925,18 +953,13 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
   max_steps = (len(active) + 1) * _MAX_CONTROL_FLOW_ITERATIONS if has_control else len(active) + 1
   writes:list[A630ExecutionWrite] = []
   reads:list[tuple[int, int, str]] = []
-  memory_events = 0
-  lane_instruction_steps = 0
-
   def record_memory_event() -> None:
-    nonlocal memory_events
-    memory_events += 1
-    _require(memory_events <= _MAX_MEMORY_EVENTS, "A630 execution exceeded its bounded memory-event limit")
+    budget.memory_events += 1
+    _require(budget.memory_events <= _MAX_MEMORY_EVENTS, "A630 execution exceeded its bounded memory-event limit")
 
   def record_instruction_steps(count:int) -> None:
-    nonlocal lane_instruction_steps
-    lane_instruction_steps += count
-    _require(lane_instruction_steps <= _MAX_LANE_INSTRUCTION_STEPS,
+    budget.lane_instruction_steps += count
+    _require(budget.lane_instruction_steps <= _MAX_LANE_INSTRUCTION_STEPS,
              "A630 execution exceeded its bounded lane-instruction limit")
 
   for group in range(dispatch.groups[0]):
@@ -1060,6 +1083,14 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
                 right = lane.full[instruction.srcs[1].value + component]
                 lane.full[instruction.dst.value + component] = _f32_add_bits(left, right)
               continue
+            if opcode == "add.u.rpt2":
+              assert instruction.dst is not None
+              left = _read_ir3_operand(instruction.srcs[0], lane.full, lane.half, state.shared, constants)
+              # Only SRC2 carries (r), so the constant remains fixed while the GPR source advances.
+              for component in range(2):
+                right = lane.full[instruction.srcs[1].value + component]
+                lane.full[instruction.dst.value + component] = (left + right) & 0xffffffff
+              continue
 
             src = tuple(_read_ir3_operand(operand, lane.full, lane.half, state.shared, constants)
                         for operand in instruction.srcs)
@@ -1076,12 +1107,13 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
   return _finish_writes(writes, reads)
 
 
-def execute_a630(submission:A630Submission, resolver:Resolver, *,
-                 read_observer:ReadObserver|None=None) -> tuple[A630ExecutionWrite, ...]:
+def execute_a630(submission:A630Submission, resolver:Resolver, *, read_observer:ReadObserver|None=None,
+                 budget:A630ExecutionBudget|None=None) -> tuple[A630ExecutionWrite, ...]:
   """Execute admitted A630 images into an immutable write journal; this does not retire the KGSL submission."""
   dispatch = _execution_dispatch(submission)
   end = next(instruction.index for instruction in dispatch.instructions if instruction.opcode == "end")
-  writes = _execute_a630_dispatch(dispatch, resolver, dispatch.instructions[:end+1], read_observer=read_observer)
+  writes = _execute_a630_dispatch(dispatch, resolver, dispatch.instructions[:end+1], read_observer=read_observer,
+                                  budget=budget if budget is not None else A630ExecutionBudget())
   immutable_reads = tuple((memory_range.address, memory_range.size, memory_range.purpose)
                           for memory_range in submission.memory_ranges
                           if memory_range.read and memory_range.purpose != "wait value")

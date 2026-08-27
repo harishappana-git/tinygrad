@@ -1,16 +1,19 @@
 from __future__ import annotations
 import ctypes, functools, mmap, os, struct, time
-from dataclasses import dataclass
+from bisect import bisect_right
+from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterator, cast
 from tinygrad.runtime.autogen import kgsl, libc
 from tinygrad.helpers import DEV, Target, to_mv
 from test.mockgpu.driver import VirtDriver, VirtFile, VirtFileDesc
-from test.mockgpu.qcom.a630 import A630Submission, execute_a630, stage_a630
+from test.mockgpu.qcom.a630 import A630ExecutionBudget, A630Submission, execute_a630, stage_a630
 from test.mockgpu.qcom.pm4 import parse_pm4
 
 PAGE_SIZE = 0x1000
 A630_CHIP_ID = 0x060300FF
 MAP_FAILED = ctypes.c_void_p(-1).value
+# Emulator policy bound for rebuilding prior-effect interval indexes across all dispatches in one command.
+_MAX_A630_OVERLAY_INTERVAL_WORK = 1 << 20
 
 def ioctl_code(ioctl:functools.partial) -> int:
   direction, base, nr, struct_type = ioctl.args[:4]
@@ -279,7 +282,6 @@ class QCOMDriver(VirtDriver):
 
   def _plan_a630_retirement(self, fd:int, submission:A630Submission, command_address:int, command_size:int) \
       -> tuple[tuple[KGSLJournalWrite, ...], int]:
-    self._require(len(submission.dispatches) <= 1, "A630 retirement supports at most one dispatch")
     effects = [write.word_offset for write in submission.writes] + [dispatch.word_offset for dispatch in submission.dispatches]
     self._require(all(not effects or wait.word_offset < min(effects) for wait in submission.waits),
                   "memory wait after a submission effect")
@@ -290,15 +292,58 @@ class QCOMDriver(VirtDriver):
                     f"unsatisfied memory wait at {wait.address:#x}: {current & wait.mask:#x} < {wait.reference & wait.mask:#x}")
 
     journal:list[KGSLJournalWrite] = []
-    execution_reads:list[tuple[int, int, str]] = []
     planned_counter = self.always_on_counter
+    overlay_interval_work = 0
     ordered_effects = [(write.word_offset, False, index) for index,write in enumerate(submission.writes)]
-    if submission.dispatches: ordered_effects.append((submission.dispatches[0].word_offset, True, 0))
+    ordered_effects.extend((dispatch.word_offset, True, index) for index,dispatch in enumerate(submission.dispatches))
+    execution_budget = A630ExecutionBudget()
     for word_offset,is_dispatch,index in sorted(ordered_effects):
       if is_dispatch:
-        for ordinal,execution_write in enumerate(execute_a630(
-            submission, lambda address,size: self.resolve_owned(fd, address, size),
-            read_observer=lambda address,size,purpose: execution_reads.append((address, size, purpose)))):
+        overlay_interval_work += len(journal)
+        self._require(overlay_interval_work <= _MAX_A630_OVERLAY_INTERVAL_WORK,
+                      "A630 submission exceeded its bounded prior-effect overlay limit")
+        visible_overlay:list[KGSLJournalWrite] = []
+        for prior in sorted(journal, key=lambda write: (write.address, len(write.data), write.word_offset, write.ordinal)):
+          if visible_overlay and self._overlaps(visible_overlay[-1].address, len(visible_overlay[-1].data),
+                                                prior.address, len(prior.data)):
+            previous = visible_overlay[-1]
+            repeated_pm4_target = not previous.from_dispatch and not prior.from_dispatch and \
+              (previous.address, len(previous.data)) == (prior.address, len(prior.data))
+            self._require(repeated_pm4_target, f"overlapping {previous.purpose} and {prior.purpose}")
+            visible_overlay[-1] = prior
+          else: visible_overlay.append(prior)
+        overlay_starts = [prior.address for prior in visible_overlay]
+
+        def resolve_after_prior_effects(address:int, size:int) -> memoryview:
+          image = bytearray(self.resolve_owned(fd, address, size))
+          prior_index = max(0, bisect_right(overlay_starts, address) - 1)
+          while prior_index < len(visible_overlay):
+            prior = visible_overlay[prior_index]
+            if prior.address >= address + size: break
+            overlap_start,overlap_end = max(address, prior.address), min(address + size, prior.address + len(prior.data))
+            if overlap_start < overlap_end:
+              image[overlap_start-address:overlap_end-address] = \
+                prior.data[overlap_start-prior.address:overlap_end-prior.address]
+            prior_index += 1
+          return memoryview(image)
+
+        dispatch_reads:list[tuple[int, int, str]] = []
+        single_dispatch = replace(submission, dispatches=(submission.dispatches[index],))
+        dispatch_writes = execute_a630(single_dispatch, resolve_after_prior_effects,
+          read_observer=lambda address,size,purpose: dispatch_reads.append((address, size, purpose)), budget=execution_budget)
+        # execute_a630 enforces this for the real interpreter. Keep the retirement-side sweep as a defense for
+        # alternate executors and tests, but scope it to one dispatch so a later dispatch can consume prior output.
+        address_writes = sorted(dispatch_writes, key=lambda write: (write.address, len(write.data)))
+        address_reads = sorted(dispatch_reads, key=lambda read: (read[0], read[1], read[2]))
+        write_index = read_index = 0
+        while write_index < len(address_writes) and read_index < len(address_reads):
+          execution_write = address_writes[write_index]
+          address,size,purpose = address_reads[read_index]
+          if self._overlaps(execution_write.address, len(execution_write.data), address, size):
+            self._require(False, f"A630 global store aliases snapshotted {purpose}")
+          if execution_write.address + len(execution_write.data) <= address: write_index += 1
+          else: read_index += 1
+        for ordinal,execution_write in enumerate(dispatch_writes):
           journal.append(KGSLJournalWrite(word_offset, ordinal, execution_write.address,
                                           execution_write.data, "A630 global store", True))
         continue
@@ -328,9 +373,6 @@ class QCOMDriver(VirtDriver):
     if submission.dispatches:
       immutable_reads = [(memory_range.address, memory_range.size, memory_range.purpose)
                          for memory_range in submission.memory_ranges if memory_range.read and memory_range.purpose != "wait value"]
-      # Actual machine execution is the source of truth for dynamic loads. Sweep the exact intervals rather than
-      # coalescing away diagnostic provenance or multiplying every write by every read.
-      immutable_reads.extend(execution_reads)
       address_reads = sorted(immutable_reads, key=lambda read: (read[0], read[1], read[2]))
       write_index = read_index = 0
       while write_index < len(address_journal) and read_index < len(address_reads):

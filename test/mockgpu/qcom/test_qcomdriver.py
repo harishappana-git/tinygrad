@@ -40,9 +40,9 @@ class TestQCOMDriver(unittest.TestCase):
     submissions,command_images = [],[]
     real_execute = qcomdriver.execute_a630
     real_plan = self.driver._plan_a630_retirement
-    def capture_execution(submission, resolver, *, read_observer=None):
+    def capture_execution(submission, resolver, *, read_observer=None, budget=None):
       submissions.append(submission)
-      return real_execute(submission, resolver, read_observer=read_observer)
+      return real_execute(submission, resolver, read_observer=read_observer, budget=budget)
     def capture_plan(fd, submission, command_address, command_size):
       command_images.append(bytes(self.driver.resolve_owned(fd, command_address, command_size)))
       return real_plan(fd, submission, command_address, command_size)
@@ -493,7 +493,7 @@ class TestQCOMDriver(unittest.TestCase):
     submission = A630Submission((cast(Any, mock.Mock(word_offset=7)),), (), (), ())
 
     def execute_with_reads(reads):
-      def execute(_submission, _resolver, *, read_observer=None):
+      def execute(_submission, _resolver, *, read_observer=None, budget=None):
         self.assertIsNotNone(read_observer)
         for address,size,purpose in reads: read_observer(address, size, purpose)
         return writes
@@ -526,6 +526,11 @@ class TestQCOMDriver(unittest.TestCase):
       (A630Write(1, 0x40000000, 8, None, "first PM4 write"), A630Write(2, 0x40000004, 4, 2, "partial PM4 write")))
     with self.assertRaisesRegex(RuntimeError, "overlapping first PM4 write and partial PM4 write"):
       self.driver._plan_a630_retirement(self.device.fd.fd, partial, 0x50000000, 4)
+    two_dispatches = A630Submission((cast(Any, mock.Mock(word_offset=7)), cast(Any, mock.Mock(word_offset=8))), (), (), ())
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(())), \
+         mock.patch.object(qcomdriver, "_MAX_A630_OVERLAY_INTERVAL_WORK", count - 1), \
+         self.assertRaisesRegex(RuntimeError, "bounded prior-effect overlay limit"):
+      self.driver._plan_a630_retirement(self.device.fd.fd, two_dispatches, 0x50000000, 4)
 
   def test_rejected_hcq_program_recovers_timeline_for_next_kernel(self):
     import struct
@@ -594,6 +599,71 @@ class TestQCOMDriver(unittest.TestCase):
     finally:
       if not completed: restore_before()
       dummy_view[:] = original_dummy
+
+  def test_multi_dispatch_overlay_is_transactional_and_recovers(self):
+    import numpy as np, struct
+    from tinygrad import Device, Tensor
+    from tinygrad.codegen import to_program
+    from tinygrad.engine.realize import get_runtime
+    from tinygrad.runtime.autogen import kgsl
+    from tinygrad.runtime.support.hcq import HCQSubmissionRejected
+    from test.mockgpu.qcom import a630 as a630_module, qcomdriver
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import parse_pm4
+
+    shape,count = (45, 68),45 * 68
+    a = Tensor(np.arange(count, dtype=np.float32).reshape(shape), device=Device.DEFAULT).realize()
+    b = a + 1
+    program_spec = to_program(b.schedule_linear().src[-1].src[0], self.device.renderer)
+    runtime = get_runtime(self.device.device, program_spec)
+    a_buffer,b_buffer = cast(Any, a.uop.buffer),cast(Any, b.uop.buffer)
+    b_buffer.allocate()
+    a_address,b_address = int(a_buffer._buf.va_addr),int(b_buffer._buf.va_addr)
+    b_args = runtime.fill_kernargs([b_buffer._buf, a_buffer._buf])
+    a_args = runtime.fill_kernargs([a_buffer._buf, b_buffer._buf])
+    queue = self.device.hw_compute_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1) \
+      .exec(runtime, b_args, program_spec.arg.global_size, program_spec.arg.local_size) \
+      .exec(runtime, a_args, program_spec.arg.global_size, program_spec.arg.local_size) \
+      .signal(self.device.timeline_signal, self.device.timeline_value)
+    words = tuple(queue._q)
+    submission = stage_a630(parse_pm4(words), self._resolve_owned)
+    self.assertEqual(len(submission.dispatches), 2)
+    self.assertLess(submission.dispatches[0].word_offset, submission.dispatches[1].word_offset)
+    self.assertEqual(tuple(struct.unpack("<2Q", dispatch.constants_image[:16]) for dispatch in submission.dispatches),
+                     ((b_address, a_address), (a_address, b_address)))
+
+    command_buffer,_,request = self.gpu_command(words)
+    request.timestamp = marker = 0x4d554c54
+    a_view,b_view = self._resolve_owned(a_address, count * 4),self._resolve_owned(b_address, count * 4)
+    signal_view = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
+    dummy_view = self._resolve_owned(self.device.dummy_addr, 4)
+    before = (bytes(a_view), bytes(b_view), bytes(signal_view), bytes(dummy_view),
+              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter,
+              self.device.last_cmd, self.device.error_state)
+    first = submission.dispatches[0]
+    active_count = next(instruction.index + 1 for instruction in first.instructions if instruction.opcode == "end")
+    first_dispatch_steps = active_count * first.groups[0] * first.local_size[0]
+    real_execute,calls = qcomdriver.execute_a630,0
+    def count_execution(*args, **kwargs):
+      nonlocal calls
+      calls += 1
+      return real_execute(*args, **kwargs)
+    try:
+      with mock.patch.object(a630_module, "_MAX_LANE_INSTRUCTION_STEPS", first_dispatch_steps), \
+           mock.patch.object(qcomdriver, "execute_a630", side_effect=count_execution), \
+           self.assertRaisesRegex(HCQSubmissionRejected, "bounded lane-instruction limit"):
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+      self.assertEqual((calls, request.timestamp), (2, marker))
+      self.assertEqual((bytes(a_view), bytes(b_view), bytes(signal_view), bytes(dummy_view),
+                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter,
+                        self.device.last_cmd, self.device.error_state), before)
+    finally: self.device._gpu_free(command_buffer)
+
+    queue.submit(self.device)
+    self.device.timeline_signal.wait(self.device.timeline_value)
+    self.device.timeline_value += 1
+    self.assertEqual((struct.unpack(f"<{count}f", a_view), struct.unpack(f"<{count}f", b_view)),
+                     (tuple(float(index + 2) for index in range(count)), tuple(float(index + 1) for index in range(count))))
 
   def test_timeline_rollback_requires_latest_definite_rejection(self):
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
@@ -725,7 +795,9 @@ class TestQCOMDriver(unittest.TestCase):
                             instruction(4, "add.u", gpr(30), (gpr(8), gpr(1))), instruction(5, "end")), dispatch)
 
   def test_ir3_typed_instruction_and_modifier_contracts(self):
-    from test.mockgpu.qcom.a630 import A630IR3Operand, decode_a630_ir3
+    from dataclasses import replace
+    from tinygrad.runtime.autogen import mesa
+    from test.mockgpu.qcom.a630 import A630Dispatch, A630IR3Operand, _full_gpr_accesses, _validate_register_footprint, decode_a630_ir3
 
     end = 6 << 55
     words = (
@@ -756,6 +828,65 @@ class TestQCOMDriver(unittest.TestCase):
                       "cmps.s.eq.p0", "stl.u32", "bar.g", "ldl.u32x4", "predt.p0", "prede", "end"))
 
     def decode_one(word): return decode_a630_ir3(word.to_bytes(8, "little") + end.to_bytes(8, "little"))[0]
+
+    addressing_words = {
+      "shared multiply":0x46500005200c00c0, "register multiply":0x4650080320030000,
+      "constant accumulate":0x6182000400051010, "scheduled constant accumulate":0x6180080000039011,
+      "repeated address add":0x42180110000b1003,
+    }
+    addressing_expected = {
+      "shared multiply":("mull.u", A630IR3Operand("gpr", 5),
+                         (A630IR3Operand("shared", 192), A630IR3Operand("iim", 12))),
+      "register multiply":("mull.u", A630IR3Operand("gpr", 3),
+                           (A630IR3Operand("gpr", 0), A630IR3Operand("iim", 3))),
+      "constant accumulate":("madsh.m16", A630IR3Operand("gpr", 4),
+                             (A630IR3Operand("const", 16), A630IR3Operand("gpr", 4), A630IR3Operand("gpr", 5))),
+      "scheduled constant accumulate":("madsh.m16", A630IR3Operand("gpr", 0),
+                                       (A630IR3Operand("const", 17), A630IR3Operand("gpr", 0), A630IR3Operand("gpr", 3))),
+      "repeated address add":("add.u.rpt2", A630IR3Operand("gpr", 16),
+                              (A630IR3Operand("const", 3), A630IR3Operand("gpr", 11))),
+    }
+    for name,word in addressing_words.items():
+      instruction = decode_one(word)
+      self.assertEqual((instruction.opcode, instruction.dst, instruction.srcs), addressing_expected[name])
+    repeated_address = decode_one(addressing_words["repeated address add"])
+    self.assertEqual(tuple(value for field,value in repeated_address.fields if field == "SRC_R"), (0, 1))
+    self.assertTrue({("REPEAT", 1), ("DST_HALF", 0)} <= set(repeated_address.fields))
+    self.assertIn(("NOP", 1), decode_one(addressing_words["register multiply"]).fields)
+    self.assertIn(("NOP", 3), decode_one(addressing_words["scheduled constant accumulate"]).fields)
+    boundary_repeat = replace(repeated_address, dst=A630IR3Operand("gpr", 15),
+                              srcs=(A630IR3Operand("const", 3), A630IR3Operand("gpr", 7)))
+    self.assertEqual(_full_gpr_accesses(boundary_repeat), {7, 8, 15, 16})
+    empty_dispatch = A630Dispatch(0, (), (), 0, 0, b"", 0, 0, b"", 0, 0, (1, 1, 1), (1, 1, 1), (1, 1, 1))
+    footprint_shift = mesa.A6XX_SP_CS_CNTL_0_FULLREGFOOTPRINT__SHIFT
+    admitted = replace(empty_dispatch, registers=((mesa.REG_A6XX_SP_CS_CNTL_0, 5 << footprint_shift),))
+    _validate_register_footprint(admitted, (boundary_repeat,), 0xfc, 0xfc)
+    with self.assertRaisesRegex(ValueError, "register footprints do not match"):
+      _validate_register_footprint(replace(admitted, registers=((mesa.REG_A6XX_SP_CS_CNTL_0, 4 << footprint_shift),)),
+                                   (boundary_repeat,), 0xfc, 0xfc)
+    repeated_rejections = {
+      "repeat two":repeated_address.raw & ~(0x3 << 40) | 2 << 40,
+      "repeat three":repeated_address.raw & ~(0x3 << 40) | 3 << 40,
+      "no increment":repeated_address.raw & ~((1 << 43) | (1 << 51)),
+      "first increment":repeated_address.raw & ~((1 << 43) | (1 << 51)) | 1 << 43,
+      "both increment":repeated_address.raw | 1 << 43,
+      "register first source":repeated_address.raw & ~0xffff | 3,
+      "special second source":repeated_address.raw & ~(0xffff << 16) | 0xe0 << 16,
+      "destination crosses GPR file":repeated_address.raw & ~(0xff << 32) | 0xbf << 32,
+      "destination conversion":repeated_address.raw | 1 << 46,
+      "half precision":repeated_address.raw ^ 1 << 52,
+    }
+    for name,word in repeated_rejections.items():
+      with self.subTest(repeated_address_modifier=name): self.assertIsNone(decode_one(word).opcode)
+    constant_madsh = decode_one(addressing_words["constant accumulate"])
+    for name,word in {
+      "repeat":constant_madsh.raw | 1 << 40, "negate":constant_madsh.raw | 1 << 14,
+      "shared destination":constant_madsh.raw & ~(0xff << 32) | 0xc0 << 32,
+      "shared third source":constant_madsh.raw & ~(0x1fff << 16) | 0xc0 << 16,
+    }.items():
+      with self.subTest(constant_madsh_modifier=name): self.assertIsNone(decode_one(word).opcode)
+    with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
+      decode_one(constant_madsh.raw | 1 << 13)
 
     workgroup_words = {
       "compare":0x42b400f820000000, "store-local":0xc1064f000180001a, "barrier":0xe042000000000000,
@@ -1433,7 +1564,8 @@ class TestQCOMDriver(unittest.TestCase):
     repeated_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
     repeated_before = (bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-    with self.assertRaisesRegex(RuntimeError, "at most one dispatch"):
+    # Multiple dispatches are admitted, but overlapping output journals remain conservatively fail closed.
+    with self.assertRaisesRegex(RuntimeError, "overlapping A630 global store and A630 global store"):
       kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=repeated_request)
     self.assertEqual(repeated_request.timestamp, 0x27182818)
     self.assertEqual((bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),

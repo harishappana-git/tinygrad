@@ -591,6 +591,9 @@ jobs:
         run: |
           python -m pytest -n12 --dist=loadscope --durations=20 \
             test/mockgpu/qcom \
+            test/device/test_hcq.py::TestHCQSubmissionRejection \
+            test/device/test_hcq.py::TestHCQ::test_exec_2_kernels_100_times \
+            test/backend/test_ops.py::TestOps::test_add \
             test/test_tiny.py::TestTiny::test_const \
             test/test_tiny.py::TestTiny::test_copy \
             test/test_tiny.py::TestTiny::test_plus \
