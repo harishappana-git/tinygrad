@@ -124,9 +124,22 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(self.driver.power_levels[self.device.ctx], 1)
     self.assertIsInstance(self.device.hw_compute_queue_t, functools.partial)
     self.assertIs(self.device.hw_compute_queue_t.func, QCOMComputeQueue)
+    self.assertIsNone(self.device.graph)
     for buffer in (self.device.cmd_buf, self.device.border_color_buf, self.device.kernargs_buf, self.device.timeline_signal.base_buf):
       self.assertIsNotNone(self.allocation_for(int(buffer.va_addr), buffer.size))
     self.assertIsNotNone(self.allocation_for(self.device.dummy_addr, 0x1000))
+
+  def test_mock_qcom_jit_falls_back_to_individual_submissions(self):
+    from tinygrad import Tensor, TinyJit
+
+    self.assertIsNone(self.device.graph)
+    @TinyJit
+    def two_kernels(value):
+      intermediate = (value + 1).realize()
+      return (intermediate + 2).realize()
+
+    for offset in range(3):
+      self.assertEqual(two_kernels(Tensor([offset], device=self.device.device)).item(), offset + 3)
 
   def test_allocate_map_and_free(self):
     buffer = self.device._gpu_alloc(0x1234, fill_zeroes=True)
@@ -348,7 +361,7 @@ class TestQCOMDriver(unittest.TestCase):
   def test_gpu_command_validation_and_control_retirement(self):
     from tinygrad.runtime.autogen import kgsl, mesa
     from tinygrad.runtime.ops_qcom import pkt7_hdr
-    from test.mockgpu.qcom.qcomdriver import KGSLJournalWrite, ioctl_code
+    from test.mockgpu.qcom.qcomdriver import KGSLJournalWrite, _MAX_A630_COMMAND_WORDS, ioctl_code
     words = [pkt7_hdr(mesa.CP_WAIT_FOR_IDLE, 0)]
     buffer, command, request = self.gpu_command(words)
     request.timestamp = 0x12345678
@@ -419,6 +432,7 @@ class TestQCOMDriver(unittest.TestCase):
       ("gpuaddr", int(buffer.va_addr) + 1, "unaligned command address"),
       ("size", 0, "invalid command size"),
       ("size", 2, "invalid command size"),
+      ("size", (_MAX_A630_COMMAND_WORDS + 1) * 4, "command exceeds the A630 emulator word limit"),
       ("gpuaddr", (1 << 64) - 4, "invalid GPU range"),
     )
     for field,value,message in object_cases:
@@ -513,6 +527,52 @@ class TestQCOMDriver(unittest.TestCase):
          mock.patch.object(qcomdriver, "_MAX_A630_OVERLAY_INTERVAL_WORK", count - 1), \
          self.assertRaisesRegex(RuntimeError, "bounded prior-effect overlay limit"):
       self.driver._plan_a630_retirement(self.device.fd.fd, two_dispatches, 0x50000000, 4)
+
+  def test_retirement_commit_classifies_only_complete_rollback_as_definite(self):
+    from tinygrad.runtime.autogen import kgsl
+    from test.mockgpu.qcom.qcomdriver import A630SubmissionAmbiguous, KGSLJournalWrite, ioctl_code
+
+    class FaultingView:
+      readonly = False
+      def __init__(self, image:bytes, failures:set[int]|None=None, failure:type[BaseException]=RuntimeError):
+        self.image,self.failures,self.failure,self.assignments = bytearray(image),failures or set(),failure,0
+      def __len__(self): return len(self.image)
+      def __bytes__(self): return bytes(self.image)
+      def __setitem__(self, key, value):
+        self.assignments += 1
+        if self.assignments in self.failures: raise self.failure(f"injected write failure {self.assignments}")
+        self.image[key] = value
+
+    journal = (KGSLJournalWrite(0, 0, 1, b"LEFT", "first test", False),
+               KGSLJournalWrite(1, 0, 5, b"RIGHT", "second test", False))
+    first,second = FaultingView(b"left"),FaultingView(b"right", {1})
+    with mock.patch.object(self.driver, "resolve_owned", side_effect=(first, second)), \
+         self.assertRaisesRegex(RuntimeError, "failed to commit A630 retirement") as definite:
+      self.driver._commit_a630_journal(self.device.fd.fd, journal)
+    self.assertIs(type(definite.exception), RuntimeError)
+    self.assertEqual((bytes(first), bytes(second)), (b"left", b"right"))
+
+    first,second = FaultingView(b"left"),FaultingView(b"right", {1}, KeyboardInterrupt)
+    with mock.patch.object(self.driver, "resolve_owned", side_effect=(first, second)), self.assertRaises(KeyboardInterrupt):
+      self.driver._commit_a630_journal(self.device.fd.fd, journal)
+    self.assertEqual((bytes(first), bytes(second)), (b"left", b"right"))
+
+    ambiguous_journal = journal + (KGSLJournalWrite(2, 0, 9, b"THIRD", "third test", False),)
+    first,second,third = FaultingView(b"left"),FaultingView(b"right", {2}),FaultingView(b"third", {1})
+    with mock.patch.object(self.driver, "resolve_owned", side_effect=(first, second, third)), \
+         self.assertRaisesRegex(A630SubmissionAmbiguous, "rollback was incomplete") as ambiguous:
+      self.driver._commit_a630_journal(self.device.fd.fd, ambiguous_journal)
+    self.assertIs(type(ambiguous.exception), A630SubmissionAmbiguous)
+    self.assertEqual((bytes(first), bytes(second), bytes(third)), (b"left", b"RIGHT", b"third"))
+
+    request_code = ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND)
+    struct_type,_ = self.driver._ioctls[request_code]
+    payload = struct_type()
+    def fail_ambiguously(_fd, _payload): raise A630SubmissionAmbiguous("ambiguous retirement")
+    with mock.patch.dict(self.driver._ioctls, {request_code:(struct_type, fail_ambiguously)}), \
+         self.assertRaisesRegex(A630SubmissionAmbiguous, "ambiguous retirement") as ioctl_error:
+      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=payload)
+    self.assertIs(type(ioctl_error.exception), A630SubmissionAmbiguous)
 
   def test_rejected_hcq_program_recovers_timeline_for_next_kernel(self):
     import struct
@@ -649,17 +709,19 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_timeline_rollback_requires_latest_definite_rejection(self):
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
+    from test.mockgpu.qcom.qcomdriver import A630SubmissionAmbiguous
 
-    before = self.device.timeline_value
+    before,before_error = self.device.timeline_value,self.device.error_state
     ambiguous_timeline = later_timeline = None
     try:
       ambiguous = self.device.hw_compute_queue_t()
-      with mock.patch.object(ambiguous, "_submit", side_effect=RuntimeError("ambiguous acceptance")), \
-           self.assertRaisesRegex(RuntimeError, "ambiguous acceptance") as raised:
+      with mock.patch.object(ambiguous, "_submit", side_effect=A630SubmissionAmbiguous("ambiguous acceptance")), \
+           self.assertRaisesRegex(A630SubmissionAmbiguous, "ambiguous acceptance") as raised:
         self.device.submit_timeline(ambiguous)
-      self.assertIs(type(raised.exception), RuntimeError)
+      self.assertIs(type(raised.exception), A630SubmissionAmbiguous)
       ambiguous_timeline = self.device.timeline_value
-      self.device.timeline_value = before
+      self.assertIs(self.device.error_state, raised.exception)
+      self.device.timeline_value,self.device.error_state = before,None
 
       def reject_after_later_reservation(_):
         self.device.next_timeline()
@@ -669,9 +731,84 @@ class TestQCOMDriver(unittest.TestCase):
            self.assertRaisesRegex(HCQSubmissionRejected, "after a later reservation"):
         self.device.submit_timeline(non_lifo)
       later_timeline = self.device.timeline_value
-    finally: self.device.timeline_value = before
+      self.assertRegex(str(self.device.error_state), "non-latest timeline reservation")
+    finally: self.device.timeline_value,self.device.error_state = before,before_error
 
     self.assertEqual((ambiguous_timeline, later_timeline), (before + 1, before + 2))
+
+  def test_escaped_timeline_retirement_poison_blocks_followup_submission(self):
+    from test.mockgpu.qcom.qcomdriver import A630SubmissionAmbiguous
+
+    timeline_view = self.device.timeline_signal.base_buf.cpu_view().mv[:16]
+    before = {"timeline_value":self.device.timeline_value, "timeline_image":bytes(timeline_view),
+              "context_timestamp":self.driver.context_timestamps[self.device.ctx], "last_cmd":self.device.last_cmd,
+              "counter":self.driver.always_on_counter, "error_state":self.device.error_state}
+    try:
+      def escape_timeline(fd, journal):
+        target = next(write for write in journal
+                      if write.address == self.device.timeline_signal.value_addr and len(write.data) == 4)
+        self.driver.resolve_owned(fd, target.address, len(target.data))[:] = target.data
+        raise A630SubmissionAmbiguous("incomplete retirement rollback")
+
+      queue = self.device.hw_compute_queue_t()
+      with mock.patch.object(self.driver, "_commit_a630_journal", side_effect=escape_timeline), \
+           self.assertRaisesRegex(A630SubmissionAmbiguous, "incomplete retirement rollback") as raised:
+        self.device.submit_timeline(queue)
+      self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value),
+                       (before["timeline_value"] + 1, before["timeline_value"]))
+      self.assertIs(self.device.error_state, raised.exception)
+      self.assertEqual((self.driver.context_timestamps[self.device.ctx], self.device.last_cmd, self.driver.always_on_counter),
+                       (before["context_timestamp"], before["last_cmd"], before["counter"]))
+
+      blocked = self.device.hw_compute_queue_t()
+      with mock.patch.object(blocked, "_submit", side_effect=AssertionError("poisoned device submitted follow-up work")) as submit, \
+           self.assertRaisesRegex(A630SubmissionAmbiguous, "incomplete retirement rollback") as blocked_error:
+        self.device.submit_timeline(blocked)
+      submit.assert_not_called()
+      self.assertIs(blocked_error.exception, raised.exception)
+      self.assertEqual(self.device.timeline_value, before["timeline_value"] + 1)
+    finally:
+      self.device.timeline_value,timeline_view[:] = before["timeline_value"],before["timeline_image"]
+      self.driver.context_timestamps[self.device.ctx],self.device.last_cmd = before["context_timestamp"],before["last_cmd"]
+      self.driver.always_on_counter,self.device.error_state = before["counter"],before["error_state"]
+
+  def test_raw_queue_ambiguous_retirement_poison_blocks_graph_style_submission(self):
+    from tinygrad import Variable, dtypes
+    from test.mockgpu.qcom.qcomdriver import A630SubmissionAmbiguous
+
+    timeline_view = self.device.timeline_signal.base_buf.cpu_view().mv[:16]
+    before = {"timeline_value":self.device.timeline_value, "timeline_image":bytes(timeline_view),
+              "context_timestamp":self.driver.context_timestamps[self.device.ctx], "last_cmd":self.device.last_cmd,
+              "counter":self.driver.always_on_counter, "error_state":self.device.error_state}
+    try:
+      def escape_timeline(fd, journal):
+        target = next(write for write in journal
+                      if write.address == self.device.timeline_signal.value_addr and len(write.data) == 4)
+        self.driver.resolve_owned(fd, target.address, len(target.data))[:] = target.data
+        raise A630SubmissionAmbiguous("raw queue retirement escaped rollback")
+
+      target = Variable("raw_timeline_target", 0, 0xffffffff, dtypes.uint32)
+      queue = self.device.hw_compute_queue_t().signal(self.device.timeline_signal, target)
+      queue.bind(self.device)
+      with mock.patch.object(self.driver, "_commit_a630_journal", side_effect=escape_timeline), \
+           self.assertRaisesRegex(A630SubmissionAmbiguous, "raw queue retirement escaped rollback") as raised:
+        queue.submit(self.device, {target.expr:self.device.timeline_value})
+      poisoned_command = bytes(queue._q)
+      self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value),
+                       (before["timeline_value"], before["timeline_value"]))
+      self.assertIs(self.device.error_state, raised.exception)
+      self.assertEqual((self.driver.context_timestamps[self.device.ctx], self.device.last_cmd, self.driver.always_on_counter),
+                       (before["context_timestamp"], before["last_cmd"], before["counter"]))
+
+      with self.assertRaisesRegex(A630SubmissionAmbiguous, "raw queue retirement escaped rollback") as blocked_error:
+        queue.submit(self.device, {target.expr:self.device.timeline_value + 1})
+      self.assertIs(blocked_error.exception, raised.exception)
+      self.assertEqual(bytes(queue._q), poisoned_command)
+      self.assertEqual(self.device.timeline_value, before["timeline_value"])
+    finally:
+      self.device.timeline_value,timeline_view[:] = before["timeline_value"],before["timeline_image"]
+      self.driver.context_timestamps[self.device.ctx],self.device.last_cmd = before["context_timestamp"],before["last_cmd"]
+      self.driver.always_on_counter,self.device.error_state = before["counter"],before["error_state"]
 
   def test_ir3_decoder_rejects_invalid_and_private_encodings(self):
     from test.mockgpu.qcom import a630 as a630_module
@@ -729,6 +866,29 @@ class TestQCOMDriver(unittest.TestCase):
       stage_a630((oversized,), resolver)
     resolver.assert_not_called()
 
+  def test_state_snapshot_budget_deduplicates_and_bounds_amplification(self):
+    from tinygrad.runtime.autogen import mesa
+    from test.mockgpu.qcom.a630 import stage_a630
+    from test.mockgpu.qcom.pm4 import PM4Type7Packet
+
+    units = 0x3ff
+    control = mesa.ST_CONSTANTS << 14 | mesa.SS6_INDIRECT << 16 | mesa.SB6_CS_TEX << 18 | units << 22
+    load_size = units * 64
+    load = PM4Type7Packet(0, mesa.CP_LOAD_STATE6_FRAG, (control, 0x10000, 0))
+    resolver = mock.Mock(return_value=memoryview(bytearray(load_size)))
+    submission = stage_a630((load,) * (1 << 14), resolver)
+    self.assertEqual((submission.dispatches, len(submission.memory_ranges), resolver.call_count), ((), 1, 1))
+
+    unique = tuple(PM4Type7Packet(index * 4, mesa.CP_LOAD_STATE6_FRAG,
+                                 (control, 0x10000 + index * 0x10000, 0)) for index in range(17))
+    resolver.reset_mock()
+    self.assertEqual(len(stage_a630(unique[:16], resolver).memory_ranges), 16)
+    self.assertEqual(resolver.call_count, 16)
+    resolver.reset_mock()
+    with self.assertRaisesRegex(ValueError, "state snapshots exceed the emulator byte limit"):
+      stage_a630(unique, resolver)
+    self.assertEqual(resolver.call_count, 16)
+
   def test_local_load_scoreboard_tracks_full_register_dependencies(self):
     from dataclasses import replace
     from test.mockgpu.qcom.a630 import A630Dispatch, A630IR3Instruction, A630IR3Operand, _validate_control_flow
@@ -775,6 +935,28 @@ class TestQCOMDriver(unittest.TestCase):
     synchronized_load = replace(unsynchronized_load, fields=(("SS", 0), ("SY", 1)))
     _validate_control_flow((barrier, ss_nop, synchronized_load, instruction(3, "nop", ss=1),
                             instruction(4, "add.u", gpr(30), (gpr(8), gpr(1))), instruction(5, "end")), dispatch)
+
+  def test_max_group_memory_free_dispatch_uses_no_dense_local_backing(self):
+    from tinygrad.runtime.autogen import mesa
+    from test.mockgpu.qcom import a630 as a630_module
+    from test.mockgpu.qcom.a630 import A630Dispatch, A630ExecutionBudget, _execute_a630_dispatch, decode_a630_ir3
+
+    end = decode_a630_ir3((6 << 55).to_bytes(8, "little"))[0]
+    registers = (
+      (mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, 0xfcfcfcc0),
+      (mesa.REG_A6XX_SP_CS_WGE_CNTL, 0xfc),
+      (mesa.REG_A6XX_SP_CS_CNTL_1, mesa.CONSTLEN_256 << mesa.A6XX_SP_CS_CNTL_1_CONSTANTRAMMODE__SHIFT),
+    )
+    dispatch = A630Dispatch(0, registers, (), 0, 8, end.raw.to_bytes(8, "little"), 0, 4096, bytes(4096), 0, 0,
+                            (1, 1, 1), (a630_module._MAX_INVOCATIONS, 1, 1),
+                            (a630_module._MAX_INVOCATIONS, 1, 1), (end,))
+    resolver = mock.Mock(side_effect=AssertionError("memory-free dispatch resolved memory"))
+    budget = A630ExecutionBudget()
+    with mock.patch.object(a630_module, "bytearray", side_effect=AssertionError("dense A630 local backing allocated"), create=True):
+      writes = _execute_a630_dispatch(dispatch, resolver, (end,), read_observer=None, budget=budget)
+    self.assertEqual((writes, budget.lane_instruction_steps, budget.memory_events),
+                     ((), a630_module._MAX_INVOCATIONS, 0))
+    resolver.assert_not_called()
 
   def test_ir3_typed_instruction_and_modifier_contracts(self):
     from dataclasses import replace

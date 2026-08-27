@@ -18,7 +18,6 @@ class A630MemoryRange:
   read:bool
   write:bool
   purpose:str
-  image:bytes|None = None
 
 @dataclass(frozen=True)
 class A630LoadState:
@@ -81,8 +80,7 @@ class _A630WorkgroupState:
   shared:dict[int, int]
   active:list[bool]
   predicated:bool
-  local:bytearray
-  local_initialized:bytearray
+  local:dict[int, int]
   steps:int
 
 @dataclass(frozen=True)
@@ -121,6 +119,8 @@ _MAX_LANE_INSTRUCTION_STEPS = 64 * _MAX_INVOCATIONS
 # Emulator resource policy, not an A630 hardware limit. It bounds work and the retirement journal while retaining
 # four memory operations for every invocation at the largest admitted dispatch.
 _MAX_MEMORY_EVENTS = 4 * _MAX_INVOCATIONS
+# Emulator policy bound, not an A630 hardware limit. It caps immutable state copied while staging one command.
+_MAX_A630_SNAPSHOT_BYTES = 1 << 20
 _OPERAND_CONTRACTS:dict[str, tuple[str|None, tuple[tuple[str, ...], ...]]] = {
   "nop":(None, ((),)), "end":(None, ((),)), "bar.g":(None, ((),)), "prede":(None, ((),)),
   "br.p0":(None, (("pred", "iim"),)), "jump":(None, (("iim",),)), "predt.p0":(None, (("pred",),)),
@@ -631,14 +631,23 @@ def stage_a630(packets:Sequence[PM4Packet], resolver:Resolver) -> A630Submission
   _require(not update_pending and not marker_pending, "unterminated compute-state sequence")
 
   resolved:list[A630MemoryRange] = []
+  snapshots:dict[tuple[int, int], bytes] = {}
   read_images:dict[tuple[int, int, str], bytes] = {}
-  for memory_range in ranges:
-    view = resolver(memory_range.address, memory_range.size)
-    _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
-    image = bytes(view) if memory_range.read else None
-    resolved_range = replace(memory_range, image=image)
-    resolved.append(resolved_range)
-    if image is not None: read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = image
+  snapshot_bytes = 0
+  for memory_range in dict.fromkeys(ranges):
+    if memory_range.read:
+      snapshot_key = (memory_range.address, memory_range.size)
+      if snapshot_key not in snapshots:
+        snapshot_bytes += memory_range.size
+        _require(snapshot_bytes <= _MAX_A630_SNAPSHOT_BYTES, "A630 state snapshots exceed the emulator byte limit")
+        view = resolver(memory_range.address, memory_range.size)
+        _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
+        snapshots[snapshot_key] = bytes(view)
+      read_images[(memory_range.address, memory_range.size, memory_range.purpose)] = snapshots[snapshot_key]
+    else:
+      view = resolver(memory_range.address, memory_range.size)
+      _require(len(view) == memory_range.size, f"short resolved {memory_range.purpose} range")
+    resolved.append(memory_range)
   dispatch_instructions = tuple(decode_a630_ir3(read_images[(dispatch.shader_address, dispatch.shader_size, "shader")])
                                 for dispatch in dispatches)
   frozen_dispatches = tuple(replace(dispatch,
@@ -837,10 +846,10 @@ def _validate_register_footprint(dispatch:A630Dispatch, active:Sequence[A630IR3I
 
   if lid != 0xfc: add_full(lid, 3)
   for instruction in active:
+    for register in _full_gpr_accesses(instruction): add_full(register)
     operands = ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs
     for operand in operands:
-      if operand.kind == "gpr": add_full(operand.value)
-      elif operand.kind == "half":
+      if operand.kind == "half":
         _require(0 <= operand.value < 0xc0, "unsupported shared or special IR3 register")
         half.add(operand.value)
       elif operand.kind == "shared":
@@ -850,21 +859,6 @@ def _validate_register_footprint(dispatch:A630Dispatch, active:Sequence[A630IR3I
         _require(0 <= operand.value < 1024, f"constant register {operand.value} is out of range")
       elif operand.kind == "flut":
         _require(operand.value in (2, 3), f"unsupported float lookup immediate {operand.value}")
-
-    if instruction.opcode in {"ldg.u32", "ldg.u32x4", "stg.u32", "stg.u32x4", "stg.u8"}:
-      add_full(instruction.srcs[0].value, 2)
-    if instruction.opcode in {"ldg.u32x4", "ldl.u32x4"}:
-      assert instruction.dst is not None
-      add_full(instruction.dst.value, 4)
-    if instruction.opcode == "stg.u32x4": add_full(instruction.srcs[1].value, 4)
-    if instruction.opcode == "add.f.rpt4":
-      assert instruction.dst is not None
-      add_full(instruction.dst.value, 4)
-      for operand in instruction.srcs: add_full(operand.value, 4)
-    if instruction.opcode == "add.u.rpt2":
-      assert instruction.dst is not None
-      add_full(instruction.dst.value, 2)
-      add_full(instruction.srcs[1].value, 2)
 
   control = registers[mesa.REG_A6XX_SP_CS_CNTL_0]
   half_footprint = (control & mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__MASK) >> mesa.A6XX_SP_CS_CNTL_0_HALFREGFOOTPRINT__SHIFT
@@ -949,6 +943,7 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
   constants = struct.unpack("<1024I", dispatch.constants_image)
   registers = dict(dispatch.registers)
   wgid,lid = _system_registers(dispatch)
+  capacity = _local_capacity(registers)
   has_control = any(instruction.opcode in {"br.p0", "jump"} for instruction in active)
   max_steps = (len(active) + 1) * _MAX_CONTROL_FLOW_ITERATIONS if has_control else len(active) + 1
   writes:list[A630ExecutionWrite] = []
@@ -966,9 +961,7 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
     lanes = [_A630LaneState({lid:lane, lid+1:0, lid+2:0} if lid != 0xfc else {}, {}, {})
              for lane in range(dispatch.local_size[0])]
     shared = {} if wgid == 0xfc else {wgid:group, wgid+1:0, wgid+2:0}
-    capacity = _local_capacity(registers)
-    state = _A630WorkgroupState(0, lanes, shared, [True] * len(lanes), False,
-                                bytearray(capacity), bytearray(capacity), 0)
+    state = _A630WorkgroupState(0, lanes, shared, [True] * len(lanes), False, {}, 0)
     while True:
       _require(0 <= state.pc < len(active), f"A630 program counter {state.pc} is out of range")
       state.steps += 1
@@ -1013,19 +1006,16 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
           continue
 
         if opcode == "stl.u32":
-          pending:list[tuple[int, bytes]] = []
+          pending:list[tuple[int, int]] = []
           for lane_index,lane in enumerate(state.lanes):
             if not state.active[lane_index]: continue
             record_memory_event()
             address = _read_ir3_operand(instruction.srcs[0], lane.full, lane.half, state.shared, constants)
             value = _read_ir3_operand(instruction.srcs[1], lane.full, lane.half, state.shared, constants)
             _require(address % 4 == 0 and address + 4 <= capacity, "A630 local store is unaligned or out of range")
-            _require(all(not (address < other + 4 and other < address + 4) for other,_ in pending),
-                     "overlapping A630 local stores")
-            pending.append((address, struct.pack("<I", value)))
-          for address,data in pending:
-            state.local[address:address+4] = data
-            state.local_initialized[address:address+4] = b"\x01" * 4
+            _require(all(address != other for other,_ in pending), "overlapping A630 local stores")
+            pending.append((address, value))
+          state.local.update(pending)
           state.pc += 1
           continue
 
@@ -1070,10 +1060,11 @@ def _execute_a630_dispatch(dispatch:A630Dispatch, resolver:Resolver, active:Sequ
               address = _read_ir3_operand(instruction.srcs[0], lane.full, lane.half, state.shared, constants)
               _require(address % 4 == 0 and address + 16 <= capacity,
                        "A630 local load is unaligned or out of range")
-              _require(all(state.local_initialized[address:address+16]),
+              addresses = tuple(address + component * 4 for component in range(4))
+              _require(all(component_address in state.local for component_address in addresses),
                        "A630 local load reads an uninitialized dword")
-              for component,value in enumerate(struct.unpack_from("<4I", state.local, address)):
-                lane.full[instruction.dst.value + component] = value
+              for component,component_address in enumerate(addresses):
+                lane.full[instruction.dst.value + component] = state.local[component_address]
               continue
             if opcode == "add.f.rpt4":
               assert instruction.dst is not None

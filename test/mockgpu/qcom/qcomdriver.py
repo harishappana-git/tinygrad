@@ -14,6 +14,11 @@ A630_CHIP_ID = 0x060300FF
 MAP_FAILED = ctypes.c_void_p(-1).value
 # Emulator policy bound for rebuilding prior-effect interval indexes across all dispatches in one command.
 _MAX_A630_OVERLAY_INTERVAL_WORK = 1 << 20
+# Emulator policy bound, not a KGSL/A630 hardware limit. It caps command copying, unpacking, and PM4 staging work.
+_MAX_A630_COMMAND_WORDS = 1 << 16
+
+class A630SubmissionAmbiguous(RuntimeError):
+  """A retirement commit may have escaped its journal; the reserved HCQ timeline must not be reused."""
 
 def ioctl_code(ioctl:functools.partial) -> int:
   direction, base, nr, struct_type = ioctl.args[:4]
@@ -125,7 +130,7 @@ class QCOMDriver(VirtDriver):
     payload = struct_type.from_address(argp)
     try: return handler(fd, payload)
     except RuntimeError as error:
-      if request == ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND):
+      if request == ioctl_code(kgsl.IOCTL_KGSL_GPU_COMMAND) and not isinstance(error, A630SubmissionAmbiguous):
         # _gpu_command publishes retirement state only after its rollback-capable journal commit.
         from tinygrad.runtime.support.hcq import HCQSubmissionRejected
         raise HCQSubmissionRejected(str(error)) from error
@@ -382,9 +387,16 @@ class QCOMDriver(VirtDriver):
       originals.setdefault((write.address, len(write.data)), (view, bytes(view)))
     try:
       for write,view in targets: view[:] = write.data
-    except Exception as error:
-      for view,image in reversed(tuple(originals.values())): view[:] = image
-      raise RuntimeError(f"invalid KGSL request: failed to commit A630 retirement: {error}") from error
+    except BaseException as error:
+      rollback_errors:list[BaseException] = []
+      for view,image in reversed(tuple(originals.values())):
+        try: view[:] = image
+        except BaseException as rollback_error: rollback_errors.append(rollback_error)
+      if rollback_errors:
+        raise A630SubmissionAmbiguous(
+          f"invalid KGSL request: failed to commit A630 retirement and rollback was incomplete: {rollback_errors[0]}") from error
+      if isinstance(error, Exception): raise RuntimeError(f"invalid KGSL request: failed to commit A630 retirement: {error}") from error
+      raise
 
   def _gpu_command(self, fd:int, req:kgsl.struct_kgsl_gpu_command) -> int:
     self._require(req.flags == 0, f"unsupported GPU command flags {req.flags:#x}")
@@ -404,6 +416,7 @@ class QCOMDriver(VirtDriver):
     self._require(command.flags == kgsl.KGSL_CMDLIST_IB, f"unsupported command-object flags {command.flags:#x}")
     self._require(command.gpuaddr != 0 and command.gpuaddr % 4 == 0, f"unaligned command address {command.gpuaddr:#x}")
     self._require(command.size > 0 and command.size % 4 == 0, f"invalid command size {command.size:#x}")
+    self._require(command.size // 4 <= _MAX_A630_COMMAND_WORDS, "command exceeds the A630 emulator word limit")
     command_bytes = bytes(self.resolve_owned(fd, command.gpuaddr, command.size, internal_only=True))
     try:
       packets = parse_pm4(struct.unpack(f"<{command.size // 4}I", command_bytes))

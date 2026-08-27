@@ -4,12 +4,13 @@ assert sys.platform != 'win32'
 from typing import Any, cast
 from tinygrad.device import BufferSpec, Device, TinyELF
 from tinygrad.runtime.support.hcq import HCQBuffer, HWQueue, HCQProgram, HCQCompiled, HCQAllocatorBase, HCQSignal, HCQArgsState, BumpAllocator
+from tinygrad.runtime.support.hcq import HCQSubmissionRejected
 from tinygrad.runtime.support.hcq import FileIOInterface, MMIOInterface
 from tinygrad.runtime.autogen import kgsl, mesa
 from tinygrad.renderer.cstyle import QCOMCLRenderer
 from tinygrad.renderer.nir import IR3Renderer
 from tinygrad.helpers import getenv, mv_address, to_mv, round_up, data64_le, ceildiv, prod, cpu_profile, lo32, suppress_finalizing, is_image_shape
-from tinygrad.helpers import next_power2, flatten, PROFILE, IMAGE
+from tinygrad.helpers import DEV, next_power2, flatten, PROFILE, IMAGE
 from tinygrad.dtype import dtypes, AddrSpace
 from tinygrad.runtime.support.system import System
 if getenv("IOCTL"): import extra.qcom_gpu_driver.opencl_ioctl  # noqa: F401  # pylint: disable=unused-import
@@ -118,7 +119,14 @@ class QCOMComputeQueue(HWQueue):
   def _submit(self, dev:QCOMDevice):
     if self.binded_device == dev: submit_req = self.submit_req
     else: submit_req, _ = self._build_gpu_command(dev)
-    dev.last_cmd = kgsl.IOCTL_KGSL_GPU_COMMAND(dev.fd, __payload=submit_req).timestamp
+    try: dev.last_cmd = kgsl.IOCTL_KGSL_GPU_COMMAND(dev.fd, __payload=submit_req).timestamp
+    except HCQSubmissionRejected: raise
+    except Exception as error:
+      dev.error_state = error
+      raise
+    except BaseException as error:
+      dev.error_state = RuntimeError(f"QCOM submission was interrupted with unknown acceptance state: {type(error).__name__}")
+      raise
 
   def exec(self, prg:QCOMProgram, args_state:QCOMArgsState, global_size, local_size):
     self.bind_args_state(args_state)
@@ -376,6 +384,8 @@ class QCOMDevice(HCQCompiled):
 
     super().__init__(device, QCOMAllocator(self), [QCOMCLRenderer, IR3Renderer], QCOMProgram, QCOMSignal, functools.partial(QCOMComputeQueue, self),
                      arch=("a%d%d%d" + (",IMAGE_PITCH_ALIGNMENT=64" if IMAGE else "")) % self.gpu_id)
+    # Virtual KGSL retires a submission synchronously, so it cannot model HCQGraph's submit-before-kick protocol.
+    if DEV.target("QCOM").interface.startswith("MOCK"): self.graph = None
 
   def _gpu_alloc(self, size:int, flags:int=0, uncached=False, fill_zeroes=False) -> HCQBuffer:
     flags |= flag("KGSL_MEMALIGN", alignment_hint:=12) | kgsl.KGSL_MEMFLAGS_USE_CPU_MAP
