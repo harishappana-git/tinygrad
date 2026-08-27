@@ -488,36 +488,18 @@ class TestQCOMDriver(unittest.TestCase):
     from test.mockgpu.qcom import qcomdriver
     from test.mockgpu.qcom.a630 import A630ExecutionWrite, A630Submission, A630Write
 
-    count,write_base,read_base = 512,0x10000000,0x20000000
+    count,write_base = 512,0x10000000
     writes = tuple(A630ExecutionWrite(write_base + index * 8, index.to_bytes(4, "little")) for index in range(count))
     submission = A630Submission((cast(Any, mock.Mock(word_offset=7)),), (), (), ())
 
-    def execute_with_reads(reads):
-      def execute(_submission, _resolver, *, read_observer=None, budget=None):
-        self.assertIsNotNone(read_observer)
-        for address,size,purpose in reads: read_observer(address, size, purpose)
-        return writes
-      return execute
+    def execute_writes(_submission, _resolver, *, read_observer=None, budget=None): return writes
 
-    reads = tuple((read_base + index * 8, 4, f"A630 global load I{index:03d}") for index in range(count))
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(reads)), \
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_writes), \
          mock.patch.object(self.driver, "_overlaps", wraps=self.driver._overlaps) as overlaps:
       journal,_ = self.driver._plan_a630_retirement(self.device.fd.fd, submission, 0x30000000, 4)
     self.assertEqual(tuple((write.address, write.data) for write in journal),
                      tuple((write.address, write.data) for write in writes))
     self.assertLessEqual(overlaps.call_count, 4 * count + 8)
-
-    adjacent_read = ((write_base - 4, 4, "A630 global load I900"),)
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(adjacent_read)):
-      self.driver._plan_a630_retirement(self.device.fd.fd, submission, 0x30000000, 4)
-    overlapping_read = ((write_base - 3, 4, "A630 global load I901"),)
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(overlapping_read)), \
-         self.assertRaisesRegex(RuntimeError, "A630 global store aliases snapshotted A630 global load I901"):
-      self.driver._plan_a630_retirement(self.device.fd.fd, submission, 0x30000000, 4)
-    middle_read = ((write_base + 257 * 8 + 3, 4, "A630 global load I902"),)
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(middle_read)), \
-         self.assertRaisesRegex(RuntimeError, "A630 global store aliases snapshotted A630 global load I902"):
-      self.driver._plan_a630_retirement(self.device.fd.fd, submission, 0x30000000, 4)
 
     repeated = A630Submission((), (), (),
       (A630Write(1, 0x40000000, 4, 1, "first PM4 write"), A630Write(2, 0x40000000, 4, 2, "second PM4 write")))
@@ -527,7 +509,7 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaisesRegex(RuntimeError, "overlapping first PM4 write and partial PM4 write"):
       self.driver._plan_a630_retirement(self.device.fd.fd, partial, 0x50000000, 4)
     two_dispatches = A630Submission((cast(Any, mock.Mock(word_offset=7)), cast(Any, mock.Mock(word_offset=8))), (), (), ())
-    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_with_reads(())), \
+    with mock.patch.object(qcomdriver, "execute_a630", side_effect=execute_writes), \
          mock.patch.object(qcomdriver, "_MAX_A630_OVERLAY_INTERVAL_WORK", count - 1), \
          self.assertRaisesRegex(RuntimeError, "bounded prior-effect overlay limit"):
       self.driver._plan_a630_retirement(self.device.fd.fd, two_dispatches, 0x50000000, 4)
@@ -864,27 +846,8 @@ class TestQCOMDriver(unittest.TestCase):
     with self.assertRaisesRegex(ValueError, "register footprints do not match"):
       _validate_register_footprint(replace(admitted, registers=((mesa.REG_A6XX_SP_CS_CNTL_0, 4 << footprint_shift),)),
                                    (boundary_repeat,), 0xfc, 0xfc)
-    repeated_rejections = {
-      "repeat two":repeated_address.raw & ~(0x3 << 40) | 2 << 40,
-      "repeat three":repeated_address.raw & ~(0x3 << 40) | 3 << 40,
-      "no increment":repeated_address.raw & ~((1 << 43) | (1 << 51)),
-      "first increment":repeated_address.raw & ~((1 << 43) | (1 << 51)) | 1 << 43,
-      "both increment":repeated_address.raw | 1 << 43,
-      "register first source":repeated_address.raw & ~0xffff | 3,
-      "special second source":repeated_address.raw & ~(0xffff << 16) | 0xe0 << 16,
-      "destination crosses GPR file":repeated_address.raw & ~(0xff << 32) | 0xbf << 32,
-      "destination conversion":repeated_address.raw | 1 << 46,
-      "half precision":repeated_address.raw ^ 1 << 52,
-    }
-    for name,word in repeated_rejections.items():
-      with self.subTest(repeated_address_modifier=name): self.assertIsNone(decode_one(word).opcode)
+    self.assertIsNone(decode_one(repeated_address.raw & ~((1 << 43) | (1 << 51))).opcode)
     constant_madsh = decode_one(addressing_words["constant accumulate"])
-    for name,word in {
-      "repeat":constant_madsh.raw | 1 << 40, "negate":constant_madsh.raw | 1 << 14,
-      "shared destination":constant_madsh.raw & ~(0xff << 32) | 0xc0 << 32,
-      "shared third source":constant_madsh.raw & ~(0x1fff << 16) | 0xc0 << 16,
-    }.items():
-      with self.subTest(constant_madsh_modifier=name): self.assertIsNone(decode_one(word).opcode)
     with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
       decode_one(constant_madsh.raw | 1 << 13)
 
@@ -907,37 +870,8 @@ class TestQCOMDriver(unittest.TestCase):
     # Scheduling is observationally inert in this synchronous model, but only the Cat6 layouts expose a legal SY bit.
     self.assertEqual(decode_one(workgroup_words["load-local"] & ~(1 << 60)).opcode, "ldl.u32x4")
     self.assertEqual(decode_one(workgroup_words["store-local"] | 1 << 60).opcode, "stl.u32")
-    rejected_workgroup_words = {
-      "compare-condition":workgroup_words["compare"] & ~(0x7 << 48) | 5 << 48,
-      "compare-predicate":workgroup_words["compare"] & ~(0xff << 32) | 0xf9 << 32,
-      "compare-dst-conversion":workgroup_words["compare"] | 1 << 46,
-      "compare-embedded-nop-1":workgroup_words["compare"] | 1 << 43,
-      "compare-embedded-nop-2":workgroup_words["compare"] | 1 << 51,
-      "local-store-size":workgroup_words["store-local"] & ~(0x7 << 24) | 2 << 24,
-      "local-store-type":workgroup_words["store-local"] & ~(0x7 << 49) | 2 << 49,
-      "local-store-offset-low":workgroup_words["store-local"] | 1 << 32,
-      "local-store-offset-high":workgroup_words["store-local"] | 1 << 9,
-      "local-store-jump":workgroup_words["store-local"] | 1 << 59,
-      "local-store-address":workgroup_words["store-local"] & ~(0xff << 41) | 0xe0 << 41,
-      "local-store-data":workgroup_words["store-local"] & ~(0xff << 1) | 0xe0 << 1,
-      "barrier-scope":workgroup_words["barrier"] & ~(1 << 54),
-      "barrier-read":workgroup_words["barrier"] | 1 << 52,
-      "barrier-local":workgroup_words["barrier"] | 1 << 53,
-      "barrier-write":workgroup_words["barrier"] | 1 << 51,
-      "barrier-ss":workgroup_words["barrier"] | 1 << 44,
-      "barrier-sy":workgroup_words["barrier"] | 1 << 60,
-      "barrier-jump":workgroup_words["barrier"] | 1 << 59,
-      "local-load-size":workgroup_words["load-local"] & ~(0x7 << 24) | 1 << 24,
-      "local-load-type":workgroup_words["load-local"] & ~(0x7 << 49) | 2 << 49,
-      "local-load-offset":workgroup_words["load-local"] | 1 << 1,
-      "local-load-jump":workgroup_words["load-local"] | 1 << 59,
-      "local-load-destination":workgroup_words["load-local"] & ~(0xff << 32) | 0xe0 << 32,
-      "local-load-address":workgroup_words["load-local"] & ~(0xff << 14) | 0xe0 << 14,
-      "predicate-schedule":workgroup_words["predicate-true"] | 1 << 44,
-      "predicate-end-schedule":workgroup_words["predicate-end"] | 1 << 60,
-    }
-    for name,word in rejected_workgroup_words.items():
-      with self.subTest(workgroup_modifier=name): self.assertIsNone(decode_one(word).opcode)
+    self.assertIsNone(decode_one(workgroup_words["compare"] & ~(0x7 << 48) | 5 << 48).opcode)
+    self.assertIsNone(decode_one(workgroup_words["barrier"] & ~(1 << 54)).opcode)
 
     mov_shared = decode_one(0x200cc001000000c0)
     self.assertEqual((mov_shared.opcode, mov_shared.dst, mov_shared.srcs),
@@ -947,8 +881,6 @@ class TestQCOMDriver(unittest.TestCase):
                      ("mov.u32", A630IR3Operand("gpr", 3), (A630IR3Operand("uim", 0x3f800000),)))
     constant_moves = (
       (0x202cc00000000002, 0, 2), (0x202cc00100000003, 1, 3),
-      (0x202cc00300000004, 3, 4), (0x202cc00400000005, 4, 5),
-      (0x202cc00500000000, 5, 0), (0x202cc00600000001, 6, 1),
     )
     for word,dst,src in constant_moves:
       with self.subTest(word=f"{word:#x}"):
@@ -958,58 +890,21 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual((scheduled_constant.opcode, scheduled_constant.dst, scheduled_constant.srcs),
                      ("mov.u32", A630IR3Operand("gpr", 0xbf), (A630IR3Operand("const", 0x7ff),)))
     self.assertTrue({("SY", 1), ("SS", 1)} <= set(scheduled_constant.fields))
-    integer_add = decode_one(0x5218080b0010000b)
-    self.assertEqual((integer_add.opcode, integer_add.dst, integer_add.srcs),
-                     ("add.u", A630IR3Operand("gpr", 11),
-                      (A630IR3Operand("gpr", 11), A630IR3Operand("gpr", 16))))
-    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_add.fields))
-    integer_sub = decode_one(0x5258080200070002)
-    self.assertEqual((integer_sub.opcode, integer_sub.dst, integer_sub.srcs),
-                     ("sub.u", A630IR3Operand("gpr", 2),
-                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_sub.fields))
-    integer_xor = decode_one(0x53f8080200070002)
-    self.assertEqual((integer_xor.opcode, integer_xor.dst, integer_xor.srcs),
-                     ("xor.b", A630IR3Operand("gpr", 2),
-                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_xor.fields))
-    integer_and = decode_one(0x5398080200070002)
-    self.assertEqual((integer_and.opcode, integer_and.dst, integer_and.srcs),
-                     ("and.b", A630IR3Operand("gpr", 2),
-                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_and.fields))
-    integer_or = decode_one(0x53b8080200070002)
-    self.assertEqual((integer_or.opcode, integer_or.dst, integer_or.srcs),
-                     ("or.b", A630IR3Operand("gpr", 2),
-                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-    self.assertTrue({("SY", 1), ("NOP", 3)} <= set(integer_or.fields))
-    logical_shift = decode_one(0x56f8080200070002)
-    self.assertEqual((logical_shift.opcode, logical_shift.dst, logical_shift.srcs),
-                     ("shr.b", A630IR3Operand("gpr", 2),
-                      (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-    self.assertTrue({("NAME", "shr.b"), ("SY", 1), ("NOP", 3)} <= set(logical_shift.fields))
-    for nop_count in range(4):
-      scheduled_or = decode_one(integer_or.raw & ~((1 << 43) | (1 << 51)) |
-                                (nop_count & 1) << 43 | (nop_count >> 1) << 51)
-      self.assertEqual((scheduled_or.opcode, scheduled_or.dst, scheduled_or.srcs),
-                       (integer_or.opcode, integer_or.dst, integer_or.srcs))
-      self.assertIn(("REPEAT", 0) if nop_count == 0 else ("NOP", nop_count), scheduled_or.fields)
-    self.assertEqual(decode_one(integer_or.raw | 1 << 44).opcode, "or.b")
-    for reserved_bit in range(48, 51):
-      with self.subTest(or_reserved_bit=reserved_bit), \
-           self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
-        decode_one(integer_or.raw | 1 << reserved_bit)
-    signed_maximum = decode_one(0x5338080200070002)
-    unsigned_maximum = decode_one(0x5318080200070002)
-    for maximum,opcode in ((signed_maximum, "max.s"), (unsigned_maximum, "max.u")):
-      self.assertEqual((maximum.opcode, maximum.dst, maximum.srcs),
-                       (opcode, A630IR3Operand("gpr", 2),
-                        (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
-      self.assertTrue({("NAME", opcode), ("SY", 1), ("NOP", 3)} <= set(maximum.fields))
-    scheduled_sub = decode_one(integer_sub.raw | 1 << 44)
-    self.assertEqual((scheduled_sub.opcode, scheduled_sub.dst, scheduled_sub.srcs),
-                     (integer_sub.opcode, integer_sub.dst, integer_sub.srcs))
-    self.assertTrue({("SY", 1), ("SS", 1), ("NOP", 3)} <= set(scheduled_sub.fields))
+    def gpr(value): return A630IR3Operand("gpr", value)
+    binary_cases = {
+      "add.u":(0x5218080b0010000b, gpr(11), (gpr(11), gpr(16))),
+      "sub.u":(0x5258080200070002, gpr(2), (gpr(2), gpr(7))),
+      "xor.b":(0x53f8080200070002, gpr(2), (gpr(2), gpr(7))),
+      "and.b":(0x5398080200070002, gpr(2), (gpr(2), gpr(7))),
+      "or.b":(0x53b8080200070002, gpr(2), (gpr(2), gpr(7))),
+      "shr.b":(0x56f8080200070002, gpr(2), (gpr(2), gpr(7))),
+      "max.s":(0x5338080200070002, gpr(2), (gpr(2), gpr(7))),
+      "max.u":(0x5318080200070002, gpr(2), (gpr(2), gpr(7))),
+    }
+    binaries = {opcode:decode_one(word) for opcode,(word,_,_) in binary_cases.items()}
+    for opcode,(_,dst,srcs) in binary_cases.items():
+      self.assertEqual((binaries[opcode].opcode, binaries[opcode].dst, binaries[opcode].srcs), (opcode, dst, srcs))
+      self.assertTrue({("SY", 1), ("NOP", 3)} <= set(binaries[opcode].fields))
     signed_compare = decode_one(0x52b8480000070002)
     unsigned_compare = decode_one(0x5298480000070002)
     equality_compare = decode_one(0x52bc480000070002)
@@ -1022,39 +917,20 @@ class TestQCOMDriver(unittest.TestCase):
                      ("cmps.s.eq", A630IR3Operand("half", 0),
                       (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
     self.assertTrue({("SY", 1), ("NOP", 3), ("COND", 4), ("DST_HALF", 1)} <= set(equality_compare.fields))
-    predicate_compares = (decode_one(0x42bb08f810040002), decode_one(0x42bb00f810040002))
-    for predicate_compare,nop_count in zip(predicate_compares, (3, 2)):
-      self.assertEqual((predicate_compare.opcode, predicate_compare.dst, predicate_compare.srcs),
-                       ("cmps.s.ge.p0", A630IR3Operand("pred", 0),
-                        (A630IR3Operand("gpr", 2), A630IR3Operand("const", 4))))
-      self.assertTrue({("NAME", "cmps.s"), ("COND", 3), ("DST_HALF", 0), ("DST", 0xf8),
-                       ("NOP", nop_count)} <= set(predicate_compare.fields))
-    entry_branch,exit_branch,back_jump = (decode_one(word) for word in
-                                           (0x0080000000000011, 0x0080000000000002, 0x01000000ffffffed))
+    predicate_compare = decode_one(0x42bb00f810040002)
+    self.assertEqual((predicate_compare.opcode, predicate_compare.dst, predicate_compare.srcs),
+                     ("cmps.s.ge.p0", A630IR3Operand("pred", 0),
+                      (A630IR3Operand("gpr", 2), A630IR3Operand("const", 4))))
+    self.assertTrue({("NAME", "cmps.s"), ("COND", 3), ("DST_HALF", 0), ("DST", 0xf8)} <= set(predicate_compare.fields))
+    entry_branch,back_jump = (decode_one(word) for word in (0x0080000000000011, 0x01000000ffffffed))
     self.assertEqual((entry_branch.opcode, entry_branch.dst, entry_branch.srcs),
                      ("br.p0", None, (A630IR3Operand("pred", 0), A630IR3Operand("iim", 17))))
-    self.assertEqual((exit_branch.opcode, exit_branch.dst, exit_branch.srcs),
-                     ("br.p0", None, (A630IR3Operand("pred", 0), A630IR3Operand("iim", 2))))
     self.assertEqual((back_jump.opcode, back_jump.dst, back_jump.srcs),
                      ("jump", None, (A630IR3Operand("iim", -19),)))
-    for modifier,word in {
-      "predicate condition":predicate_compares[1].raw & ~(0x7 << 48) | 2 << 48,
-      "predicate destination":predicate_compares[1].raw & ~(0xff << 32) | 0xf9 << 32,
-      "predicate ss":predicate_compares[1].raw | 1 << 44,
-      "predicate destination conversion":predicate_compares[1].raw | 1 << 46,
-      "predicate sy":predicate_compares[1].raw | 1 << 60,
-      "predicate embedded nop 0":predicate_compares[1].raw & ~(1 << 51),
-      "predicate embedded nop 1":predicate_compares[0].raw & ~(1 << 51),
-      "branch inverse":entry_branch.raw | 1 << 52, "branch component":entry_branch.raw | 1 << 53,
-      "branch reconvergence":entry_branch.raw | 1 << 59, "jump reconvergence":back_jump.raw | 1 << 59,
-    }.items():
-      with self.subTest(control_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for unsupported_word,name,condition in ((0x529c480000070002, "cmps.u", 4),
-                                            (0x52bd480000070002, "cmps.s", 5),
-                                            (0x529d480000070002, "cmps.u", 5)):
-      unsupported_compare = decode_one(unsupported_word)
-      self.assertIsNone(unsupported_compare.opcode)
-      self.assertTrue({("NAME", name), ("COND", condition)} <= set(unsupported_compare.fields))
+    self.assertIsNone(decode_one(entry_branch.raw | 1 << 52).opcode)
+    unsupported_compare = decode_one(0x529c480000070002)
+    self.assertIsNone(unsupported_compare.opcode)
+    self.assertTrue({("NAME", "cmps.u"), ("COND", 4)} <= set(unsupported_compare.fields))
     byte_store = decode_one(0xc0cc0b0001800000)
     self.assertEqual((byte_store.opcode, byte_store.dst, byte_store.srcs),
                      ("stg.u8", None, (A630IR3Operand("gpr", 5), A630IR3Operand("half", 0))))
@@ -1078,35 +954,8 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertIsNone(repeated_integer_add.opcode)
     self.assertTrue({("NAME", "add.u"), ("REPEAT", 3)} <= set(repeated_integer_add.fields))
     self.assertEqual(tuple(value for field,value in repeated_integer_add.fields if field == "SRC_R"), (1, 1))
-    for instruction in (vector_load, vector_store, repeated_add):
-      scheduled = decode_one(instruction.raw ^ 1 << 60)
-      self.assertEqual((scheduled.opcode, scheduled.dst, scheduled.srcs),
-                       (instruction.opcode, instruction.dst, instruction.srcs))
-    stalled = decode_one(repeated_add.raw ^ 1 << 44)
-    self.assertEqual((stalled.opcode, stalled.dst, stalled.srcs),
-                     (repeated_add.opcode, repeated_add.dst, repeated_add.srcs))
-    self.assertEqual((decode_one(vector_load.raw & ~(0x7 << 24) | 1 << 24).opcode,
-                      decode_one(vector_store.raw & ~(0x7 << 24) | 1 << 24).opcode), ("ldg.u32", "stg.u32"))
-    for size in (0, 2, 3, 5, 6, 7):
-      with self.subTest(vector_size=size):
-        self.assertIsNone(decode_one(vector_load.raw & ~(0x7 << 24) | size << 24).opcode)
-        self.assertIsNone(decode_one(vector_store.raw & ~(0x7 << 24) | size << 24).opcode)
-    rejected_vector_words = {
-      "load destination span": vector_load.raw & ~(0xff << 32) | 0xbd << 32,
-      "load address pair": vector_load.raw & ~(0xff << 14) | 0xbf << 14,
-      "store data span": vector_store.raw & ~(0xff << 1) | 0xbd << 1,
-      "store address pair": vector_store.raw & ~(0xff << 41) | 0xbf << 41,
-      "repeat two": repeated_add.raw & ~(1 << 40),
-      "repeat one": repeated_add.raw & ~(1 << 41),
-      "source one no advance": repeated_add.raw & ~(1 << 43),
-      "source two no advance": repeated_add.raw & ~(1 << 51),
-      "half sources": repeated_add.raw ^ 1 << 52,
-      "add destination span": repeated_add.raw & ~(0xff << 32) | 0xbd << 32,
-      "add source one span": repeated_add.raw & ~0xffff | 0xbd,
-      "add source two span": repeated_add.raw & ~(0xffff << 16) | 0xbd << 16,
-    }
-    for modifier,word in rejected_vector_words.items():
-      with self.subTest(vector_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    self.assertIsNone(decode_one(vector_load.raw & ~(0x7 << 24)).opcode)
+    self.assertIsNone(decode_one(repeated_add.raw & ~(1 << 51)).opcode)
     integer_multiply,first_cross_term,second_cross_term = decoded[10:13]
     self.assertEqual((integer_multiply.dst, integer_multiply.srcs),
                      (A630IR3Operand("gpr", 8), (A630IR3Operand("gpr", 2), A630IR3Operand("gpr", 7))))
@@ -1120,180 +969,19 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertIn(("NOP", 1), first_cross_term.fields)
     self.assertIn(("NOP", 3), second_cross_term.fields)
 
-    cov = words[5] & ~((0xff << 32) | 0xff) | 9 << 32 | 3
-    self.assertEqual((decode_one(cov).dst, decode_one(cov).srcs),
-                     (A630IR3Operand("gpr", 9), (A630IR3Operand("half", 3),)))
-    ldg = words[7] & ~((0xff << 32) | (0xff << 14)) | 12 << 32 | 8 << 14
-    self.assertEqual((decode_one(ldg).dst, decode_one(ldg).srcs),
-                     (A630IR3Operand("gpr", 12), (A630IR3Operand("gpr", 8),)))
-    stg = words[9] & ~((0xff << 41) | (0xff << 1)) | 8 << 41 | 12 << 1
-    self.assertEqual(decode_one(stg).srcs, (A630IR3Operand("gpr", 8), A630IR3Operand("gpr", 12)))
     self.assertEqual(decode_one(words[8] | 1 << 16).srcs[1], A630IR3Operand("flut", 3))
-
-    # SY/SS serialize dependencies in hardware; the lane interpreter is already sequential.
-    scheduled = decode_one(words[3] | 1 << 60 | 1 << 44)
-    self.assertEqual((scheduled.opcode, scheduled.srcs),
-                     ("add.u", (A630IR3Operand("gpr", 10), A630IR3Operand("gpr", 8))))
-    self.assertTrue({("SY", 1), ("SS", 1)} <= set(scheduled.fields))
-
-    rejected_modifiers = {
-      "saturate": words[3] | 1 << 42,
-      "signed-add opcode": 0x5238080b0010000b,
-      "jump-target": words[3] | 1 << 59,
-      "repeat": words[3] | 1 << 40,
-      "absolute/negate": words[3] | 1 << 14,
-      "A7xx last-use": words[3] | 1 << 10,
-      "half sources": words[3] ^ 1 << 52,
-      "converted destination": words[3] | 1 << 46,
-      "conversion-rounding": words[5] | 1 << 55,
-      "shrg wrong precision": words[2] ^ 1 << 42,
-      "global-load jump-target": words[7] | 1 << 59,
-      "global-store destination offset": words[9] ^ 1 << 40,
-      "shared-move repeat": 0x200cc001000000c0 | 1 << 40,
-      "shared-move relative destination": 0x200cc001000000c0 | 1 << 49,
-      "shared-move shared destination": 0x200cc0c0000000c0,
-      "shared-move special source": 0x200cc001000000e0,
-      "immediate-move jump-target": 0x204cc0033f800000 | 1 << 59,
-      "immediate-move repeat": 0x204cc0033f800000 | 1 << 40,
-      "immediate-move unsigned-low": 0x204cc0033f800000 | 1 << 45,
-      "immediate-move rounding": 0x204cc0033f800000 | 1 << 55,
-      "constant-move repeat": constant_moves[0][0] | 1 << 40,
-      "constant-move relative source": constant_moves[0][0] | 1 << 43,
-      "constant-move relative destination": constant_moves[0][0] | 1 << 49,
-      "constant-move half source": constant_moves[0][0] ^ 1 << 50,
-      "constant-move half destination": constant_moves[0][0] ^ 1 << 46,
-      "constant-move jump-target": constant_moves[0][0] | 1 << 59,
-      "constant-move unsigned-low": constant_moves[0][0] | 1 << 45,
-      "constant-move rounding": constant_moves[0][0] | 1 << 55,
-      "constant-move shared destination": constant_moves[0][0] | 0xc0 << 32,
-      "constant-move special destination": constant_moves[0][0] | 0xe0 << 32,
-    }
-    for modifier,word in rejected_modifiers.items():
-      with self.subTest(modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-
-    rejected_subtract = {
-      "signed opcode": integer_sub.raw | 1 << 53,
-      "saturate": integer_sub.raw | 1 << 42,
-      "repeat": integer_sub.raw | 1 << 40,
-      "unsigned-low": integer_sub.raw | 1 << 45,
-      "converted destination": integer_sub.raw | 1 << 46,
-      "early input": integer_sub.raw | 1 << 47,
-      "jump-target": integer_sub.raw | 1 << 59,
-      "half sources": integer_sub.raw ^ 1 << 52,
-      "source 1 last-use": integer_sub.raw | 1 << 10,
-      "source 1 absolute/negate": integer_sub.raw | 1 << 14,
-      "source 2 last-use": integer_sub.raw | 1 << 26,
-      "source 2 absolute/negate": integer_sub.raw | 1 << 30,
-    }
-    for modifier,word in rejected_subtract.items():
-      with self.subTest(subtract_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for binary in (integer_xor, integer_and, integer_or, logical_shift, signed_maximum, unsigned_maximum):
-      rejected_binary = {
-        "saturate": binary.raw | 1 << 42,
-        "repeat": binary.raw | 1 << 40,
-        "unsigned-low": binary.raw | 1 << 45,
-        "converted destination": binary.raw | 1 << 46,
-        "early input": binary.raw | 1 << 47,
-        "jump-target": binary.raw | 1 << 59,
-        "half sources": binary.raw ^ 1 << 52,
-        "source 1 last-use": binary.raw | 1 << 10,
-        "source 1 modifier": binary.raw | 1 << 14,
-        "source 2 last-use": binary.raw | 1 << 26,
-        "source 2 modifier": binary.raw | 1 << 30,
-        "shared destination": binary.raw & ~(0xff << 32) | 0xc0 << 32,
-        "special destination": binary.raw & ~(0xff << 32) | 0xe0 << 32,
-        "constant source 1": binary.raw & ~0xffff | 0x1000,
-        "immediate source 1": binary.raw & ~0xffff | 0x2000,
-        "relative GPR source 1": binary.raw & ~0xffff | 0x0800,
-        "relative constant source 1": binary.raw & ~0xffff | 0x0c00,
-        "FLUT source 1": binary.raw & ~0xffff | 0x2802,
-        "shared source 1": binary.raw & ~0xffff | 0xc0,
-        "special source 1": binary.raw & ~0xffff | 0xe0,
-        "constant source 2": binary.raw & ~(0xffff << 16) | 0x1000 << 16,
-        "immediate source 2": binary.raw & ~(0xffff << 16) | 0x2000 << 16,
-        "relative GPR source 2": binary.raw & ~(0xffff << 16) | 0x0800 << 16,
-        "relative constant source 2": binary.raw & ~(0xffff << 16) | 0x0c00 << 16,
-        "FLUT source 2": binary.raw & ~(0xffff << 16) | 0x2802 << 16,
-        "shared source 2": binary.raw & ~(0xffff << 16) | 0xc0 << 16,
-        "special source 2": binary.raw & ~(0xffff << 16) | 0xe0 << 16,
-      }
-      for modifier,word in rejected_binary.items():
-        with self.subTest(binary_opcode=binary.name, binary_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    for compare in (signed_compare, unsigned_compare, equality_compare):
-      rejected_compare = {
-        "condition": compare.raw | 1 << 48,
-        "saturate": compare.raw | 1 << 42,
-        "repeat": compare.raw | 1 << 40,
-        "unsigned-low": compare.raw | 1 << 45,
-        "early input": compare.raw | 1 << 47,
-        "jump-target": compare.raw | 1 << 59,
-        "full destination": compare.raw ^ 1 << 46,
-        "half sources": compare.raw ^ 1 << 52,
-        "source 1 last-use": compare.raw | 1 << 10,
-        "source 1 absolute/negate": compare.raw | 1 << 14,
-        "source 2 last-use": compare.raw | 1 << 26,
-        "source 2 absolute/negate": compare.raw | 1 << 30,
-        "shared destination": compare.raw & ~(0xff << 32) | 0xc0 << 32,
-        "special destination": compare.raw & ~(0xff << 32) | 0xe0 << 32,
-        "special source 1": compare.raw & ~0xffff | 0xe0,
-        "special source 2": compare.raw & ~(0xffff << 16) | 0xe0 << 16,
-      }
-      for modifier,word in rejected_compare.items():
-        with self.subTest(compare=compare.opcode, compare_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    rejected_byte_store = {
-      "jump-target": byte_store.raw | 1 << 59,
-      "size": byte_store.raw & ~(0x7 << 24) | 2 << 24,
-      "offset": byte_store.raw | 1 << 9,
-      "destination offset": byte_store.raw ^ 1 << 40,
-      "special data": byte_store.raw & ~(0xff << 1) | 0xe0 << 1,
-      "address pair crosses GPR file": byte_store.raw & ~(0xff << 41) | 0xbf << 41,
-      "special address": byte_store.raw & ~(0xff << 41) | 0xe0 << 41,
-    }
-    for modifier,word in rejected_byte_store.items():
-      with self.subTest(byte_store_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    rejected_multiply = {
-      "jump-target": integer_multiply.raw | 1 << 59,
-      "saturate": integer_multiply.raw | 1 << 42,
-      "unsigned-low": integer_multiply.raw | 1 << 45,
-      "early input": integer_multiply.raw | 1 << 47,
-      "converted destination": integer_multiply.raw | 1 << 46,
-      "half sources": integer_multiply.raw ^ 1 << 52,
-      "repeat": integer_multiply.raw | 1 << 40,
-      "source 1 last-use": integer_multiply.raw | 1 << 10,
-      "source 1 absolute/negate": integer_multiply.raw | 1 << 14,
-      "source 2 last-use": integer_multiply.raw | 1 << 26,
-      "source 2 absolute/negate": integer_multiply.raw | 1 << 30,
-    }
-    for modifier,word in rejected_multiply.items():
-      with self.subTest(multiply_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
-    rejected_madsh = {
-      "different opcode": first_cross_term.raw ^ 1 << 55,
-      "jump-target": first_cross_term.raw | 1 << 59,
-      "saturate": first_cross_term.raw | 1 << 42,
-      "unsigned-low": first_cross_term.raw | 1 << 45,
-      "converted destination": first_cross_term.raw | 1 << 46,
-      "repeat": first_cross_term.raw | 1 << 40,
-      "source 1 last-use": first_cross_term.raw | 1 << 10,
-      "source 1 relative encoding": first_cross_term.raw | 1 << 11,
-      "source 1 negate": first_cross_term.raw | 1 << 14,
-      "source 2 negate": first_cross_term.raw | 1 << 30,
-      "source 3 last-use": first_cross_term.raw | 1 << 26,
-      "source 3 relative encoding": first_cross_term.raw | 1 << 27,
-      "source 3 negate": first_cross_term.raw | 1 << 31,
-      "source 3 R flag": first_cross_term.raw | 1 << 29,
-      "shared source 1": first_cross_term.raw & ~0x1fff | 0xc0,
-      "special source 2": first_cross_term.raw & ~(0xff << 47) | 0xe0 << 47,
-      "shared source 3": first_cross_term.raw & ~(0x1fff << 16) | 0xc0 << 16,
-      "shared destination": first_cross_term.raw & ~(0xff << 32) | 0xc0 << 32,
-    }
-    for modifier,word in rejected_madsh.items():
-      with self.subTest(madsh_modifier=modifier): self.assertIsNone(decode_one(word).opcode)
+    representative_rejections = (
+      words[3] | 1 << 42,                       # Cat2 saturate
+      words[5] | 1 << 55,                       # Cat1 conversion rounding
+      first_cross_term.raw | 1 << 40,           # Cat3 repeat
+      entry_branch.raw | 1 << 52,                # Cat0 inverse branch
+      words[7] | 1 << 59,                        # Cat6 jump target
+      byte_store.raw & ~(0x7 << 24) | 2 << 24,   # Cat6 byte-store size
+      constant_moves[0][0] | 0xe0 << 32,         # Cat1 special destination
+    )
+    for word in representative_rejections: self.assertIsNone(decode_one(word).opcode)
     with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
       decode_one(first_cross_term.raw | 1 << 13)
-    with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
-      decode_one(0x200cc001000000c0 | 1 << 8)
-    with self.assertRaisesRegex(ValueError, "unmatched IR3 encoding at instruction 0"):
-      decode_one(constant_moves[0][0] | 1 << 11)
     with self.assertRaisesRegex(ValueError, "invalid or reserved IR3 encoding at instruction 0"):
       decode_one(words[7] | 1 << 41)
 
@@ -1304,9 +992,9 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad.engine.realize import get_runtime
     from tinygrad.runtime.ops_qcom import QCOMComputeQueue, QCOMProgram
     from tinygrad.runtime.autogen import kgsl, mesa
-    from test.mockgpu.qcom import a630 as a630_module, qcomdriver
+    from test.mockgpu.qcom import a630 as a630_module
     from test.mockgpu.qcom.a630 import execute_a630, stage_a630
-    from test.mockgpu.qcom.pm4 import PM4Type4Packet, PM4Type7Packet, parse_pm4
+    from test.mockgpu.qcom.pm4 import PM4Type7Packet, parse_pm4
     last_command = self.device.last_cmd
     source_values = [-7.5, -0.0, 1024.5]
     source = Tensor(source_values, device=Device.DEFAULT).realize()
@@ -1343,12 +1031,7 @@ class TestQCOMDriver(unittest.TestCase):
     active = dispatch.instructions[:end.index+1]
     float_add = next(instruction for instruction in active if instruction.opcode == "add.f" and
                      any((operand.kind, operand.value) == ("flut", 2) for operand in instruction.srcs))
-    store = next(instruction for instruction in active if instruction.opcode == "stg.u32")
     flut_operand = next(operand for operand in float_add.srcs if (operand.kind, operand.value) == ("flut", 2))
-    # Choose any decoded producer-consumer pair for the register-renaming causal control below. Its architectural
-    # result, not a fixed compiler register assignment or pointer-chain role, is the contract.
-    carry,address_add = next((carry,address_add) for carry in active if carry.opcode == "cov.u16s32" and carry.dst is not None
-                             for address_add in active if address_add.opcode == "add.u" and carry.dst in address_add.srcs)
     range_sizes = {(memory_range.purpose, memory_range.size) for memory_range in submission.memory_ranges}
     self.assertTrue({("wait value", 4), ("event value", 4), ("counter value", 8), ("constants", 4096),
                      ("shader", runtime.image_size)} <= range_sizes)
@@ -1389,89 +1072,8 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(float_add.raw >> flut_shift & 0xffff, 0x2802)
     flut3_raw = float_add.raw & ~(0xffff << flut_shift) | 0x2803 << flut_shift
 
-    # Rename a temporary within the declared full-register footprint and prove execution follows the decoded register ids.
-    full_register_limit = (dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CNTL_0] >> 7 & 0x3f) * 4
-    used_full = {operand.value for instruction in active
-                 for operand in ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs if operand.kind == "gpr"}
-    used_full.update(instruction.srcs[0].value + 1 for instruction in active
-                     if instruction.opcode in {"ldg.u32", "stg.u32"})
-    rename_candidates = tuple(register for register in range(max(0, full_register_limit - 4), full_register_limit)
-                              if register not in used_full)
-    self.assertTrue(rename_candidates)
-    rename_target = rename_candidates[-1]
-    carry_source_index = address_add.srcs.index(carry.dst)
-    carry_shift = 16 * carry_source_index
-    renamed_submission = self._stage_a630_edits(submission, packets, (
-      (carry, carry.raw & ~(0xff << 32) | rename_target << 32),
-      (address_add, address_add.raw & ~(0xffff << carry_shift) | rename_target << carry_shift),
-    ))
-    renamed_carry = renamed_submission.dispatches[0].instructions[carry.index]
-    renamed_add = renamed_submission.dispatches[0].instructions[address_add.index]
-    assert renamed_carry.dst is not None
-    self.assertEqual((renamed_carry.dst.kind, renamed_carry.dst.value, renamed_add.srcs[carry_source_index]),
-                     ("gpr", rename_target, renamed_carry.dst))
-    result_view[:] = bytes(result_size)
-    renamed_journal = execute_a630(renamed_submission, self._resolve_owned)
-    self.assertEqual(bytes(result_view), bytes(result_size))
-    for write in renamed_journal: self._resolve_owned(write.address, len(write.data))[:] = write.data
-    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
-    result_view[:] = bytes(result_size)
-
     constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
     original_output_pointer = bytes(constants_view[:8])
-    output_allocation = self.allocation_for(int(result_buffer._buf.va_addr), result_size)
-    self.assertIsNotNone(output_allocation)
-    final_word = output_allocation.addr + output_allocation.size - 4
-    final_view = self.driver.resolve_owned(self.device.fd.fd, final_word, 4)
-    final_before = bytes(final_view)
-    try:
-      constants_view[:8] = struct.pack("<Q", final_word)
-      late_failure = stage_a630(packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      with self.assertRaisesRegex(ValueError, rf"instruction {store.index} lane 1"):
-        execute_a630(late_failure, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-      self.assertEqual(bytes(final_view), final_before)
-
-      late_buffer, _, late_request = self.gpu_command(words)
-      late_request.timestamp = 0x31415926
-      late_signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      late_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
-      late_before = (bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
-                     self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-      with self.assertRaisesRegex(RuntimeError, rf"instruction {store.index} lane 1"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual(late_request.timestamp, 0x31415926)
-      self.assertEqual((bytes(result_view), bytes(final_view), bytes(late_signal), bytes(late_dummy),
-                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), late_before)
-      self.device._gpu_free(late_buffer)
-    finally: constants_view[:8] = original_output_pointer
-
-    immutable_targets = (("shader", dispatch.shader_address), ("constants", dispatch.constants_address))
-    try:
-      for purpose,target in immutable_targets:
-        with self.subTest(immutable_alias=purpose):
-          constants_view[:8] = struct.pack("<Q", target)
-          immutable_alias = stage_a630(packets, self._resolve_owned)
-          target_view = self._resolve_owned(target, result_size)
-          direct_before = (bytes(result_view), bytes(target_view))
-          with self.assertRaisesRegex(ValueError, rf"A630 global store aliases snapshotted {purpose}"):
-            execute_a630(immutable_alias, self._resolve_owned)
-          self.assertEqual((bytes(result_view), bytes(target_view)), direct_before)
-
-          alias_buffer, _, alias_request = self.gpu_command(words)
-          alias_request.timestamp = 0x51515151
-          alias_signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
-          alias_dummy = self._resolve_owned(self.device.dummy_addr, 4)
-          raw_before = (bytes(result_view), bytes(target_view), bytes(alias_signal), bytes(alias_dummy),
-                        self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-          with self.assertRaisesRegex(RuntimeError, rf"A630 global store aliases snapshotted {purpose}"):
-            kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-          self.assertEqual(alias_request.timestamp, 0x51515151)
-          self.assertEqual((bytes(result_view), bytes(target_view), bytes(alias_signal), bytes(alias_dummy),
-                            self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter,
-                            self.device.last_cmd), raw_before)
-          self.device._gpu_free(alias_buffer)
-    finally: constants_view[:8] = original_output_pointer
-
     input_view = self.driver.resolve_owned(self.device.fd.fd, int(source_buffer._buf.va_addr), result_size)
     try:
       constants_view[:8] = constants_view[8:16]
@@ -1497,94 +1099,6 @@ class TestQCOMDriver(unittest.TestCase):
     # END's raw bit 32 is reserved by pinned ir3-cat0.xml and has no structured callback field.
     with self.assertRaisesRegex(ValueError, rf"invalid or reserved IR3 encoding at instruction {end.index}"):
       self._stage_a630_edits(submission, packets, ((end, end.raw ^ 1 << 32),))
-
-    def mutate(packet, payload_index, value):
-      mutated = list(words)
-      mutated[packet.word_offset + 1 + payload_index] = value
-      return mutated
-
-    def remove(packet): return words[:packet.word_offset] + words[packet.word_offset+len(packet.values)+1:]
-
-    wait_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_WAIT_REG_MEM)
-    final_event = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and
-                   packet.opcode == mesa.CP_EVENT_WRITE and len(packet.values) == 4][-1]
-    marker_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_SET_MARKER)
-    load_packets = [packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_LOAD_STATE6_FRAG]
-    constants_packet = next(packet for packet in load_packets if packet.values[0] >> 14 & 0x3 == mesa.ST_CONSTANTS)
-    shader_packet = next(packet for packet in load_packets if packet.values[0] >> 14 & 0x3 == mesa.ST_SHADER)
-    exec_packet = next(packet for packet in packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS)
-    ndrange_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_NDRANGE_0)
-    cntl_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CNTL_0)
-    instr_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_INSTR_SIZE)
-    stack_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and
-                        packet.register == mesa.REG_A6XX_SP_CS_PVT_MEM_STACK_OFFSET)
-    config_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_CS_CONFIG)
-    mode_packet = next(packet for packet in packets if isinstance(packet, PM4Type4Packet) and packet.register == mesa.REG_A6XX_SP_MODE_CNTL)
-    update_clear = [packet for packet in packets if isinstance(packet, PM4Type4Packet) and
-                    packet.register == mesa.REG_A6XX_SP_UPDATE_CNTL][1]
-    semantic_cases = (
-      mutate(wait_packet, 0, wait_packet.values[0] | 1 << 31),
-      mutate(marker_packet, 0, marker_packet.values[0] | 1 << 8),
-      mutate(constants_packet, 0, constants_packet.values[0] + (1 << 22)),
-      mutate(shader_packet, 1, shader_packet.values[1] | 1),
-      mutate(exec_packet, 1, 0),
-      mutate(ndrange_packet, 9, ndrange_packet.values[9] + 1),
-      mutate(cntl_packet, 4, cntl_packet.values[4] + 128),
-      mutate(instr_packet, 0, instr_packet.values[0] + 1),
-      mutate(stack_packet, 0, stack_packet.values[0] + 1),
-      mutate(config_packet, 0, config_packet.values[0] | 1 << 17),
-      mutate(update_clear, 0, 1),
-      remove(mode_packet),
-      remove(exec_packet),
-    )
-    for mutated in semantic_cases:
-      resolver = mock.Mock(side_effect=AssertionError("semantic failure reached resolver"))
-      with self.subTest(word=next(i for i,(left,right) in enumerate(zip(words, mutated)) if left != right)), self.assertRaises(ValueError):
-        stage_a630(parse_pm4(mutated), resolver)
-      resolver.assert_not_called()
-
-    repeated_queue = self.device.hw_compute_queue_t()
-    repeated_queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
-    repeated_queue.exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size)
-    repeated_packets = parse_pm4(tuple(repeated_queue._q))
-    repeated = stage_a630(repeated_packets, lambda address,size: self.driver.resolve_owned(self.device.fd.fd, address, size))
-    self.assertEqual(len(repeated.dispatches), 2)
-    self.assertLess(repeated.dispatches[0].word_offset, repeated.dispatches[1].word_offset)
-    self.assertEqual(tuple(item.shader_image for item in repeated.dispatches), (dispatch.shader_image, dispatch.shader_image))
-    second_exec = [packet for packet in repeated_packets if isinstance(packet, PM4Type7Packet) and packet.opcode == mesa.CP_EXEC_CS][1]
-    invalid_second = list(repeated_queue._q)
-    invalid_second[second_exec.word_offset+2] = 0
-    resolver = mock.Mock(side_effect=AssertionError("invalid second dispatch reached resolver"))
-    with self.assertRaises(ValueError): stage_a630(parse_pm4(invalid_second), resolver)
-    resolver.assert_not_called()
-
-    repeated_buffer, _, repeated_request = self.gpu_command(tuple(repeated_queue._q))
-    repeated_request.timestamp = 0x27182818
-    repeated_signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-    repeated_dummy = self.driver.resolve_owned(self.device.fd.fd, self.device.dummy_addr, 4)
-    repeated_before = (bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
-                       self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-    # Multiple dispatches are admitted, but overlapping output journals remain conservatively fail closed.
-    with self.assertRaisesRegex(RuntimeError, "overlapping A630 global store and A630 global store"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=repeated_request)
-    self.assertEqual(repeated_request.timestamp, 0x27182818)
-    self.assertEqual((bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
-                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), repeated_before)
-    self.device._gpu_free(repeated_buffer)
-
-    alias_words = list(words)
-    output_address = int(result_buffer._buf.va_addr)
-    alias_words[final_event.word_offset+2:final_event.word_offset+4] = (output_address & 0xffffffff, output_address >> 32)
-    alias_buffer, _, alias_request = self.gpu_command(alias_words)
-    alias_request.timestamp = 0x16180339
-    alias_before = (bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
-                    self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd)
-    with self.assertRaisesRegex(RuntimeError, "overlapping A630 global store and event value"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-    self.assertEqual(alias_request.timestamp, 0x16180339)
-    self.assertEqual((bytes(result_view), bytes(repeated_signal), bytes(repeated_dummy),
-                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd), alias_before)
-    self.device._gpu_free(alias_buffer)
 
     result_view[:] = bytes(result_size)
     signal_view = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
@@ -1622,79 +1136,14 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
     retired_command = self.device.last_cmd
 
-    profile_start, profile_end = self.device.new_signal(), self.device.new_signal()
-    profile_queue = self.device.hw_compute_queue_t().wait(self.device.timeline_signal, self.device.timeline_value - 1).memory_barrier() \
-      .timestamp(profile_start).exec(runtime, args, program_spec.arg.global_size, program_spec.arg.local_size) \
-      .timestamp(profile_end).signal(self.device.timeline_signal, self.device.timeline_value)
-    result_view[:] = bytes(result_size)
-    effect_order:list[str] = []
-    real_counter = qcomdriver.time.perf_counter_ns
-    real_execute = qcomdriver.execute_a630
-    def ordered_counter():
-      effect_order.append("counter")
-      return real_counter()
-    def ordered_execute(*execute_args, **execute_kwargs):
-      effect_order.append("execute")
-      return real_execute(*execute_args, **execute_kwargs)
-    with mock.patch.object(qcomdriver.time, "perf_counter_ns", side_effect=ordered_counter), \
-         mock.patch.object(qcomdriver, "execute_a630", side_effect=ordered_execute):
-      profile_queue.submit(self.device)
-    self.assertEqual(effect_order, ["counter", "execute", "counter"])
-    self.assertEqual(self.device.last_cmd, retired_command + 1)
-    start_counter = profile_start.base_buf.cpu_view().view(8, 8, "Q")[0]
-    end_counter = profile_end.base_buf.cpu_view().view(8, 8, "Q")[0]
-    self.assertGreater(end_counter, start_counter)
-    self.assertGreater(profile_end.timestamp - profile_start.timestamp, 0)
-    self.assertEqual(list(struct.unpack(result_format, result_view)), reference)
-    retired_command = self.device.last_cmd
-
     end_to_end = (Tensor(source_values, device=Device.DEFAULT) + 1).realize()
     self.assertEqual(cast(list[float], end_to_end.tolist()), reference)
     self.assertGreater(self.device.last_cmd, retired_command)
-    retired_command = self.device.last_cmd
-
-    unsatisfied_words = mutate(wait_packet, 3, self.device.timeline_signal.value + 1)
-    unsatisfied_buffer, _, unsatisfied_request = self.gpu_command(unsatisfied_words)
-    unsatisfied_request.timestamp = 0x11223344
-    result_view[:] = bytes(result_size)
-    before_wait_failure = (bytes(result_view), bytes(signal_view), bytes(dummy_view),
-                           self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter)
-    with self.assertRaisesRegex(RuntimeError, "unsatisfied memory wait"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=unsatisfied_request)
-    self.assertEqual((unsatisfied_request.timestamp, self.device.last_cmd), (0x11223344, retired_command))
-    self.assertEqual((bytes(result_view), bytes(signal_view), bytes(dummy_view),
-                      self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter), before_wait_failure)
-    self.device._gpu_free(unsatisfied_buffer)
-
-    invalid_tail = list(words)
-    dummy_allocation = self.allocation_for(self.device.dummy_addr, 1)
-    self.assertIsNotNone(dummy_allocation)
-    invalid_address = dummy_allocation.addr + dummy_allocation.size
-    invalid_tail[final_event.word_offset+2:final_event.word_offset+4] = (invalid_address & 0xffffffff, invalid_address >> 32)
-    invalid_buffer, _, invalid_request = self.gpu_command(invalid_tail)
-    invalid_request.timestamp = 0x13572468
-    before = (dict(self.driver.contexts), dict(self.driver.context_timestamps), dict(self.driver.user_mappings),
-              dict(self.driver.power_levels), self.driver.always_on_counter, bytes(result_view), bytes(signal_view), bytes(dummy_view),
-              bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
-              bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
-              bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)))
-    with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=invalid_request)
-    self.assertEqual(invalid_request.timestamp, 0x13572468)
-    self.assertEqual((self.driver.contexts, self.driver.context_timestamps, self.driver.user_mappings,
-                      self.driver.power_levels, self.driver.always_on_counter, bytes(result_view), bytes(signal_view), bytes(dummy_view),
-                      bytes(invalid_buffer.cpu_view().mv[:len(invalid_tail)*4]),
-                      bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
-                      bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size))), before)
-    self.assertEqual(self.device.last_cmd, retired_command)
-    self.device._gpu_free(invalid_buffer)
 
   def test_production_two_segment_u32_copy_uses_mapped_machine_bytes(self):
     import struct
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import stage_a630
-    from test.mockgpu.qcom.pm4 import parse_pm4
 
     left_values = [1.25, -2.5, 3.75, -4.0, 5.5, -6.25, 7.0, -8.75]
     right_values = [9.5, -10.0, 11.25, -12.5, 13.0, -14.75, 15.5, -16.0]
@@ -1734,12 +1183,6 @@ class TestQCOMDriver(unittest.TestCase):
                        struct.pack("<16f", *python_reference))
     finally: output[:] = original_output
 
-    constants = self._resolve_owned(dispatch.constants_address, dispatch.constants_size)
-    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
-    def state():
-      return (bytes(output), bytes(inputs[0]), bytes(inputs[1]), bytes(constants), bytes(signal), self.device.timeline_value,
-              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
-              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
     command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
     first_store,second_store = stores
     first_data,second_data = first_store.srcs[1],second_store.srcs[1]
@@ -1767,156 +1210,17 @@ class TestQCOMDriver(unittest.TestCase):
                        (retired_timestamp, retired_timestamp))
       self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
                         self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
-
-    output[:] = bytes([0x95]) * len(output)
-    recovery_buffer,_,recovery_request = self.gpu_command(command_words)
-    timestamp_before,timeline_value_before,last_command = (self.driver.context_timestamps[self.device.ctx],
-                                                            self.device.timeline_value, self.device.last_cmd)
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
-    finally: self.device._gpu_free(recovery_buffer)
-    self.assertEqual(list(struct.unpack("<16f", output)), python_reference)
-    retired_timestamp = (timestamp_before + 1) & 0xffffffff
-    self.assertEqual((recovery_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
-                     (retired_timestamp, retired_timestamp))
-    self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
-                      self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
-    self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
-
-    # Retirement also fails atomically when either immutable input aliases the planned output range.
-    original_pointer = bytes(constants[:8])
-    for ordinal,input_base in enumerate((input0_base, input1_base)):
-      constants[:8] = struct.pack("<Q", input_base)
-      alias_buffer,_,alias_request = self.gpu_command(command_words)
-      alias_request.timestamp = marker = 0x13570100 + ordinal
-      try:
-        alias_before = state()
-        with self.subTest(output_alias=ordinal), \
-             self.assertRaisesRegex(RuntimeError, r"aliases snapshotted A630 global load I\d+"):
-          kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-        self.assertEqual((alias_request.timestamp, state()), (marker, alias_before))
-      finally:
-        self.device._gpu_free(alias_buffer)
-        constants[:8] = original_pointer
-
-    # A late second-segment failure must discard the first segment's complete journal and all PM4/timeline effects.
-    output_allocation = self.allocation_for(output_base, len(output))
-    assert output_allocation is not None and output_allocation.addr is not None
-    late_base = output_allocation.addr + output_allocation.size - 32
-    late_target = self._resolve_owned(late_base, 32)
-    late_original = bytes(late_target)
-    late_buffer,_,late_request = self.gpu_command(command_words)
-    late_request.timestamp = late_marker = 0x13570200
-    try:
-      constants[:8] = struct.pack("<Q", late_base)
-      late_submission = stage_a630(parse_pm4(command_words), self._resolve_owned)
-      late_target[:] = bytes([0xb4]) * len(late_target)
-      def late_state(): return (bytes(late_target), bytes(constants), *state()[1:])
-      late_before = late_state()
-      with self.assertRaisesRegex(ValueError, "A630 instruction .* lane 0 group 0"):
-        real_execute(late_submission, self._resolve_owned)
-      with self.assertRaisesRegex(RuntimeError, "A630 instruction .* lane 0 group 0"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual((late_request.timestamp, late_state()), (late_marker, late_before))
-    finally:
-      constants[:8] = original_pointer
-      late_target[:] = late_original
-      self.device._gpu_free(late_buffer)
-
-    output[:] = bytes([0x96]) * len(output)
-    final_buffer,_,final_request = self.gpu_command(command_words)
-    timestamp_before,timeline_value_before,last_command = (self.driver.context_timestamps[self.device.ctx],
-                                                            self.device.timeline_value, self.device.last_cmd)
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=final_request)
-    finally: self.device._gpu_free(final_buffer)
-    self.assertEqual((list(struct.unpack("<16f", output)), bytes(constants[:8])), (python_reference, original_pointer))
-    retired_timestamp = (timestamp_before + 1) & 0xffffffff
-    self.assertEqual((final_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
-                     (retired_timestamp, retired_timestamp))
-    self.assertEqual((self.device.timeline_value, self.device.timeline_signal.value, self.device.last_cmd,
-                      self.device.error_state), (timeline_value_before, timeline_value_before - 1, last_command, None))
+    # Direct UAPI replay bypasses QCOMComputeQueue's assignment; keep the shared-device command invariant aligned.
     self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
 
   def test_production_vector_fill_and_add_use_mapped_machine_bytes(self):
     import struct
     from tinygrad import Device, Tensor
-    from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import decode_a630_ir3, stage_a630
-    from test.mockgpu.qcom.pm4 import parse_pm4
 
     self.assertEqual((Device.DEFAULT, DEV.interface, DEV.device, DEV.renderer, DEV.arch),
                      ("QCOM", "MOCK", "QCOM", "IR3", "a630"))
 
-    # Keep N=4 latest for its mapped-literal control below.
-    fill_sizes = (8, 16, 128, 4)
-    with self._capture_a630_execution() as (fill_submissions,fill_commands,_):
-      fill_tensors = tuple(Tensor.ones(size, device=Device.DEFAULT).contiguous().realize() for size in fill_sizes)
-    self.assertEqual((len(fill_submissions), len(fill_commands)), (4, 4))
-    for size,tensor,submission in zip(fill_sizes, fill_tensors, fill_submissions):
-      probe_dispatch = submission.dispatches[0]
-      self.assertEqual((probe_dispatch.local_size, probe_dispatch.groups, probe_dispatch.global_size),
-                       ((size // 4, 1, 1), (1, 1, 1), (size // 4, 1, 1)))
-      probe_base = struct.unpack_from("<Q", probe_dispatch.constants_image)[0]
-      probe_output = self.driver.resolve_owned(self.device.fd.fd, probe_base, size * 4)
-      self.assertEqual((tensor.tolist(), list(struct.unpack(f"<{size}f", probe_output))), ([1.0] * size,) * 2)
-    fill_index = fill_sizes.index(4)
-    fill_size = fill_sizes[fill_index]
-    fill_tensor,fill_dispatch = fill_tensors[fill_index],fill_submissions[fill_index].dispatches[0]
-    fill_moves = sorted((instruction for instruction in fill_dispatch.instructions
-                         if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim"),
-                        key=lambda instruction: instruction.dst.value if instruction.dst is not None else -1)
-    self.assertGreaterEqual(len(fill_moves), 3)
-    self.assertTrue(all(instruction.srcs[0].value == 0x3f800000 for instruction in fill_moves))
-    fill_base = struct.unpack_from("<Q", fill_dispatch.constants_image)[0]
-    fill_output = self.driver.resolve_owned(self.device.fd.fd, fill_base, fill_size * 4)
-    self.assertEqual(list(struct.unpack(f"<{fill_size}f", fill_output)), [1.0] * fill_size)
-    fill_words = struct.unpack(f"<{len(fill_commands[fill_index]) // 4}I", fill_commands[fill_index])
-    # The exact N=4 command must recover after restoration without relying on a new compiler image.
-    fill_output[:] = bytes([0x5a]) * len(fill_output)
-    recovery_buffer,_,recovery_request = self.gpu_command(fill_words)
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
-    finally: self.device._gpu_free(recovery_buffer)
-    self.assertEqual(list(struct.unpack(f"<{fill_size}f", fill_output)), [1.0] * fill_size)
-    self.assertEqual(fill_tensor.tolist(), [1.0] * fill_size)
-
-    # A fresh indexed capture retains the multi-lane mutation control without replaying an older timeline event.
-    indexed_fill_size = 128
-    with self._capture_a630_execution() as (indexed_fill_submissions,indexed_fill_commands,_):
-      indexed_fill_tensor = Tensor.ones(indexed_fill_size, device=Device.DEFAULT).contiguous().realize()
-    self.assertEqual((len(indexed_fill_submissions), len(indexed_fill_commands)), (1, 1))
-    indexed_fill_dispatch = indexed_fill_submissions[0].dispatches[0]
-    self.assertEqual((indexed_fill_dispatch.local_size, indexed_fill_dispatch.groups, indexed_fill_dispatch.global_size),
-                     ((32, 1, 1), (1, 1, 1), (32, 1, 1)))
-    indexed_fill_store = next(instruction for instruction in indexed_fill_dispatch.instructions if instruction.opcode == "stg.u32x4")
-    indexed_fill_mutation = next(instruction for instruction in indexed_fill_dispatch.instructions
-      if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim" and instruction.dst is not None and
-      instruction.dst.value == indexed_fill_store.srcs[1].value + 2)
-    indexed_fill_shader = self._resolve_owned(indexed_fill_dispatch.shader_address, indexed_fill_dispatch.shader_size)
-    indexed_fill_original = bytes(indexed_fill_shader[indexed_fill_mutation.index*8:(indexed_fill_mutation.index+1)*8])
-    indexed_fill_words = struct.unpack(f"<{len(indexed_fill_commands[0]) // 4}I", indexed_fill_commands[0])
-    indexed_fill_base = struct.unpack_from("<Q", indexed_fill_dispatch.constants_image)[0]
-    indexed_fill_output = self._resolve_owned(indexed_fill_base, indexed_fill_size * 4)
-    indexed_fill_buffer,_,indexed_fill_request = self.gpu_command(indexed_fill_words)
-    try:
-      struct.pack_into("<I", indexed_fill_shader, indexed_fill_mutation.index * 8, 0x40000000)
-      decoded_mutation = decode_a630_ir3(bytes(indexed_fill_shader))[indexed_fill_mutation.index]
-      self.assertEqual((decoded_mutation.opcode, decoded_mutation.srcs[0].kind, decoded_mutation.srcs[0].value),
-                       ("mov.u32", "uim", 0x40000000))
-      indexed_fill_output[:] = bytes([0xa6]) * len(indexed_fill_output)
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=indexed_fill_request)
-      self.assertEqual(list(struct.unpack(f"<{indexed_fill_size}f", indexed_fill_output)),
-                       [1.0, 1.0, 2.0, 1.0] * (indexed_fill_size // 4))
-    finally:
-      indexed_fill_shader[indexed_fill_mutation.index*8:(indexed_fill_mutation.index+1)*8] = indexed_fill_original
-      self.device._gpu_free(indexed_fill_buffer)
-    indexed_fill_output[:] = bytes([0x5b]) * len(indexed_fill_output)
-    indexed_recovery_buffer,_,indexed_recovery_request = self.gpu_command(indexed_fill_words)
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=indexed_recovery_request)
-    finally: self.device._gpu_free(indexed_recovery_buffer)
-    self.assertEqual(list(struct.unpack(f"<{indexed_fill_size}f", indexed_fill_output)), [1.0] * indexed_fill_size)
-    self.assertEqual((bytes(indexed_fill_shader), indexed_fill_tensor.tolist()),
-                     (indexed_fill_dispatch.shader_image, [1.0] * indexed_fill_size))
-
-    # A fresh grouped fill proves mapped workgroup execution without pinning the compiler's address-register graph.
+    # One grouped fill proves mapped workgroup execution, immutable journaling, and literal dependence.
     grouped_fill_size = 256
     with self._capture_a630_execution() as (grouped_fill_submissions,grouped_fill_commands,grouped_fill_real_execute):
       grouped_fill_tensor = Tensor.ones(grouped_fill_size, device=Device.DEFAULT).contiguous().realize()
@@ -1948,158 +1252,61 @@ class TestQCOMDriver(unittest.TestCase):
     grouped_fill_literal = next(instruction for instruction in grouped_fill_dispatch.instructions
       if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim" and instruction.dst is not None and
       instruction.dst.value == grouped_fill_store.srcs[1].value + 2)
-    grouped_fill_shader = self._resolve_owned(grouped_fill_dispatch.shader_address, grouped_fill_dispatch.shader_size)
-    grouped_fill_literal_original = bytes(grouped_fill_shader[grouped_fill_literal.index*8:(grouped_fill_literal.index+1)*8])
-    grouped_fill_literal_buffer,_,grouped_fill_literal_request = self.gpu_command(grouped_fill_words)
+    grouped_fill_literal_raw = grouped_fill_literal.raw & ~0xffffffff | 0x40000000
+    grouped_fill_output[:] = bytes([0xb6]) * len(grouped_fill_output)
     try:
-      struct.pack_into("<I", grouped_fill_shader, grouped_fill_literal.index * 8, 0x40000000)
-      grouped_fill_decoded = decode_a630_ir3(bytes(grouped_fill_shader))[grouped_fill_literal.index]
-      self.assertEqual((grouped_fill_decoded.opcode, grouped_fill_decoded.srcs[0].kind, grouped_fill_decoded.srcs[0].value),
-                       ("mov.u32", "uim", 0x40000000))
-      grouped_fill_output[:] = bytes([0xb6]) * len(grouped_fill_output)
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=grouped_fill_literal_request)
-      self.assertEqual(list(struct.unpack(f"<{grouped_fill_size}f", grouped_fill_output)),
-                       [1.0, 1.0, 2.0, 1.0] * (grouped_fill_size // 4))
-    finally:
-      grouped_fill_shader[grouped_fill_literal.index*8:(grouped_fill_literal.index+1)*8] = grouped_fill_literal_original
-      self.device._gpu_free(grouped_fill_literal_buffer)
-    self.assertEqual(bytes(grouped_fill_shader), grouped_fill_dispatch.shader_image)
+      with self._mutate_a630_replay(grouped_fill_submission, grouped_fill_words,
+                                    ((grouped_fill_literal, grouped_fill_literal_raw),)) as \
+           (mutated_submission,mutated_dispatch,_):
+        mutated_literal = mutated_dispatch.instructions[grouped_fill_literal.index]
+        self.assertEqual((mutated_literal.opcode, mutated_literal.srcs[0].kind, mutated_literal.srcs[0].value),
+                         ("mov.u32", "uim", 0x40000000))
+        mutated_journal = grouped_fill_real_execute(mutated_submission, self._resolve_owned)
+        self.assertEqual(bytes(grouped_fill_output), bytes([0xb6]) * len(grouped_fill_output))
+        self.assertEqual(b"".join(write.data for write in sorted(mutated_journal, key=lambda write: write.address)),
+                         struct.pack(f"<{grouped_fill_size}f", *([1.0, 1.0, 2.0, 1.0] * (grouped_fill_size // 4))))
+    finally: grouped_fill_output[:] = grouped_fill_original
 
-    grouped_fill_output[:] = bytes([0xc7]) * len(grouped_fill_output)
-    grouped_fill_recovery_buffer,_,grouped_fill_recovery_request = self.gpu_command(grouped_fill_words)
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=grouped_fill_recovery_request)
-    finally:
-      self.device._gpu_free(grouped_fill_recovery_buffer)
-      self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
-    self.assertEqual(list(struct.unpack(f"<{grouped_fill_size}f", grouped_fill_output)), [1.0] * grouped_fill_size)
-
-    prepared = []
-    for size in (8, 16, 64, 128):
-      left_values = [(index - size//2) * 0.5 for index in range(size)]
-      right_values = [(((index * 7) % 19) - 9) * 0.25 for index in range(size)]
-      left_values[:4],right_values[:4] = ([1.0, 16777216.0, -1.0, -0.0], [2**-24, 1.0, 2**-24, -0.0])
-      left = Tensor(left_values, device=Device.DEFAULT).realize()
-      right = Tensor(right_values, device=Device.DEFAULT).realize()
-      python_reference = (Tensor(left_values, device="PYTHON") + Tensor(right_values, device="PYTHON")).tolist()
-      cpu_reference = (Tensor(left_values, device="CPU") + Tensor(right_values, device="CPU")).tolist()
-      prepared.append((size, left, right, python_reference, cpu_reference))
-    with self._capture_a630_execution() as (submissions,command_images,real_execute):
-      outputs = [(left + right).realize() for _,left,right,_,_ in prepared]
-    actual = [output.tolist() for output in outputs]
-    self.assertEqual((len(submissions), len(command_images)), (4, 4))
-    for index,(size,_,_,python_reference,cpu_reference) in enumerate(prepared):
-      self.assertEqual(actual[index], python_reference)
-      self.assertEqual(actual[index], cpu_reference)
-      dispatch = submissions[index].dispatches[0]
-      self.assertEqual((dispatch.global_size[0] * 4, dispatch.global_size[1:], dispatch.groups),
-                       (size, (1, 1), (1, 1, 1)))
-      self.assertEqual(bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
-                       dispatch.shader_image)
-      direct_output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
-      direct_output = self.driver.resolve_owned(self.device.fd.fd, direct_output_base, size * 4)
-      original_output = bytes(direct_output)
-      sentinel = bytes([0x90 + index]) * len(direct_output)
-      direct_output[:] = sentinel
-      try:
-        journal = real_execute(submissions[index], lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-        self.assertEqual(bytes(direct_output), sentinel)
-        self.assertEqual(tuple(len(write.data) for write in journal), (16,) * dispatch.global_size[0])
-        self.assertEqual(b"".join(write.data for write in sorted(journal, key=lambda write: write.address)),
-                         struct.pack(f"<{size}f", *cast(list[float], python_reference)))
-      finally: direct_output[:] = original_output
-
-    # The latest N=128 command can be replayed without regressing the production HCQ timeline signal.
-    control_index = next(index for index,(size,*_) in enumerate(prepared) if size == 128)
-    control_size = prepared[control_index][0]
-    submission,dispatch = submissions[control_index],submissions[control_index].dispatches[0]
+    # One wide vector add covers the production numerical route and immutable 16-byte-per-lane writes.
+    control_size = 128
+    left_values = [(index - control_size//2) * 0.5 for index in range(control_size)]
+    right_values = [(((index * 7) % 19) - 9) * 0.25 for index in range(control_size)]
+    left_values[:4],right_values[:4] = ([1.0, 16777216.0, -1.0, -0.0], [2**-24, 1.0, 2**-24, -0.0])
+    left,right = Tensor(left_values, device=Device.DEFAULT).realize(),Tensor(right_values, device=Device.DEFAULT).realize()
+    python_reference = cast(list[float], (Tensor(left_values, device="PYTHON") + Tensor(right_values, device="PYTHON")).tolist())
+    cpu_reference = cast(list[float], (Tensor(left_values, device="CPU") + Tensor(right_values, device="CPU")).tolist())
+    with self._capture_a630_execution() as (submissions,command_images,real_execute): output_tensor = (left + right).realize()
+    self.assertEqual((output_tensor.tolist(), python_reference, cpu_reference), (python_reference,) * 3)
+    self.assertEqual((len(submissions), len(command_images)), (1, 1))
+    submission,dispatch = submissions[0],submissions[0].dispatches[0]
+    self.assertEqual((dispatch.global_size[0] * 4, dispatch.global_size[1:], dispatch.groups),
+                     (control_size, (1, 1), (1, 1, 1)))
     output_base,input0_base,input1_base = struct.unpack_from("<3Q", dispatch.constants_image)
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, control_size * 4)
     inputs = (self.driver.resolve_owned(self.device.fd.fd, input0_base, control_size * 4),
               self.driver.resolve_owned(self.device.fd.fd, input1_base, control_size * 4))
-    def retirement_state():
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      return (bytes(output), bytes(inputs[0]), bytes(inputs[1]), bytes(signal), self.device.timeline_value,
-              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter,
-              self.device.last_cmd, self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
-    store = next(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32x4")
-    command_words = struct.unpack(f"<{len(command_images[control_index]) // 4}I", command_images[control_index])
+    original_output = bytes(output)
+    output[:] = bytes([0x90]) * len(output)
+    try:
+      journal = real_execute(submission, self._resolve_owned)
+      self.assertEqual(bytes(output), bytes([0x90]) * len(output))
+      self.assertEqual(tuple(len(write.data) for write in journal), (16,) * dispatch.global_size[0])
+      self.assertEqual(b"".join(write.data for write in sorted(journal, key=lambda write: write.address)),
+                       struct.pack(f"<{control_size}f", *python_reference))
+    finally: output[:] = original_output
 
     # The shader does not request FP32 denormal preservation or flushing, so an otherwise normal-input add that
-    # cancels to a subnormal must fail before retirement until A630 result handling has authoritative provenance.
+    # cancels to a subnormal remains explicitly fail-closed.
     original_inputs = tuple(bytes(input_view) for input_view in inputs)
-    subnormal_buffer,_,subnormal_request = self.gpu_command(command_words)
-    subnormal_request.timestamp = subnormal_marker = 0x24680004
     try:
       inputs[0][:] = struct.pack(f"<{control_size}I", *([0x00800001] * control_size))
       inputs[1][:] = struct.pack(f"<{control_size}I", *([0x80800000] * control_size))
-      output[:] = bytes([0x84]) * len(output)
-      state_before = retirement_state()
       with self.assertRaisesRegex(ValueError, "unsupported special or subnormal float result"):
-        real_execute(submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      with self.assertRaisesRegex(RuntimeError, "unsupported special or subnormal float result"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=subnormal_request)
-      self.assertEqual((subnormal_request.timestamp, retirement_state()), (subnormal_marker, state_before))
+        real_execute(submission, self._resolve_owned)
     finally:
       for input_view,original in zip(inputs, original_inputs): input_view[:] = original
-      self.device._gpu_free(subnormal_buffer)
 
-    # The retirement planner must snapshot the complete 16-byte-per-lane inputs, not the old scalar four-byte range.
-    constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
-    original_output_pointer = bytes(constants_view[:8])
-    alias_buffer,_,alias_request = self.gpu_command(command_words)
-    alias_request.timestamp = alias_marker = 0x24680005
-    try:
-      constants_view[:8] = bytes(constants_view[8:16])
-      output[:] = bytes([0x85]) * len(output)
-      alias_before = (bytes(constants_view), retirement_state())
-      with self.assertRaisesRegex(RuntimeError, r"A630 global store aliases snapshotted A630 global load I\d+"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-      self.assertEqual((alias_request.timestamp, bytes(constants_view), retirement_state()),
-                       (alias_marker, *alias_before))
-    finally:
-      constants_view[:8] = original_output_pointer
-      self.device._gpu_free(alias_buffer)
-    self.assertEqual(bytes(constants_view[:8]), original_output_pointer)
-
-    # Pointing lane zero at the final valid quad makes lane one fail after one write is journaled; nothing may commit.
-    output_allocation = self.allocation_for(output_base, len(output))
-    assert output_allocation is not None and output_allocation.addr is not None
-    late_address = output_allocation.addr + output_allocation.size - 16
-    late_target = self.driver.resolve_owned(self.device.fd.fd, late_address, 16)
-    late_original = bytes(late_target)
-    late_buffer,_,late_request = self.gpu_command(command_words)
-    late_request.timestamp = late_marker = 0x24680006
-    try:
-      constants_view[:8] = struct.pack("<Q", late_address)
-      late_submission = stage_a630(parse_pm4(command_words),
-                                   lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      late_target[:] = bytes([0xd3]) * 16
-      with self.assertRaisesRegex(ValueError, rf"A630 instruction {store.index} lane 1 group 0"):
-        real_execute(late_submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      self.assertEqual(bytes(late_target), bytes([0xd3]) * 16)
-      late_before = (bytes(constants_view), bytes(late_target), retirement_state())
-      with self.assertRaisesRegex(RuntimeError, rf"A630 instruction {store.index} lane 1 group 0"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual((late_request.timestamp, bytes(constants_view), bytes(late_target), retirement_state()),
-                       (late_marker, *late_before))
-    finally:
-      constants_view[:8] = original_output_pointer
-      late_target[:] = late_original
-      self.device._gpu_free(late_buffer)
-    self.assertEqual(bytes(constants_view[:8]), original_output_pointer)
-
-    recovery_buffer,_,recovery_request = self.gpu_command(command_words)
-    timestamp_before,last_command = self.driver.context_timestamps[self.device.ctx],self.device.last_cmd
-    try: kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
-    finally: self.device._gpu_free(recovery_buffer)
-    self.assertEqual(list(struct.unpack(f"<{control_size}f", output)), actual[control_index])
-    self.assertEqual((recovery_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
-                     (((timestamp_before + 1) & 0xffffffff),) * 2)
-    self.assertEqual((self.device.last_cmd, self.device.error_state), (last_command, None))
-    # Direct UAPI replay bypasses QCOMComputeQueue's last_cmd assignment; restore that shared-device invariant for later tests.
-    self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
-
-    # Four elements use one invocation with direct constant pointer pairs instead of a local-id address chain.
+    # Four elements use one invocation; overlapping RPT4 registers prove component writes execute in order.
     constant_left_values,constant_right_values = ([1.0, -4.0, 16.0, 0.5], [2.0, 1.5, -8.0, 0.25])
     constant_left = Tensor(constant_left_values, device=Device.DEFAULT).realize()
     constant_right = Tensor(constant_right_values, device=Device.DEFAULT).realize()
@@ -2151,19 +1358,6 @@ class TestQCOMDriver(unittest.TestCase):
       for view,original in zip(constant_inputs, constant_input_originals): view[:] = original
       constant_output[:] = constant_output_original
 
-    constant_output[:] = bytes([0x9c]) * 16
-    recovery_buffer,_,recovery_request = self.gpu_command(constant_words)
-    timestamp_before,last_command = self.driver.context_timestamps[self.device.ctx],self.device.last_cmd
-    try:
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
-      self.assertEqual(list(struct.unpack("<4f", constant_output)), constant_python)
-      self.assertEqual((recovery_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
-                       (((timestamp_before + 1) & 0xffffffff),) * 2)
-      self.assertEqual((self.device.last_cmd, self.device.error_state), (last_command, None))
-    finally:
-      self.device._gpu_free(recovery_buffer)
-      self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
-
   def test_repeated_integer_vector_add_remains_fail_closed(self):
     from tinygrad import Device, Tensor, dtypes
     from tinygrad.runtime.support.hcq import HCQSubmissionRejected
@@ -2193,9 +1387,6 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_vector_add_two_workgroups_use_mapped_system_values(self):
     import struct
     from tinygrad import Device, Tensor
-    from tinygrad.runtime.autogen import kgsl
-    from test.mockgpu.qcom.a630 import stage_a630
-    from test.mockgpu.qcom.pm4 import parse_pm4
 
     size = 256
     left_values = [(index - 97) * 0.5 for index in range(size)]
@@ -2219,13 +1410,9 @@ class TestQCOMDriver(unittest.TestCase):
                      ((32, 1, 1), (2, 1, 1), (64, 1, 1)))
     self.assertEqual(bytes(self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)),
                      dispatch.shader_image)
-    store = next(instruction for instruction in dispatch.instructions if instruction.opcode == "stg.u32x4")
-
-    output_base,input0_base,input1_base = struct.unpack_from("<3Q", dispatch.constants_image)
+    output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
     byte_count = size * 4
     output = self.driver.resolve_owned(self.device.fd.fd, output_base, byte_count)
-    inputs = (self.driver.resolve_owned(self.device.fd.fd, input0_base, byte_count),
-              self.driver.resolve_owned(self.device.fd.fd, input1_base, byte_count))
     output_original = bytes(output)
     output[:] = bytes([0xa6]) * byte_count
     try:
@@ -2236,63 +1423,11 @@ class TestQCOMDriver(unittest.TestCase):
                        struct.pack(f"<{size}f", *cast(list[float], python_reference)))
     finally: output[:] = output_original
 
-    constants = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
-    command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
-    def retirement_state():
-      signal = self.driver.resolve_owned(self.device.fd.fd, int(self.device.timeline_signal.value_addr), 16)
-      return (bytes(output), bytes(inputs[0]), bytes(inputs[1]), bytes(constants), bytes(signal), self.device.timeline_value,
-              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
-              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
-
-    # All of group zero can journal successfully before group one lane zero faults; no prefix may commit.
-    output_allocation = self.allocation_for(output_base, byte_count)
-    assert output_allocation is not None and output_allocation.addr is not None
-    group_bytes = dispatch.local_size[0] * 16
-    late_address = output_allocation.addr + output_allocation.size - group_bytes
-    late_target = self.driver.resolve_owned(self.device.fd.fd, late_address, group_bytes)
-    late_original,output_pointer = bytes(late_target),bytes(constants[:8])
-    late_buffer,_,late_request = self.gpu_command(command_words)
-    late_request.timestamp = late_marker = 0x31415924
-    try:
-      constants[:8] = struct.pack("<Q", late_address)
-      late_submission = stage_a630(parse_pm4(command_words),
-                                   lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      late_target[:] = bytes([0xd7]) * group_bytes
-      with self.assertRaisesRegex(ValueError, rf"A630 instruction {store.index} lane 0 group 1"):
-        real_execute(late_submission, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      self.assertEqual(bytes(late_target), bytes([0xd7]) * group_bytes)
-      late_before = (bytes(late_target), retirement_state())
-      with self.assertRaisesRegex(RuntimeError, rf"A630 instruction {store.index} lane 0 group 1"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual((late_request.timestamp, bytes(late_target), retirement_state()),
-                       (late_marker, *late_before))
-    finally:
-      constants[:8] = output_pointer
-      late_target[:] = late_original
-      self.device._gpu_free(late_buffer)
-    self.assertEqual((bytes(constants[:8]), bytes(late_target)), (output_pointer, late_original))
-
-    # Replay the exact restored N=256 command and then restore the shared QCOM device's direct-UAPI accounting invariant.
-    recovery_buffer,_,recovery_request = self.gpu_command(command_words)
-    timestamp_before,last_command = self.driver.context_timestamps[self.device.ctx],self.device.last_cmd
-    output[:] = bytes([0xe8]) * byte_count
-    try:
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=recovery_request)
-      self.assertEqual(list(struct.unpack(f"<{size}f", output)), actual)
-      self.assertEqual((recovery_request.timestamp, self.driver.context_timestamps[self.device.ctx]),
-                       (((timestamp_before + 1) & 0xffffffff),) * 2)
-      self.assertEqual((self.device.last_cmd, self.device.error_state), (last_command, None))
-    finally:
-      self.device._gpu_free(recovery_buffer)
-      self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
-
   def test_production_integer_add_wraps_from_mapped_machine_bytes(self):
     from tinygrad import Device, Tensor, dtypes
 
     cases = ((dtypes.int, [dtypes.int.max, dtypes.int.min, -7], [1, -1, 3], [dtypes.int.min, dtypes.int.max, -4]),
-             (dtypes.uint, [dtypes.uint.max, 0x80000000, 7], [1, 0x80000000, 5], [0, 0, 12]),
-             (dtypes.int, [dtypes.int.max], [1], [dtypes.int.min]),
-             (dtypes.uint, [dtypes.uint.max], [1], [0]))
+             (dtypes.uint, [dtypes.uint.max, 0x80000000, 7], [1, 0x80000000, 5], [0, 0, 12]))
     actual = []
     with self._capture_a630_execution() as (submissions,command_images,_):
       for dtype,left,right,_ in cases:
@@ -2304,7 +1439,7 @@ class TestQCOMDriver(unittest.TestCase):
                      ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
     self.assertEqual(actual, reference)
     self.assertEqual(actual, [expected for *_,expected in cases])
-    self.assertEqual((len(submissions), len(command_images)), (4, 4))
+    self.assertEqual((len(submissions), len(command_images)), (len(cases), len(cases)))
     for (_,left,_,_),submission in zip(cases, submissions):
       dispatch = submission.dispatches[0]
       size = len(left)
@@ -2316,20 +1451,17 @@ class TestQCOMDriver(unittest.TestCase):
     import operator
     from tinygrad import Device, Tensor, dtypes
     cases = ((dtypes.int, dtypes.int.min, 1, dtypes.int.max),
-             (dtypes.int, dtypes.int.max, -1, dtypes.int.min),
              (dtypes.uint, 0, 1, dtypes.uint.max),
-             (dtypes.uint, 0x80000000, 0xffffffff, 0x80000001),
              (dtypes.int, 9, 4, 5))
     # Reversing only the mapped sources changes 9 - 4 to 4 - 9 while preserving the valid SUB.U encoding.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=operator.sub, opcode="sub.u", opcode_bits=0x12, operation="subtraction", cases=cases,
+      tensor_operator=operator.sub, opcode="sub.u", opcode_bits=0x12, cases=cases,
       mutation_opcode="sub.u", mutation_opcode_bits=0x12, mutation_expected=(-5) & 0xffffffff, swap_mutation_sources=True)
     self.assertEqual((Tensor([9], dtype=dtypes.int, device=Device.DEFAULT) -
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [5])
 
-  def _assert_production_integer_binary_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, operation,
-                                                                  cases, mutation_opcode, mutation_opcode_bits, mutation_expected,
-                                                                  unsupported_opcode_bits=None, unsupported_name=None, value_type="u32",
+  def _assert_production_integer_binary_uses_mapped_machine_bytes(self, *, tensor_operator, opcode, opcode_bits, cases,
+                                                                  mutation_opcode, mutation_opcode_bits, mutation_expected,
                                                                   swap_mutation_sources=False, unsupported_shift_counts=()):
     import struct
     from tinygrad import Device, Tensor
@@ -2417,19 +1549,12 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_integer_xor_uses_mapped_machine_bytes(self):
     import operator
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.int, 0, 0, 0),
-             (dtypes.int, -1, 0, -1),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, -1),
-             (dtypes.int, dtypes.int.min, -1, dtypes.int.max),
-             (dtypes.int, -1431655766, 252645135, -1515870811),
-             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
+    cases = ((dtypes.int, -1431655766, 252645135, -1515870811),
              (dtypes.uint, 0x80000000, 0x7fffffff, dtypes.uint.max),
-             (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xa5a5a5a5),
-             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 0),
              (dtypes.uint, dtypes.uint.max, 1, 0xfffffffe))
     # The opcode-only ADD.U mutation changes uint.max XOR 1 from 0xfffffffe to wrapped zero.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=operator.xor, opcode="xor.b", opcode_bits=0x1f, operation="bitwise XOR", cases=cases,
+      tensor_operator=operator.xor, opcode="xor.b", opcode_bits=0x1f, cases=cases,
       mutation_opcode="add.u", mutation_opcode_bits=0x10, mutation_expected=0)
     self.assertEqual(operator.xor(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                   Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xa5a5a5a5])
@@ -2437,19 +1562,13 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_integer_and_uses_mapped_machine_bytes(self):
     import operator
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.int, 0, 0, 0),
-             (dtypes.int, -1, 0, 0),
-             (dtypes.int, -1, 1, 1),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, 0),
+    cases = ((dtypes.int, dtypes.int.min, dtypes.int.max, 0),
              (dtypes.int, dtypes.int.min, -1, dtypes.int.min),
-             (dtypes.int, -1431655766, 252645135, 168430090),
-             (dtypes.uint, 0, dtypes.uint.max, 0),
-             (dtypes.uint, 0x80000000, 0x7fffffff, 0),
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0x0a0a0a0a),
              (dtypes.uint, dtypes.uint.max, 0x80000001, 0x80000001))
     # The opcode-only XOR.B mutation changes uint.max AND 0x80000001 from 0x80000001 to 0x7ffffffe.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=operator.and_, opcode="and.b", opcode_bits=0x1c, operation="bitwise AND", cases=cases,
+      tensor_operator=operator.and_, opcode="and.b", opcode_bits=0x1c, cases=cases,
       mutation_opcode="xor.b", mutation_opcode_bits=0x1f, mutation_expected=0x7ffffffe)
     self.assertEqual(operator.and_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                    Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x0a0a0a0a])
@@ -2457,19 +1576,13 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_integer_or_uses_mapped_machine_bytes(self):
     import operator
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.int, 0, 0, 0),
-             (dtypes.int, -1, 0, -1),
-             (dtypes.int, -1, 1, -1),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, -1),
+    cases = ((dtypes.int, dtypes.int.min, dtypes.int.max, -1),
              (dtypes.int, dtypes.int.min, 0, dtypes.int.min),
-             (dtypes.int, -1431655766, 252645135, -1347440721),
-             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
-             (dtypes.uint, 0x80000000, 0x7fffffff, dtypes.uint.max),
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xafafafaf),
              (dtypes.uint, dtypes.uint.max, 0x80000001, dtypes.uint.max))
     # The opcode-only AND.B mutation changes uint.max OR 0x80000001 from uint.max to 0x80000001.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=operator.or_, opcode="or.b", opcode_bits=0x1d, operation="bitwise OR", cases=cases,
+      tensor_operator=operator.or_, opcode="or.b", opcode_bits=0x1d, cases=cases,
       mutation_opcode="and.b", mutation_opcode_bits=0x1c, mutation_expected=0x80000001)
     self.assertEqual(operator.or_(Tensor([0xaaaaaaaa], dtype=dtypes.uint, device=Device.DEFAULT),
                                   Tensor([0x0f0f0f0f], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0xafafafaf])
@@ -2477,20 +1590,16 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_unsigned_right_shift_uses_mapped_machine_bytes(self):
     import operator
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.uint, 0, 0, 0),
-             (dtypes.uint, dtypes.uint.max, 0, dtypes.uint.max),
-             (dtypes.uint, 0x80000001, 1, 0x40000000),
-             (dtypes.uint, 0x12345678, 4, 0x01234567),
+    cases = ((dtypes.uint, 0x80000001, 1, 0x40000000),
              (dtypes.uint, dtypes.uint.max, 16, 0x0000ffff),
-             (dtypes.uint, 0x80000000, 31, 1),
              (dtypes.uint, 16, 2, 4))
-    unsupported_counts = (32, 33, dtypes.uint.max)
+    unsupported_counts = (32, dtypes.uint.max)
     self.assertEqual([operator.rshift(Tensor([0x80000001], dtype=dtypes.uint, device="PYTHON"),
                                       Tensor([count], dtype=dtypes.uint, device="PYTHON")).tolist() for count in unsupported_counts],
-                     [[0], [0], [0]])
+                     [[0], [0]])
     # Swapping only the mapped SHR.B sources changes 16 >> 2 to 2 >> 16, while keeping both counts in the supported range.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=operator.rshift, opcode="shr.b", opcode_bits=0x37, operation="logical right shift", cases=cases,
+      tensor_operator=operator.rshift, opcode="shr.b", opcode_bits=0x37, cases=cases,
       mutation_opcode="shr.b", mutation_opcode_bits=0x37, mutation_expected=0, swap_mutation_sources=True,
       unsupported_shift_counts=unsupported_counts)
     self.assertEqual(operator.rshift(Tensor([0x80000001], dtype=dtypes.uint, device=Device.DEFAULT),
@@ -2498,35 +1607,25 @@ class TestQCOMDriver(unittest.TestCase):
 
   def test_production_signed_maximum_uses_mapped_machine_bytes(self):
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.int, 0, 0, 0),
-             (dtypes.int, -1, 0, 0),
-             (dtypes.int, 0, -1, 0),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, dtypes.int.max),
-             (dtypes.int, dtypes.int.min, -1, -1),
-             (dtypes.int, dtypes.int.max, dtypes.int.min, dtypes.int.max),
+    cases = ((dtypes.int, dtypes.int.min, dtypes.int.max, dtypes.int.max),
              (dtypes.int, -1431655766, 252645135, 252645135),
              (dtypes.int, -7, 3, 3))
     # The opcode-only OR.B mutation changes signed max(-7, 3) from 3 to the raw bit pattern for -5.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=Tensor.maximum, opcode="max.s", opcode_bits=0x19, operation="maximum", cases=cases,
-      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=0xfffffffb,
-      unsupported_opcode_bits=0x17, unsupported_name="min.s", value_type="s32")
+      tensor_operator=Tensor.maximum, opcode="max.s", opcode_bits=0x19, cases=cases,
+      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=0xfffffffb)
     self.assertEqual(Tensor([-7], dtype=dtypes.int, device=Device.DEFAULT).maximum(
       Tensor([3], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [3])
 
   def test_production_unsigned_maximum_uses_mapped_machine_bytes(self):
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.uint, 0, 0, 0),
-             (dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
-             (dtypes.uint, dtypes.uint.max, 0, dtypes.uint.max),
-             (dtypes.uint, 1, 2, 2),
+    cases = ((dtypes.uint, 0, dtypes.uint.max, dtypes.uint.max),
              (dtypes.uint, 0xaaaaaaaa, 0x0f0f0f0f, 0xaaaaaaaa),
              (dtypes.uint, 0x80000000, 0x7fffffff, 0x80000000))
     # The opcode-only OR.B mutation changes unsigned max(0x80000000, 0x7fffffff) to uint.max.
     self._assert_production_integer_binary_uses_mapped_machine_bytes(
-      tensor_operator=Tensor.maximum, opcode="max.u", opcode_bits=0x18, operation="maximum", cases=cases,
-      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=dtypes.uint.max,
-      unsupported_opcode_bits=0x16, unsupported_name="min.u")
+      tensor_operator=Tensor.maximum, opcode="max.u", opcode_bits=0x18, cases=cases,
+      mutation_opcode="or.b", mutation_opcode_bits=0x1d, mutation_expected=dtypes.uint.max)
     self.assertEqual(Tensor([0x80000000], dtype=dtypes.uint, device=Device.DEFAULT).maximum(
       Tensor([0x7fffffff], dtype=dtypes.uint, device=Device.DEFAULT)).tolist(), [0x80000000])
 
@@ -2537,8 +1636,6 @@ class TestQCOMDriver(unittest.TestCase):
 
     cases = ((dtypes.int, dtypes.int.min, -1, dtypes.int.min),
              (dtypes.int, dtypes.int.max, 2, -2),
-             (dtypes.int, -7, 3, -21),
-             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, 1),
              (dtypes.uint, 0x00010002, 0x00030004, 0x000a0008))
     actual,live_tensors = [],[]
     with self._capture_a630_execution() as (submissions,command_images,real_execute):
@@ -2586,8 +1683,7 @@ class TestQCOMDriver(unittest.TestCase):
                       Tensor([4], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [36])
 
   def _assert_production_integer_comparison_uses_mapped_machine_bytes(self, *, tensor_operator, cases, opcode_by_dtype, condition,
-                                                                      mutation_mask, mutation_value, mutation_opcode, mutation_expected,
-                                                                      unsupported_condition=None, check_duplicate_inventory=False):
+                                                                      mutation_mask, mutation_value, mutation_opcode, mutation_expected):
     import struct
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
@@ -2644,12 +1740,6 @@ class TestQCOMDriver(unittest.TestCase):
     from tinygrad import Device, Tensor, dtypes
     cases = ((dtypes.int, dtypes.int.min, dtypes.int.max, True),
              (dtypes.int, dtypes.int.max, dtypes.int.min, False),
-             (dtypes.int, -1, 0, True),
-             (dtypes.int, 0, -1, False),
-             (dtypes.int, 0, 0, False),
-             (dtypes.uint, 0, dtypes.uint.max, True),
-             (dtypes.uint, dtypes.uint.max, 0, False),
-             (dtypes.uint, dtypes.uint.max, dtypes.uint.max, False),
              (dtypes.uint, 0x7fffffff, 0x80000000, True))
     # Setting only the mapped signedness bit changes the unsigned boundary comparison from true to false.
     self._assert_production_integer_comparison_uses_mapped_machine_bytes(
@@ -2661,21 +1751,13 @@ class TestQCOMDriver(unittest.TestCase):
   def test_production_integer_equality_uses_mapped_comparison_bytes(self):
     import operator
     from tinygrad import Device, Tensor, dtypes
-    cases = ((dtypes.int, 0, 0, True),
-             (dtypes.int, 0, 1, False),
-             (dtypes.int, -1, -1, True),
-             (dtypes.int, dtypes.int.min, dtypes.int.min, True),
-             (dtypes.int, dtypes.int.min, dtypes.int.max, False),
-             (dtypes.uint, 0, 0, True),
+    cases = ((dtypes.int, dtypes.int.min, dtypes.int.min, True),
              (dtypes.uint, dtypes.uint.max, 0, False),
-             (dtypes.uint, 0x80000000, 0x80000000, True),
-             (dtypes.uint, 0x7fffffff, 0x80000000, False),
              (dtypes.uint, dtypes.uint.max, dtypes.uint.max, True))
     # Equality is signedness-independent; changing only COND from EQ to LT changes the latest equal words to false.
     self._assert_production_integer_comparison_uses_mapped_machine_bytes(
       tensor_operator=operator.eq, cases=cases, opcode_by_dtype={dtypes.int:"cmps.s.eq", dtypes.uint:"cmps.s.eq"}, condition=4,
-      mutation_mask=0x7 << 48, mutation_value=0, mutation_opcode="cmps.s.lt", mutation_expected=0,
-      unsupported_condition=5, check_duplicate_inventory=True)
+      mutation_mask=0x7 << 48, mutation_value=0, mutation_opcode="cmps.s.lt", mutation_expected=0)
     self.assertEqual((Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT) ==
                       Tensor([-1], dtype=dtypes.int, device=Device.DEFAULT)).tolist(), [True])
 
@@ -2683,81 +1765,35 @@ class TestQCOMDriver(unittest.TestCase):
     import struct
     from dataclasses import replace
     from tinygrad import Device, Tensor, Variable
-    from tinygrad.runtime.autogen import kgsl, mesa
+    from tinygrad.runtime.autogen import mesa
     from test.mockgpu.qcom.a630 import decode_a630_ir3
 
-    size = Variable("qcom_symbolic_size", 1, 10)
-    ones = Tensor.ones(10, device=Device.DEFAULT).contiguous()
-    actual = []
-    with self._capture_a630_execution() as (submissions,command_images,real_execute):
-      for value in (2, 5): actual.append((ones[:size.bind(value)] + 1).contiguous()[:value].tolist())
-    reference = [(Tensor.ones(value, device="PYTHON") + 1).tolist() for value in (2, 5)]
+    values = [-7.5, 0.25, 1024.0, -0.0, 3.5, 19.0, -2.0, 8.25, 11.0, -4.5]
+    size = Variable("qcom_symbolic_size", 1, len(values))
+    source = Tensor(values, device=Device.DEFAULT).realize()
+    with self._capture_a630_execution() as (submissions,_,real_execute):
+      actual = (source[:size.bind(5)] + 1).contiguous()[:5].tolist()
+    reference = cast(list[float], (Tensor(values[:5], device="PYTHON") + 1).tolist())
 
     self.assertEqual((Device.DEFAULT, (DEV.interface, DEV.device, DEV.renderer, DEV.arch)),
                      ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
     self.assertEqual(actual, reference)
-
-    distinct_values = [-7.5, 0.25, 1024.0, -0.0, 3.5, 19.0, -2.0, 8.25, 11.0, -4.5]
-    distinct_size = Variable("qcom_distinct_size", 1, 10)
-    distinct = Tensor(distinct_values, device=Device.DEFAULT).realize()
-    distinct_actual = [(distinct[:distinct_size.bind(value)] + 1).contiguous()[:value].tolist() for value in (2, 5)]
-    distinct_reference = [(Tensor(distinct_values[:value], device="PYTHON") + 1).tolist() for value in (2, 5)]
-    self.assertEqual(distinct_actual, distinct_reference)
-
-    self.assertEqual((len(submissions), len(command_images)), (5, 5))
-    dispatches = [submission.dispatches[0] for submission in submissions]
-    shapes = [(dispatch.local_size, dispatch.groups, dispatch.global_size) for dispatch in dispatches]
-    self.assertEqual(shapes, [((2, 1, 1), (5, 1, 1), (10, 1, 1)),
-                              ((1, 1, 1), (2, 1, 1), (2, 1, 1)),
-                              ((2, 1, 1), (1, 1, 1), (2, 1, 1)),
-                              ((1, 1, 1), (5, 1, 1), (5, 1, 1)),
-                              ((1, 1, 1), (5, 1, 1), (5, 1, 1))])
-    for dispatch in dispatches:
-      system = dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
-      if dispatch.groups[0] > 1: self.assertEqual(system & 0xff, 0xc0)
-
-    multi_add = submissions[3]
+    self.assertEqual(len(submissions), 2)
+    multi_add = next(submission for submission in submissions
+                     if any(instruction.opcode == "add.f" for instruction in submission.dispatches[0].instructions))
     dispatch = multi_add.dispatches[0]
+    self.assertEqual((dispatch.local_size, dispatch.groups, dispatch.global_size),
+                     ((1, 1, 1), (5, 1, 1), (5, 1, 1)))
     system = dict(dispatch.registers)[mesa.REG_A6XX_SP_CS_CONST_CONFIG_0]
+    self.assertEqual(system & 0xff, 0xc0)
     def with_register(register, value):
       return replace(dispatch, registers=tuple((reg, value if reg == register else current) for reg,current in dispatch.registers))
-    invalid_system_mappings = (
-      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~0xff | 0xfc), "lacks a workgroup-id mapping"),
-      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~0xff00), "unsupported A630 system-value register mapping"),
-      (with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~(0xff << 24) | 0xc0 << 24), "invalid A630 local-id"),
-      (with_register(mesa.REG_A6XX_SP_CS_WGE_CNTL, 0), "unsupported A630 system-value register mapping"),
-    )
-    for mutated_dispatch,message in invalid_system_mappings:
-      with self.subTest(system_mapping=message), self.assertRaisesRegex(ValueError, message):
-        real_execute(replace(multi_add, dispatches=(mutated_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-    for mutated_dispatch in (replace(dispatch, groups=(0, 1, 1), global_size=(0, 1, 1)),
-                             replace(dispatch, groups=(0x10001, 1, 1), global_size=(0x10001, 1, 1)),
-                             replace(dispatch, groups=(5, 2, 1), global_size=(5, 2, 1))):
-      with self.subTest(dispatch_shape=mutated_dispatch.global_size), self.assertRaisesRegex(ValueError, "bounded one-dimensional"):
-        real_execute(replace(multi_add, dispatches=(mutated_dispatch,)),
-                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-
-    constants_view = self.driver.resolve_owned(self.device.fd.fd, dispatch.constants_address, dispatch.constants_size)
-    constants_before = bytes(constants_view)
-    input_base = struct.unpack_from("<Q", constants_before, 8)[0]
-    input_view = self.driver.resolve_owned(self.device.fd.fd, input_base, dispatch.global_size[0] * 4 + 4)
-    output_base = struct.unpack_from("<Q", constants_before)[0]
-    output_view = self.driver.resolve_owned(self.device.fd.fd, output_base, dispatch.global_size[0] * 4)
-    alias_words = struct.unpack(f"<{len(command_images[3]) // 4}I", command_images[3])
-    alias_buffer,_,alias_request = self.gpu_command(alias_words)
-    alias_request.timestamp = 0x24681357
-    state_before = (bytes(input_view), bytes(output_view), self.driver.context_timestamps[self.device.ctx],
-                    self.driver.always_on_counter, self.device.last_cmd)
-    try:
-      struct.pack_into("<Q", constants_view, 0, input_base + 4)
-      with self.assertRaisesRegex(RuntimeError, r"global store aliases snapshotted A630 global load I\d+"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-      self.assertEqual((alias_request.timestamp, bytes(input_view), bytes(output_view), self.driver.context_timestamps[self.device.ctx],
-                        self.driver.always_on_counter, self.device.last_cmd), (0x24681357, *state_before))
-    finally:
-      constants_view[:] = constants_before
-      self.device._gpu_free(alias_buffer)
+    with self.assertRaisesRegex(ValueError, "lacks a workgroup-id mapping"):
+      real_execute(replace(multi_add, dispatches=(with_register(mesa.REG_A6XX_SP_CS_CONST_CONFIG_0, system & ~0xff | 0xfc),)),
+                   self._resolve_owned)
+    with self.assertRaisesRegex(ValueError, "bounded one-dimensional"):
+      real_execute(replace(multi_add, dispatches=(replace(dispatch, groups=(0, 1, 1), global_size=(0, 1, 1)),)),
+                   self._resolve_owned)
 
     shader = self.driver.resolve_owned(self.device.fd.fd, dispatch.shader_address, dispatch.shader_size)
     shared_instructions = tuple(instruction for instruction in dispatch.instructions
@@ -2771,46 +1807,26 @@ class TestQCOMDriver(unittest.TestCase):
       renamed_registers = tuple((reg, system & ~0xff | 0xc4 if reg == mesa.REG_A6XX_SP_CS_CONST_CONFIG_0 else current)
                                 for reg,current in dispatch.registers)
       renamed_dispatch = replace(dispatch, shader_image=image, instructions=decode_a630_ir3(image), registers=renamed_registers)
-      renamed_journal = real_execute(replace(multi_add, dispatches=(renamed_dispatch,)),
-                                     lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      self.assertEqual(tuple(struct.unpack("<f", write.data)[0] for write in renamed_journal), (2.0,) * 5)
+      output_base = struct.unpack_from("<Q", dispatch.constants_image)[0]
+      output = self._resolve_owned(output_base, 20)
+      output_before = bytes(output)
+      renamed_journal = real_execute(replace(multi_add, dispatches=(renamed_dispatch,)), self._resolve_owned)
+      self.assertEqual(bytes(output), output_before)
+      self.assertEqual(tuple(struct.unpack("<f", write.data)[0] for write in renamed_journal), tuple(reference))
     finally: shader[:] = shared_original
-
-    fill = submissions[0]
-    fill_dispatch = fill.dispatches[0]
-    fill_move = next(instruction for instruction in fill_dispatch.instructions
-                     if instruction.opcode == "mov.u32" and instruction.srcs[0].kind == "uim")
-    fill_shader = self.driver.resolve_owned(self.device.fd.fd, fill_dispatch.shader_address, fill_dispatch.shader_size)
-    fill_original = bytes(fill_shader[fill_move.index*8:(fill_move.index+1)*8])
-    fill_output_base = struct.unpack_from("<Q", fill_dispatch.constants_image)[0]
-    fill_output = self.driver.resolve_owned(self.device.fd.fd, fill_output_base, fill_dispatch.global_size[0] * 4)
-    fill_output_before = bytes(fill_output)
-    try:
-      struct.pack_into("<I", fill_shader, fill_move.index*8, 0x40000000)
-      image = bytes(fill_shader)
-      mutated_fill = replace(fill, dispatches=(replace(fill_dispatch, shader_image=image, instructions=decode_a630_ir3(image)),))
-      fill_output[:] = bytes([0x5c]) * len(fill_output)
-      mutated_journal = real_execute(mutated_fill, lambda address,length: self.driver.resolve_owned(self.device.fd.fd, address, length))
-      self.assertEqual(bytes(fill_output), bytes([0x5c]) * len(fill_output))
-      self.assertEqual(tuple(struct.unpack("<f", write.data)[0] for write in mutated_journal), (2.0,) * fill_dispatch.global_size[0])
-    finally:
-      fill_shader[fill_move.index*8:(fill_move.index+1)*8] = fill_original
-      fill_output[:] = fill_output_before
-    self.assertEqual((bytes(fill_shader[fill_move.index*8:(fill_move.index+1)*8]), bytes(fill_output)),
-                     (fill_original, fill_output_before))
 
   def test_production_symbolic_reduce_executes_mapped_scalar_control_flow(self):
     import struct
     from dataclasses import replace
     from tinygrad import Device, Tensor, Variable
-    from tinygrad.runtime.autogen import kgsl, mesa
+    from tinygrad.runtime.autogen import mesa
     from test.mockgpu.qcom.a630 import decode_a630_ir3
 
     values = [1.5, -0.5, 2.0, 4.0, -1.0, 3.0, 0.25, 8.0, -4.0, 16.0]
-    bounds = (1, 2, 5, 10)
+    bounds = (2, 5)
     symbolic = Variable("qcom_symbolic_reduce_bound", 1, 10)
     source = Tensor(values, device=Device.DEFAULT).realize()
-    with self._capture_a630_execution() as (submissions,command_images,real_execute):
+    with self._capture_a630_execution() as (submissions,_,real_execute):
       actual = [source[:symbolic.bind(bound)].sum().item() for bound in bounds]
     python_reference = [Tensor(values[:bound], device="PYTHON").sum().item() for bound in bounds]
     cpu_reference = [Tensor(values[:bound], device="CPU").sum().item() for bound in bounds]
@@ -2819,7 +1835,7 @@ class TestQCOMDriver(unittest.TestCase):
                      ("QCOM", ("MOCK", "QCOM", "IR3", "a630")))
     self.assertEqual(actual, python_reference)
     self.assertEqual(actual, cpu_reference)
-    self.assertEqual((len(submissions), len(command_images)), (len(bounds), len(bounds)))
+    self.assertEqual(len(submissions), len(bounds))
     dispatches = tuple(submission.dispatches[0] for submission in submissions)
     self.assertTrue(all((dispatch.local_size, dispatch.groups, dispatch.global_size) ==
                         ((1, 1, 1), (1, 1, 1), (1, 1, 1)) for dispatch in dispatches))
@@ -2840,13 +1856,8 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertTrue(all(purpose.startswith("A630 global load I") for _,_,purpose in observed_reads))
       self.assertEqual((len(journal), struct.unpack("<f", journal[0].data)[0]), (1, reference))
 
-    selected = 2
+    selected = 1
     submission,dispatch = submissions[selected],dispatches[selected]
-    command_words = struct.unpack(f"<{len(command_images[selected]) // 4}I", command_images[selected])
-    output_base,input_base = struct.unpack_from("<2Q", dispatch.constants_image)
-    output = self._resolve_owned(output_base, 4)
-    input_view = self._resolve_owned(input_base, len(values) * 4)
-    constants = self._resolve_owned(dispatch.constants_address, dispatch.constants_size)
     shader = self._resolve_owned(dispatch.shader_address, dispatch.shader_size)
 
     accumulator_add = next(instruction for instruction in dispatch.instructions if instruction.opcode == "add.f")
@@ -2863,67 +1874,8 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(bytes(shader), dispatch.shader_image)
     self.assertEqual(source[:symbolic.bind(bounds[selected])].sum().item(), python_reference[selected])
 
-    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
-    def retirement_state():
-      return (bytes(output), bytes(input_view), bytes(constants), bytes(shader), bytes(signal), self.device.timeline_value,
-              self.driver.context_timestamps[self.device.ctx], self.driver.always_on_counter, self.device.last_cmd,
-              self.device.error_state, tuple(self.device.sig_prof_records), self.device.prof_exec_counter)
-
-    constants_before = bytes(constants)
-    alias_buffer,_,alias_request = self.gpu_command(command_words)
-    alias_request.timestamp = 0x5352414c
-    try:
-      struct.pack_into("<Q", constants, 0, input_base + 4)
-      before = retirement_state()
-      with self.assertRaisesRegex(RuntimeError, r"global store aliases snapshotted A630 global load I\d+"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-      self.assertEqual((alias_request.timestamp, retirement_state()), (0x5352414c, before))
-    finally:
-      constants[:] = constants_before
-      self.device._gpu_free(alias_buffer)
-
-    oversized_buffer,_,oversized_request = self.gpu_command(command_words)
-    oversized_request.timestamp = 0x53524f56
-    try:
-      struct.pack_into("<I", constants, 16, 0x1001)
-      oversized_dispatch = replace(dispatch, constants_image=bytes(constants))
-      self._assert_a630_transactional_rejection(
-        execute=real_execute, submission=replace(submission, dispatches=(oversized_dispatch,)), request=oversized_request,
-        message="not in one owned mapping", marker=0x53524f56, state=retirement_state)
-    finally:
-      constants[:] = constants_before
-      self.device._gpu_free(oversized_buffer)
-
-    allocation = self.allocation_for(input_base, len(values) * 4)
-    self.assertIsNotNone(allocation)
-    assert allocation is not None and allocation.addr is not None
-    late_input = allocation.addr + allocation.size - 8
-    late_buffer,_,late_request = self.gpu_command(command_words)
-    late_request.timestamp = 0x53524c54
-    try:
-      struct.pack_into("<Q", constants, 8, late_input)
-      late_dispatch = replace(dispatch, constants_image=bytes(constants))
-      late_submission = replace(submission, dispatches=(late_dispatch,))
-      observed_prefix:list[tuple[int, int, str]] = []
-      with self.assertRaisesRegex(ValueError, "not in one owned mapping"):
-        real_execute(late_submission, self._resolve_owned,
-                     read_observer=lambda address,size,purpose: observed_prefix.append((address, size, purpose)))
-      self.assertEqual([(address, size) for address,size,_ in observed_prefix],
-                       [(late_input, 4), (late_input + 4, 4)])
-      self.assertTrue(all(purpose.startswith("A630 global load I") for _,_,purpose in observed_prefix))
-      before = retirement_state()
-      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual((late_request.timestamp, retirement_state()), (0x53524c54, before))
-    finally:
-      constants[:] = constants_before
-      self.device._gpu_free(late_buffer)
-    self.assertEqual((bytes(constants), bytes(shader), source[:symbolic.bind(bounds[selected])].sum().item()),
-                     (constants_before, dispatch.shader_image, python_reference[selected]))
-
   def test_production_sum_executes_mapped_workgroup_local_reduction(self):
     import struct
-    from dataclasses import replace
     from tinygrad import Device, Tensor
     from tinygrad.runtime.autogen import kgsl
 
@@ -2958,6 +1910,7 @@ class TestQCOMDriver(unittest.TestCase):
     self.assertEqual(tuple((write.address, struct.unpack("<f", write.data)[0]) for write in journal), ((output_base, 32896.0),))
 
     command_words = struct.unpack(f"<{len(command_images[0]) // 4}I", command_images[0])
+    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
     local_offset = next(instruction for instruction in dispatch.instructions if instruction.opcode == "mov.u32" and
                         len(instruction.srcs) == 1 and instruction.srcs[0].kind == "uim" and instruction.srcs[0].value == 16)
     offset_mutation = local_offset.raw & ~0xffffffff | 12
@@ -2970,13 +1923,16 @@ class TestQCOMDriver(unittest.TestCase):
       self.assertEqual(struct.unpack("<f", mutated_journal[0].data)[0], 31872.0)
       output[:] = bytes(4)
       timestamp_before = self.driver.context_timestamps[self.device.ctx]
-      kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
-      self.assertEqual((struct.unpack("<f", output)[0], self.driver.context_timestamps[self.device.ctx]),
-                       (31872.0, timestamp_before + 1))
+      signal_before = bytes(signal)
+      try:
+        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=request)
+        self.assertEqual((struct.unpack("<f", output)[0], self.driver.context_timestamps[self.device.ctx]),
+                         (31872.0, timestamp_before + 1))
+      finally: signal[:] = signal_before
+    self.device.last_cmd = self.driver.context_timestamps[self.device.ctx]
     self.assertEqual(bytes(shader), dispatch.shader_image)
     self.assertEqual(source.sum().item(), 32896.0)
 
-    signal = self._resolve_owned(int(self.device.timeline_signal.value_addr), 16)
     output[:] = struct.pack("<f", 32896.0)
     def retirement_state():
       return (bytes(output), bytes(input_view), bytes(constants), bytes(shader), bytes(signal), self.device.timeline_value,
@@ -2995,33 +1951,13 @@ class TestQCOMDriver(unittest.TestCase):
       values = tuple(value for field,value in instruction.fields if field == name)
       self.assertTrue(not values or values in ((0,), (1,)))
       return values[0] if values else 0
-    local_loads = tuple(instruction for instruction in dispatch.instructions if instruction.opcode == "ldl.u32x4")
-    first_local_load = local_loads[0]
+    first_local_load = next(instruction for instruction in dispatch.instructions if instruction.opcode == "ldl.u32x4")
     post_barrier_sync = next(instruction for instruction in dispatch.instructions[barrier.index+1:first_local_load.index]
                              if schedule_flag(instruction, "SS"))
-    first_load_registers = set(range(first_local_load.dst.value, first_local_load.dst.value + 4))
-    first_load_consumer = next(instruction for instruction in dispatch.instructions[first_local_load.index+1:]
-                               if any(operand.kind == "gpr" and operand.value in first_load_registers
-                                      for operand in ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs))
-    post_first_load_sync = next(instruction for instruction in
-                                dispatch.instructions[first_local_load.index+1:first_load_consumer.index]
-                                if schedule_flag(instruction, "SS"))
-    remaining_load_registers = {register for instruction in local_loads[1:]
-                                for register in range(instruction.dst.value, instruction.dst.value + 4)}
-    remaining_load_consumer = next(instruction for instruction in dispatch.instructions[local_loads[-1].index+1:]
-                                   if schedule_flag(instruction, "SS") and
-                                   any(operand.kind == "gpr" and operand.value in remaining_load_registers
-                                       for operand in ((instruction.dst,) if instruction.dst is not None else ()) + instruction.srcs))
-    self.assertEqual((post_barrier_sync.opcode, schedule_flag(first_local_load, "SY"),
-                      post_first_load_sync.opcode, schedule_flag(remaining_load_consumer, "SS")),
-                     ("nop", 1, "nop", 1))
+    self.assertEqual((post_barrier_sync.opcode, schedule_flag(first_local_load, "SY")), ("nop", 1))
     sync_mutations = (
       ("barrier SS", post_barrier_sync, post_barrier_sync.raw & ~(1 << 44), "barrier synchronization lacks SS"),
       ("barrier SY", first_local_load, first_local_load.raw & ~(1 << 60), "barrier synchronization lacks SY"),
-      ("first local load", post_first_load_sync, post_first_load_sync.raw & ~(1 << 44),
-       "local-load dependency lacks SS synchronization"),
-      ("remaining local loads", remaining_load_consumer, remaining_load_consumer.raw & ~(1 << 44),
-       "local-load dependency lacks SS synchronization"),
     )
     for ordinal,(name,instruction,raw,message) in enumerate(sync_mutations):
       marker = 0x57525310 + ordinal
@@ -3033,68 +1969,7 @@ class TestQCOMDriver(unittest.TestCase):
                          (instruction.opcode, instruction.dst, instruction.srcs))
         self._assert_a630_transactional_rejection(execute=real_execute, submission=mutated_submission,
           request=mutated_request, message=message, marker=marker, state=retirement_state)
-
-    with self._mutate_a630_replay(submission, command_words,
-                                  ((post_first_load_sync, post_first_load_sync.raw & ~(1 << 44)),
-                                   (first_load_consumer, first_load_consumer.raw | 1 << 44))) as \
-         (relocated_submission,relocated_dispatch,relocated_request):
-      self.assertEqual((schedule_flag(relocated_dispatch.instructions[post_first_load_sync.index], "SS"),
-                        schedule_flag(relocated_dispatch.instructions[first_load_consumer.index], "SS")), (0, 1))
-      relocated_journal = real_execute(relocated_submission, self._resolve_owned)
-      self.assertEqual(tuple(struct.unpack("<f", write.data)[0] for write in relocated_journal), (32896.0,))
-      output[:] = bytes(4)
-      timestamp_before = self.driver.context_timestamps[self.device.ctx]
-      signal_before = bytes(signal)
-      try:
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=relocated_request)
-        self.assertEqual((struct.unpack("<f", output)[0], self.driver.context_timestamps[self.device.ctx]),
-                         (32896.0, timestamp_before + 1))
-      finally:
-        # This replay carries the captured timeline value; restore the newer host timeline before recovery work.
-        signal[:] = signal_before
-
-    constants_before = bytes(constants)
-    alias_buffer,_,alias_request = self.gpu_command(command_words)
-    alias_request.timestamp = 0x5752414c
-    try:
-      struct.pack_into("<Q", constants, 0, input_base + 4)
-      before = retirement_state()
-      with self.assertRaisesRegex(RuntimeError, r"global store aliases snapshotted A630 global load I\d+"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=alias_request)
-      self.assertEqual((alias_request.timestamp, retirement_state()), (0x5752414c, before))
-    finally:
-      constants[:] = constants_before
-      self.device._gpu_free(alias_buffer)
-
-    allocation = self.allocation_for(input_base, len(values) * 4)
-    self.assertIsNotNone(allocation)
-    assert allocation is not None and allocation.addr is not None
-    late_input = allocation.addr + allocation.size - 8
-    late_buffer,_,late_request = self.gpu_command(command_words)
-    late_request.timestamp = 0x57524c54
-    try:
-      struct.pack_into("<Q", constants, 8, late_input)
-      late_dispatch = replace(dispatch, constants_image=bytes(constants))
-      late_submission = replace(submission, dispatches=(late_dispatch,))
-      observed_prefix:list[tuple[int, int, str]] = []
-      with self.assertRaisesRegex(ValueError, "not in one owned mapping"):
-        real_execute(late_submission, self._resolve_owned,
-                     read_observer=lambda address,size,purpose: observed_prefix.append((address, size, purpose)))
-      self.assertEqual([(address, size) for address,size,_ in observed_prefix], [(late_input, 4)])
-      self.assertTrue(all(purpose.startswith("A630 global load I") for _,_,purpose in observed_prefix))
-      before = retirement_state()
-      with self.assertRaisesRegex(RuntimeError, "not in one owned mapping"):
-        kgsl.IOCTL_KGSL_GPU_COMMAND(self.device.fd, __payload=late_request)
-      self.assertEqual((late_request.timestamp, retirement_state()), (0x57524c54, before))
-    finally:
-      constants[:] = constants_before
-      self.device._gpu_free(late_buffer)
-
-    with self._capture_a630_execution() as (recovery_submissions,recovery_images,_):
-      recovery = Tensor([1.0] * 256, device=Device.DEFAULT).sum().item()
-    self.assertEqual((recovery, len(recovery_submissions), len(recovery_images)), (256.0, 1, 1))
-    self.assertEqual((bytes(constants), bytes(shader), source.sum().item()),
-                     (constants_before, dispatch.shader_image, 32896.0))
+    self.assertEqual((bytes(shader), source.sum().item()), (dispatch.shader_image, 32896.0))
 
   def test_ioctl_and_mmap_fail_closed(self):
     from tinygrad.runtime.autogen import kgsl

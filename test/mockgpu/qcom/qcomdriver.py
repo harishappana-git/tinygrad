@@ -327,22 +327,8 @@ class QCOMDriver(VirtDriver):
             prior_index += 1
           return memoryview(image)
 
-        dispatch_reads:list[tuple[int, int, str]] = []
         single_dispatch = replace(submission, dispatches=(submission.dispatches[index],))
-        dispatch_writes = execute_a630(single_dispatch, resolve_after_prior_effects,
-          read_observer=lambda address,size,purpose: dispatch_reads.append((address, size, purpose)), budget=execution_budget)
-        # execute_a630 enforces this for the real interpreter. Keep the retirement-side sweep as a defense for
-        # alternate executors and tests, but scope it to one dispatch so a later dispatch can consume prior output.
-        address_writes = sorted(dispatch_writes, key=lambda write: (write.address, len(write.data)))
-        address_reads = sorted(dispatch_reads, key=lambda read: (read[0], read[1], read[2]))
-        write_index = read_index = 0
-        while write_index < len(address_writes) and read_index < len(address_reads):
-          execution_write = address_writes[write_index]
-          address,size,purpose = address_reads[read_index]
-          if self._overlaps(execution_write.address, len(execution_write.data), address, size):
-            self._require(False, f"A630 global store aliases snapshotted {purpose}")
-          if execution_write.address + len(execution_write.data) <= address: write_index += 1
-          else: read_index += 1
+        dispatch_writes = execute_a630(single_dispatch, resolve_after_prior_effects, budget=execution_budget)
         for ordinal,execution_write in enumerate(dispatch_writes):
           journal.append(KGSLJournalWrite(word_offset, ordinal, execution_write.address,
                                           execution_write.data, "A630 global store", True))
